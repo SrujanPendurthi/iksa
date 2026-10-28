@@ -37,6 +37,7 @@
 ## Review Focus
 
 - **iksa exits while Chromium runs**: Chromium closes cleanly (cookies and prefs flushed) and no helper process survives. Tests `drop_closes_gracefully`, `drop_leaves_no_helpers` (Task 2b).
+- **Typo in a task's `risk` field** (e.g. `"rsik":"financial"`): task is rejected, never silently downgraded to `write` and auto-run. Test `action_unknown_field_rejected` (Task 5b).
 - **Chromium crashes mid-call**: pending calls fail fast with `browser closed`, no hang. Test `browser_exit_fails_pending` (Task 1).
 - **Process killed mid-task**: next `iksa run` requeues it at its saved cursor. Test `recover_requeues_executing` (Task 6).
 - **Secret typed into a form**: never in record JSON, report, or DB. Test `secret_never_rendered` (Task 7).
@@ -71,6 +72,7 @@ Notes for Codex runs (from Tasks 0–2):
 | 3 Snapshot chunking | `ef56e64` | `src/snapshot.rs`: `chunks`, `put`, `get`, `chunk_hashes` | C5 |
 | 3b Plain fsync | `e245cc3` | `Cas::put` uses `libc::fsync` (was `sync_all` = `F_FULLFSYNC`, ~4 ms/blob) | C5, C5b |
 | 4 Config, search, gate, actions | `e451c1b` | `src/{config,gate,action}.rs`: `Config::{load, search_url}`, `gate::decide`, `Action::{risk, redacted}`; done by Claude while Codex quota was at 86% | C6 |
+| 5 Challenge detection | `1439d7a` | `src/challenge.rs`: `ChallengeKind`, `detect` | C7 |
 
 New modules go in `src/lib.rs`; `main.rs` is the CLI only. Integration tests `use iksa::…`.
 
@@ -148,6 +150,29 @@ From Claude's caveman and ponytail reviews of `1a98892`. No new behavior except 
 - [x] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** pass.
 - [x] **Step 5:** Commit `feat: challenge detection`.
 
+### Task 5b: Review fixes for Tasks 3–5 + shared test temp dir
+
+From Claude's caveman and ponytail reviews of `e451c1b` and `1439d7a`. One commit, before Task 6, so Tasks 6–7 start from the shared helper.
+
+**Files:** `src/lib.rs`, `src/action.rs`, `src/config.rs`, `src/challenge.rs`, `src/cas.rs`, `src/snapshot.rs` (tests only in the last two).
+
+**Interfaces:**
+- `src/lib.rs`: `#[cfg(test)] pub(crate) mod testutil;` → new `src/testutil.rs`: `pub struct TempDir(pub PathBuf)` with `Drop` = `remove_dir_all`; `pub fn temp_dir(label: &str) -> TempDir` creates `std::env::temp_dir()/iksa-{label}-{pid}-{counter}` with mode 0700. Every in-module test that needs a directory uses it (cas, snapshot, config now; ledger, audit in Tasks 6–7). Integration tests keep `tests/common::temp_profile`.
+- `Action`: add `#[serde(deny_unknown_fields)]` (works with the internal `op` tag).
+- `Config::load`: create `home` with `DirBuilder::new().recursive(true).mode(0o700)`; parse errors via `anyhow::Context::with_context(|| path.display().to_string())`; reject `retention_days == 0` with an error containing `retention_days`. `search_url` encodes with one `q.bytes().map(..).collect::<String>()` expression.
+- `challenge::detect`: header values compared with `val.trim().eq_ignore_ascii_case(value)`; hCaptcha rule becomes `hcaptcha.com/1/api.js` or `class="h-captcha"` (a bare `hcaptcha.com/` link no longer matches).
+
+- [ ] **Step 1: Tests first.**
+  - `action::tests::action_unknown_field_rejected`: `{"op":"click","selector":"#buy","rsik":"financial"}` fails to parse.
+  - `config::tests::default_config_written_and_reloaded`: also asserts the created `home` dir mode & 0o777 == 0o700 (use a nested `home` path inside the temp dir so `load` creates it).
+  - `config::tests::zero_retention_rejected`: `retention_days: 0` -> `Err` containing `retention_days`.
+  - `challenge::tests::hcaptcha_privacy_link_is_not_challenge`: `<a href="https://www.hcaptcha.com/privacy">` -> `None`.
+  - `challenge::tests::cf_header_case_and_space`: status 403, headers `("Server", " Cloudflare ")`, html `Just a moment...` -> `CloudflareChallenge`.
+- [ ] **Step 2:** `cargo test --lib` — exactly those 5 fail.
+- [ ] **Step 3:** Implement the Interfaces; move cas/snapshot/config tests to `testutil::temp_dir` (snapshot tests stop writing under `target/codex`).
+- [ ] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass.
+- [ ] **Step 5:** Commit `fix: strict action JSON, 0700 home, captcha match tightening, shared test temp dir`.
+
 ### Task 6: Ledger (SQLite)
 
 **Files:** `src/ledger.rs`.
@@ -160,7 +185,7 @@ From Claude's caveman and ponytail reviews of `1a98892`. No new behavior except 
 - `transition(id, to)`: legal `Queued->Executing`; `Executing->{AwaitingHandoff, Committed, Failed, Queued}`; `AwaitingHandoff->{Queued, Failed}`; else `Illegal`. Sets `finished_ms` on `Committed`/`Failed`.
 - `approve(id)` only from `AwaitingHandoff(Approval)`: `approved_step = Some(cursor)`, `Queued`. `resume(id)` only from `AwaitingHandoff(Challenge(_))`: `Queued`. `recover() -> usize`: all `Executing` -> `Queued`.
 
-- [ ] **Step 1: Failing tests:** `add_then_get`, `happy_path_transitions`, `committed_is_terminal`, `approve_only_from_approval_wait`, `recover_requeues_executing` (cursor kept across reopen), `finished_ms_set_on_commit`.
+- [ ] **Step 1: Failing tests** (temp dirs via `crate::testutil::temp_dir`): `add_then_get`, `happy_path_transitions`, `committed_is_terminal`, `approve_only_from_approval_wait`, `recover_requeues_executing` (cursor kept across reopen), `finished_ms_set_on_commit`.
 - [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** pass.
 - [ ] **Step 5:** Commit `feat: SQLite task ledger`.
 
@@ -175,7 +200,7 @@ From Claude's caveman and ponytail reviews of `1a98892`. No new behavior except 
 - `audit::render(&Task, &[StepRecord], &Cas) -> io::Result<String>`: `# Task {id}: {title}`, state line, per step `## Step N — {op}`, action JSON, decision, outcome (≤ 2,000 chars), `DOM: {changed}/{total} chunks changed` vs previous snapshot, or `DOM: not stored`.
 - `audit::gc(&Ledger, &Cas, retention_days, now_ms) -> anyhow::Result<(usize, usize)>`: drop finished tasks older than retention, then mark-and-sweep unreachable blobs. Also removes `tmp-*` files in the CAS root older than 1 hour (left by crashes). Must not run while any task is `Executing` (M1 only calls it before tasks start).
 
-- [ ] **Step 1: Failing tests:** `report_lists_every_step`, `secret_never_rendered`, `financial_step_stores_no_snapshot`, `records_roundtrip`, `dom_change_summary`, `gc_removes_old_tasks_and_orphan_blobs` (shared blobs kept, running task untouched).
+- [ ] **Step 1: Failing tests** (temp dirs via `crate::testutil::temp_dir`): `report_lists_every_step`, `secret_never_rendered`, `financial_step_stores_no_snapshot`, `records_roundtrip`, `dom_change_summary`, `gc_removes_old_tasks_and_orphan_blobs` (shared blobs kept, running task untouched).
 - [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** pass.
 - [ ] **Step 5:** Commit `feat: audit records, report, retention GC`.
 
@@ -186,7 +211,7 @@ From Claude's caveman and ponytail reviews of `1a98892`. No new behavior except 
 **Interfaces:**
 - `engine::launch_args(profile: &Path, mock_keychain: bool) -> Vec<String>` — exactly the Global Constraints list.
 - `Engine::launch(chromium: &Path, profile: &Path, mock_keychain: bool) -> anyhow::Result<Engine>` (profile dir created 0700).
-- `Engine::run(&self, &Ledger, &Cas, &Config, id) -> anyhow::Result<State>`; `Engine::run_with_timeout(.., step_timeout: Duration)`; `const STEP_TIMEOUT: Duration = Duration::from_secs(30)`; `const TURNSTILE_WAIT: Duration = Duration::from_secs(10)`.
+- `Engine::run(&self, &Ledger, &Cas, &Config, id) -> anyhow::Result<State>`; `Engine::run_with_timeout(.., step_timeout: Duration)`; `const STEP_TIMEOUT: Duration = Duration::from_secs(30)`; `const CAPTCHA_WAIT: Duration = Duration::from_secs(10)`.
 
 How `run` maps to CDP (algorithm, since the signatures don't fix it):
 1. `transition(Executing)`; `Target.createBrowserContext`; hidden target in it; attach flatten; `Page.enable`, `Network.enable`, `Emulation.setDeviceMetricsOverride { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false }`. If cursor > 0, re-navigate to the last `Navigate`/`Search` URL before cursor.
@@ -198,16 +223,16 @@ How `run` maps to CDP (algorithm, since the signatures don't fix it):
    - Type: Click, then `Input.insertText(text)`.
    - Extract: located element's `innerText` -> outcome.
 4. One snapshot after the action: `document.documentElement.outerHTML` -> `snapshot::put` (skipped for Financial); `record_step`.
-5. `challenge::detect(..)`. For `Turnstile`, poll `document.querySelector('[name="cf-turnstile-response"]')?.value` every 250 ms for up to `TURNSTILE_WAIT`; non-empty -> not a challenge. Any remaining kind -> `AwaitingHandoff(Challenge(k))`, return without advancing the cursor.
+5. `challenge::detect(..)`. For `Turnstile`, `ReCaptcha` and `HCaptcha` (invisible/score-based widgets, e.g. reCAPTCHA v3, pass without a human), poll every 250 ms for up to `CAPTCHA_WAIT` for a non-empty `.value` on `[name="cf-turnstile-response"]`, `[name="g-recaptcha-response"]` or `[name="h-captcha-response"]` respectively; non-empty -> not a challenge. Any remaining kind -> `AwaitingHandoff(Challenge(k))`, return without advancing the cursor.
 6. Error/timeout: record outcome `error: …` / `timeout at step N`; `Failed(..)`; return.
 7. `set_cursor(cursor + 1)`; after the last step `Committed`. Always `Target.disposeBrowserContext`.
 8. Event receivers: on `broadcast::error::RecvError::Lagged` keep receiving (log the skip count); only `Closed` is an error.
 
-Fixture routes (`common::serve`): `/form` (`<h1>Form</h1>` + the Task 1 form), `/cf` (403, `cf-mitigated: challenge`), `/slow` (hang), `/search?q=…` (echoes decoded q in `<h1>`), `/turnstile` (`<div class="cf-turnstile"></div><input name="cf-turnstile-response">`, no token), `/turnstile-auto` (same, plus a script that sets the input's `.value = "tok"` after 1 s).
+Fixture routes (`common::serve`): `/form` (`<h1>Form</h1>` + the Task 1 form), `/cf` (403, `cf-mitigated: challenge`), `/slow` (hang), `/search?q=…` (echoes decoded q in `<h1>`), `/turnstile` (`<div class="cf-turnstile"></div><input name="cf-turnstile-response">`, no token), `/turnstile-auto` (same, plus a script that sets the input's `.value = "tok"` after 1 s), `/recaptcha-v3` (`<script src="https://www.google.com/recaptcha/api.js?render=k"></script><textarea name="g-recaptcha-response"></textarea>` plus a script setting its `.value = "tok"` after 1 s; the external script fails to load offline, which is fine).
 
 - [ ] **Step 1: Failing tests.**
   - Unit: `launch_args_exact` (contains `--disable-features=PreloadTopChromeWebUI,WebUIOmniboxPopup,WebUIOmniboxAimPopup` and all privacy flags; no `--enable-automation`, no `remote-debugging-port`); `mock_keychain_only_when_asked` (absent when `false`).
-  - `tests/engine.rs` (`#[ignore]`): `runs_read_task_to_committed` (Extract `h1` == "Form"); `search_uses_configured_provider` (provider `Local` -> fixture `/search?q={q}`; Search "a b"; Extract `h1` == "a b"); `write_step_waits_for_approval` (Type -> `AwaitingHandoff(Approval)`, cursor 1; `approve`; run -> `Committed`; Extract shows typed value); `click_uses_real_input` (Type "hi" into `#q` + Click `#go` with `auto_max: Write` -> `#out` == "hi"); `challenge_pauses` (`/cf` -> `AwaitingHandoff(Challenge(CloudflareChallenge))`); `turnstile_blocks_without_token` (`/turnstile` -> `AwaitingHandoff(Challenge(Turnstile))`); `turnstile_auto_pass_continues` (`/turnstile-auto` then Extract -> `Committed`); `hung_page_fails_with_timeout` (`run_with_timeout` 2 s on `/slow` -> `Failed` containing `timeout`; `render` works); `contexts_are_isolated` (cookie from task A invisible to task B); `step_overhead_under_25ms` (median over 20 Extract steps of step wall time minus time spent inside `call`, < 25 ms).
+  - `tests/engine.rs` (`#[ignore]`): `runs_read_task_to_committed` (Extract `h1` == "Form"); `search_uses_configured_provider` (provider `Local` -> fixture `/search?q={q}`; Search "a b"; Extract `h1` == "a b"); `write_step_waits_for_approval` (Type -> `AwaitingHandoff(Approval)`, cursor 1; `approve`; run -> `Committed`; Extract shows typed value); `click_uses_real_input` (Type "hi" into `#q` + Click `#go` with `auto_max: Write` -> `#out` == "hi"); `challenge_pauses` (`/cf` -> `AwaitingHandoff(Challenge(CloudflareChallenge))`); `turnstile_blocks_without_token` (`/turnstile` -> `AwaitingHandoff(Challenge(Turnstile))`); `turnstile_auto_pass_continues` (`/turnstile-auto` then Extract -> `Committed`); `recaptcha_v3_auto_pass_continues` (`/recaptcha-v3` then Extract -> `Committed`); `hung_page_fails_with_timeout` (`run_with_timeout` 2 s on `/slow` -> `Failed` containing `timeout`; `render` works); `contexts_are_isolated` (cookie from task A invisible to task B); `step_overhead_under_25ms` (median over 20 Extract steps of step wall time minus time spent inside `call`, < 25 ms).
   - `tests/pillars.rs` (`#[ignore]`, need network): `netlog_sees_real_navigation` (launch with `--log-net-log=<tmp>`; hidden tab navigates `https://example.com`; close; `netlog_hosts` contains `example.com`) — **the positive control; if it fails, the next test means nothing**; `idle_egress_is_loopback_only` (same launch, idle 60 s on `about:blank`, `netlog_hosts` empty); `idle_footprint_under_300mb` (median of 3 fresh launches, 10 s settle, `tree_footprint_kib` < 307,200); `five_tabs_three_agents_under_1200mb` (5 visible targets + 3 hidden agent contexts on Wikipedia articles `Rust_(programming_language)`, `Linux`, `Chromium_(web_browser)`, `SQLite`, `Mozilla`, `Python_(programming_language)`, `Tokio_(software)`, `WebKit`; 20 s settle; < 1,228,800).
 - [ ] **Step 2:** `cargo test engine` + ignored `--test engine` and `--test pillars` — FAIL.
 - [ ] **Step 3:** Implement.
@@ -253,10 +278,12 @@ Results go in `docs/perf.md` under `## Manual`.
 | C5 | 3 | `cargo test snapshot` + release ignored | 5 pass; overhead < 25 ms — **done** (median 8.5 ms) |
 | C5b | 3b | `grep -c 'sync_all(' src/cas.rs`; release ignored snapshot test | 0 calls; median of 5 fresh puts < 25 ms — **done** (8.5 ms) |
 | C6 | 4 | `cargo test --lib -- config:: gate:: action::` | 9 pass — **done** |
-| C7 | 5 | `cargo test challenge` | 7 pass |
+| C7 | 5 | `cargo test challenge` | 7 pass — **done** |
+| C7b | 5b | `cargo test --lib` | 5 new tests pass; total lib = previous + 5 |
+| C7c | 5b | `grep -rn 'struct Temp(\|struct Home\|target/codex' src/` | no matches |
 | C8 | 6 | `cargo test ledger` | 6 pass |
 | C9 | 7 | `cargo test audit` | 6 pass |
-| C10 | 8 | ignored `--test engine` | 10 pass |
+| C10 | 8 | ignored `--test engine` | 11 pass |
 | C11 | 8 | `netlog_sees_real_navigation` | `example.com` found |
 | C12 | 8 | `idle_egress_is_loopback_only` | 0 hosts |
 | C13 | 8 | `idle_footprint_under_300mb` | median < 300 MB (spike: 223) |

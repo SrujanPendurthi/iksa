@@ -144,9 +144,9 @@ From Claude's caveman and ponytail reviews of `1a98892`. No new behavior except 
 3. `hcaptcha.com/` or `class="h-captcha"` -> `HCaptcha`
 4. `google.com/recaptcha` or `class="g-recaptcha"` -> `ReCaptcha`
 
-- [ ] **Step 1: Failing tests:** `cf_header`, `cf_interstitial`, `turnstile_iframe`, `hcaptcha_div`, `recaptcha_script`, `plain_403_is_not_challenge`, `article_mentioning_captcha_is_not_challenge`.
-- [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** pass.
-- [ ] **Step 5:** Commit `feat: challenge detection`.
+- [x] **Step 1: Failing tests:** `cf_header`, `cf_interstitial`, `turnstile_iframe`, `hcaptcha_div`, `recaptcha_script`, `plain_403_is_not_challenge`, `article_mentioning_captcha_is_not_challenge`.
+- [x] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** pass.
+- [x] **Step 5:** Commit `feat: challenge detection`.
 
 ### Task 6: Ledger (SQLite)
 

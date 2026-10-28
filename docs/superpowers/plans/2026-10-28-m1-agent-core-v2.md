@@ -97,9 +97,9 @@ After each run, Claude reviews the diff against the task before the next one sta
 
 **Interfaces:** `Cas::open(root) -> io::Result<Cas>` (creates root 0700); `put(&[u8]) -> io::Result<blake3::Hash>` (idempotent, zstd level 3, write `tmp-<random>` then `rename`); `get(&Hash) -> io::Result<Vec<u8>>` (`InvalidData` on hash mismatch); `delete(&Hash)`; `all() -> io::Result<Vec<Hash>>`; `disk_bytes() -> io::Result<u64>`. Layout `root/ab/cdef…`.
 
-- [ ] **Step 1: Failing tests:** `put_get_roundtrip` (hash == `blake3::hash(b"hello")`), `put_is_deduplicated` (second 100 KB put leaves `disk_bytes` unchanged), `corrupt_blob_detected` (`InvalidData`), `missing_blob_is_not_found` (`NotFound`), `root_is_owner_only` (mode & 0o777 == 0o700).
-- [ ] **Step 2:** `cargo test cas` — FAIL. **Step 3:** implement. **Step 4:** 5 pass.
-- [ ] **Step 5:** Commit `feat: CAS blob store (BLAKE3 + zstd)`.
+- [x] **Step 1: Failing tests:** `put_get_roundtrip` (hash == `blake3::hash(b"hello")`), `put_is_deduplicated` (second 100 KB put leaves `disk_bytes` unchanged), `corrupt_blob_detected` (`InvalidData`), `missing_blob_is_not_found` (`NotFound`), `root_is_owner_only` (mode & 0o777 == 0o700).
+- [x] **Step 2:** `cargo test cas` — FAIL. **Step 3:** implement. **Step 4:** 5 pass.
+- [x] **Step 5:** Commit `feat: CAS blob store (BLAKE3 + zstd)`.
 
 ### Task 3: DOM snapshot chunking
 

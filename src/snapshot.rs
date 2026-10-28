@@ -190,23 +190,32 @@ mod tests {
     #[ignore = "release performance check"]
     fn put_overhead_under_25ms() {
         assert!(!cfg!(debug_assertions), "run performance check in release");
-        let temp = Temp::new();
-        let cas = temp.cas();
         let html = fixture();
-        assert!(cas.all().unwrap().is_empty());
-        let start = Instant::now();
-        let tree = put(&cas, &html).unwrap();
-        let elapsed = start.elapsed();
-        println!(
-            "snapshot fresh put: {elapsed:?}, {} bytes input, {} chunks, {} compressed CAS bytes",
-            html.len(),
-            chunks(&html).len(),
-            cas.disk_bytes().unwrap()
-        );
-        assert_eq!(get(&cas, &tree).unwrap(), html);
+        let mut timings = Vec::new();
+        for run in 1..=5 {
+            let temp = Temp::new();
+            let cas = temp.cas();
+            assert!(cas.all().unwrap().is_empty());
+            let start = Instant::now();
+            let tree = put(&cas, &html).unwrap();
+            let elapsed = start.elapsed();
+            println!(
+                "snapshot fresh put {run}: {elapsed:?}, {} bytes input, {} chunks, {} compressed CAS bytes",
+                html.len(),
+                chunks(&html).len(),
+                cas.disk_bytes().unwrap()
+            );
+            assert_eq!(get(&cas, &tree).unwrap(), html);
+            timings.push(elapsed);
+        }
+        println!("snapshot fresh put timings: {timings:?}");
+        let mut sorted = timings.clone();
+        sorted.sort();
+        let median = sorted[2];
+        println!("snapshot fresh put median: {median:?}");
         assert!(
-            elapsed.as_secs_f64() < 0.025,
-            "snapshot put took {elapsed:?}"
+            median.as_secs_f64() < 0.025,
+            "snapshot put median took {median:?}"
         );
     }
 }

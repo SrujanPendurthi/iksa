@@ -1,7 +1,10 @@
 use std::{
     fs::{self, File},
     io::{self, Write},
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{DirBuilderExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -56,7 +59,10 @@ impl Cas {
         )));
         let mut file = File::create(&temp.0)?;
         file.write_all(&zstd::encode_all(data, 3)?)?;
-        file.sync_all()?;
+        // ponytail: plain fsync, not F_FULLFSYNC (sync_all on macOS, ~4 ms/blob). Survives crashes and panics, not sudden power loss; damaged blobs self-heal via get(). Upgrade: one F_FULLFSYNC per completed step if power-loss durability matters.
+        if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
         fs::rename(&temp.0, &destination)?;
         Ok(hash)
     }

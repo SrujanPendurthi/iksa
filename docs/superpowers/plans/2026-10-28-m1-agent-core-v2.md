@@ -94,10 +94,27 @@ From Claude's caveman and ponytail reviews of `1a98892`. No new behavior except 
 - [x] **Step 1: Failing tests** (fixture: 2,000 `<div class="row" id="r{i}">item {i}</div>` rows): `chunks_concat_to_input` (+ none > 16384), `small_edit_shares_chunks` (≥ 90% shared after inserting `<b>x</b>` mid-page), `roundtrip`, `ten_step_task_under_500kb`, `put_overhead_under_25ms` (`#[ignore]`, release).
 - [x] **Step 2:** FAIL (4 functional runtime failures; release ignored runtime failure with stubs).
 - [x] **Step 3:** implement.
-- [ ] **Step 4:** `cargo test snapshot` + `cargo test --release snapshot -- --ignored` pass.
+- [x] **Step 4:** `cargo test snapshot` + `cargo test --release snapshot -- --ignored` pass.
 - [x] **Step 5:** Commit `feat: content-defined DOM snapshot chunking`.
 
 **Task 3 result — C5 BLOCKED; task not complete:** 4 snapshot functional tests pass; 52/53 chunks shared (98.11%); ten snapshots store 29,824 compressed CAS bytes. The final required full release ignored command failed with `snapshot put took 221.970542ms` on a fresh CAS (83,780-byte fixture, 53 chunks, actual writes and fsync), exceeding the unchanged < 25 ms gate. Full normal suite: 13 pass. Cargo stopped the full ignored run at that failure; separate CDP ignored run: 9 pass. Steps 1–3 are done; Step 4 remains incomplete. Detailed command logs and measurements: `target/codex/v2-task3-report.md`.
+
+**Task 3 C5 RESOLVED by Task 3b:** final full release ignored suite passed (1 snapshot + 9 CDP). Five fresh puts, in execution order: 9.167334 ms, 9.119458 ms, 8.506625 ms, 7.913917 ms, 8.220167 ms; median 8.506625 ms < 25 ms. Full normal suite: 13 pass. Historical BLOCKED evidence above is retained. Details: `target/codex/v2-task3b-report.md`.
+
+### Task 3b: Unblock C5 — cheap per-blob sync
+
+**Why C5 failed (Claude's diagnosis):** Task 2b made `Cas::put` call `File::sync_all()`. On macOS Rust implements that as `fcntl(F_FULLFSYNC)`, which flushes the drive's write cache: about 3.9 ms per call. A fresh snapshot is 53 chunks + 1 tree = 54 puts, about 210 ms, matching the measured 159–222 ms. Measured on this machine: 54 small writes + renames with `F_FULLFSYNC` each = 209 ms; with plain `fsync` each = 4.6 ms. Chunking itself is not the problem (52/53 chunks shared, 29,824 bytes for 10 snapshots).
+
+**Decision:** plain `fsync(2)` per blob. That survives app crashes and kernel panics; on sudden power loss a just-written blob can come back damaged, and `Cas::get` already deletes damaged blobs so the next `put` rewrites them. No new API.
+
+**Files:** `src/cas.rs`, `src/snapshot.rs` (test only), this plan.
+
+- [x] **Step 1:** `src/snapshot.rs` `put_overhead_under_25ms`: time 5 fresh puts, each into a new empty CAS, and assert the **median** < 25 ms (median is the convention for every other perf number in this plan). Print all 5 timings. Keep the 83,780-byte fixture.
+- [x] **Step 2:** `CHROMIUM=… cargo test --release snapshot -- --ignored --nocapture` — still FAIL (~200 ms each). Save the log.
+- [x] **Step 3:** `src/cas.rs` `put`: replace `file.sync_all()?` with `libc::fsync(file.as_raw_fd())`, mapping a nonzero result to `io::Error::last_os_error()`. Directly above it put this comment, verbatim:
+  `// ponytail: plain fsync, not F_FULLFSYNC (sync_all on macOS, ~4 ms/blob). Survives crashes and panics, not sudden power loss; damaged blobs self-heal via get(). Upgrade: one F_FULLFSYNC per completed step if power-loss durability matters.`
+- [x] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass; snapshot median < 25 ms. If the median is still ≥ 25 ms: print a breakdown (chunking, zstd, write+fsync+rename) for one put, write BLOCKED with those numbers, and stop. Do not raise the limit.
+- [x] **Step 5:** Tick Task 3 Step 4 and this task's boxes. Commit `fix: plain fsync in CAS put (C5)`, with the 5 timings in the message.
 
 ### Task 4: Config, search providers, gate, actions
 
@@ -135,7 +152,7 @@ From Claude's caveman and ponytail reviews of `1a98892`. No new behavior except 
 - `enum Handoff { Approval, Challenge(ChallengeKind) }`; `enum State { Queued, Executing, AwaitingHandoff(Handoff), Committed, Failed(String) }` (stored as JSON text).
 - `struct Task { id: i64, title: String, steps: Vec<Action>, cursor: usize, state: State, approved_step: Option<usize>, finished_ms: Option<u64> }`.
 - `enum LedgerError { Sql, Json, NotFound(i64), Illegal { from: State, to: State } }` (thiserror, `#[from]` for the first two).
-- `Ledger::open(path)`, `add(title, &[Action]) -> i64`, `get(id)`, `list()`, `set_cursor(id, usize)`, `next_queued() -> Option<Task>` (lowest id).
+- `Ledger::open(path)` sets `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;` (one cheap sync per commit, keeps steps inside the 25 ms budget), `add(title, &[Action]) -> i64`, `get(id)`, `list()`, `set_cursor(id, usize)`, `next_queued() -> Option<Task>` (lowest id).
 - `transition(id, to)`: legal `Queued->Executing`; `Executing->{AwaitingHandoff, Committed, Failed, Queued}`; `AwaitingHandoff->{Queued, Failed}`; else `Illegal`. Sets `finished_ms` on `Committed`/`Failed`.
 - `approve(id)` only from `AwaitingHandoff(Approval)`: `approved_step = Some(cursor)`, `Queued`. `resume(id)` only from `AwaitingHandoff(Challenge(_))`: `Queued`. `recover() -> usize`: all `Executing` -> `Queued`.
 
@@ -230,6 +247,7 @@ Results go in `docs/perf.md` under `## Manual`.
 | C4f | 2c | `cargo test` + ignored `--test cdp` | 8 unit, 9 cdp pass; `drop_closes_gracefully` sees `exit_type == "Normal"` |
 | C4g | 2c | `grep -c 'std::time::\|to_str()' src/cdp.rs src/cas.rs` | 0 and 0 |
 | C5 | 3 | `cargo test snapshot` + release ignored | 5 pass; overhead < 25 ms |
+| C5b | 3b | `grep -c sync_all src/cas.rs`; release ignored snapshot test | 0; median of 5 fresh puts < 25 ms |
 | C6 | 4 | `cargo test config gate action` | 9 pass |
 | C7 | 5 | `cargo test challenge` | 7 pass |
 | C8 | 6 | `cargo test ledger` | 6 pass |
@@ -243,3 +261,6 @@ Results go in `docs/perf.md` under `## Manual`.
 | C16 | 9 | binary size / CAS size | < 60 MB / < 500 KB |
 | C17 | 10 | H1 keychain | ≤ 1 prompt, none after Always Allow |
 | C18 | 10 | H2 address bar | dropdown works; bubble noted |
+
+
+**C5/C5b Task 3b validation:** `cargo test snapshot`: 4 pass, 1 ignored; release ignored snapshot: 1 pass (median 10.147458 ms). Final full ignored suite: 10 pass, snapshot median 8.506625 ms. C5b literal grep expectation `0` conflicts with the mandatory verbatim comment containing `sync_all`: actual raw `grep -c sync_all src/cas.rs` is **1**, entirely the comment; actual `sync_all` calls are **0**. Original checklist expectation is retained to make the conflict explicit.

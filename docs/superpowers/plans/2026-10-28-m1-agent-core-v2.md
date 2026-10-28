@@ -67,6 +67,9 @@ Notes for Codex runs (from Tasks 0–2):
 | 1 Pipe CDP client | `516da26` | `src/cdp.rs`: `launch`, `Browser::{call, events, pid}`, `Event`, `split_frames`; `tests/common/mod.rs` (`chromium`, `temp_profile`, `test_args`, `serve`, `Response`) | C2, C3 |
 | 2 CAS blob store | `96193d0` | `src/cas.rs`: `Cas::{open, put, get, delete, all, disk_bytes}` | C4 |
 | 2b Review fixes | `1a98892` | `src/lib.rs` (`pub mod cas; pub mod cdp;`), clean `Browser.close` in `Drop`, CAS `sync_all` + plain rename + self-heal on corrupt read, superseded plans and briefs deleted | C4b–C4e |
+| 2c Review trims | `23ec1b6` | non-blocking close write, `exit_type == "Normal"` check, `common::descendants(pid)`, CAS trims | C4f, C4g |
+| 3 Snapshot chunking | `ef56e64` | `src/snapshot.rs`: `chunks`, `put`, `get`, `chunk_hashes` | C5 |
+| 3b Plain fsync | `e245cc3` | `Cas::put` uses `libc::fsync` (was `sync_all` = `F_FULLFSYNC`, ~4 ms/blob) | C5, C5b |
 
 New modules go in `src/lib.rs`; `main.rs` is the CLI only. Integration tests `use iksa::…`.
 
@@ -244,11 +247,11 @@ Results go in `docs/perf.md` under `## Manual`.
 | C4c | 2b | `grep -c 'renamex_np\|urandom\|#\[path' src/cas.rs tests/cdp.rs` | 0 and 0 — **done** |
 | C4d | 2b | `git ls-files docs/briefs docs/superpowers/plans` | only `2026-10-28-m1-agent-core-v2.md` — **done** |
 | C4e | 2b | `du -sh spikes/target .spike-home` | `spikes/target` gone; `.spike-home` ≈ chromium + logs — **done** |
-| C4f | 2c | `cargo test` + ignored `--test cdp` | 8 unit, 9 cdp pass; `drop_closes_gracefully` sees `exit_type == "Normal"` |
-| C4g | 2c | `grep -c 'std::time::\|to_str()' src/cdp.rs src/cas.rs` | 0 and 0 |
-| C5 | 3 | `cargo test snapshot` + release ignored | 5 pass; overhead < 25 ms |
-| C5b | 3b | `grep -c sync_all src/cas.rs`; release ignored snapshot test | 0; median of 5 fresh puts < 25 ms |
-| C6 | 4 | `cargo test config gate action` | 9 pass |
+| C4f | 2c | `cargo test` + ignored `--test cdp` | 8 unit, 9 cdp pass; `drop_closes_gracefully` sees `exit_type == "Normal"` — **done** |
+| C4g | 2c | `grep -c 'std::time::\|to_str()' src/cdp.rs src/cas.rs` | 0 and 0 — **done** |
+| C5 | 3 | `cargo test snapshot` + release ignored | 5 pass; overhead < 25 ms — **done** (median 8.5 ms) |
+| C5b | 3b | `grep -c 'sync_all(' src/cas.rs`; release ignored snapshot test | 0 calls; median of 5 fresh puts < 25 ms — **done** (8.5 ms) |
+| C6 | 4 | `cargo test --lib -- config:: gate:: action::` | 9 pass |
 | C7 | 5 | `cargo test challenge` | 7 pass |
 | C8 | 6 | `cargo test ledger` | 6 pass |
 | C9 | 7 | `cargo test audit` | 6 pass |
@@ -263,4 +266,4 @@ Results go in `docs/perf.md` under `## Manual`.
 | C18 | 10 | H2 address bar | dropdown works; bubble noted |
 
 
-**C5/C5b Task 3b validation:** `cargo test snapshot`: 4 pass, 1 ignored; release ignored snapshot: 1 pass (median 10.147458 ms). Final full ignored suite: 10 pass, snapshot median 8.506625 ms. C5b literal grep expectation `0` conflicts with the mandatory verbatim comment containing `sync_all`: actual raw `grep -c sync_all src/cas.rs` is **1**, entirely the comment; actual `sync_all` calls are **0**. Original checklist expectation is retained to make the conflict explicit.
+**C5/C5b:** done in `e245cc3`; median 8.5 ms (was 238 ms with `sync_all`). The old C5b grep counted the required comment; fixed to count calls.

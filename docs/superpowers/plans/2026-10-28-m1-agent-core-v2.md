@@ -70,6 +70,7 @@ Notes for Codex runs (from Tasks 0–2):
 | 2c Review trims | `23ec1b6` | non-blocking close write, `exit_type == "Normal"` check, `common::descendants(pid)`, CAS trims | C4f, C4g |
 | 3 Snapshot chunking | `ef56e64` | `src/snapshot.rs`: `chunks`, `put`, `get`, `chunk_hashes` | C5 |
 | 3b Plain fsync | `e245cc3` | `Cas::put` uses `libc::fsync` (was `sync_all` = `F_FULLFSYNC`, ~4 ms/blob) | C5, C5b |
+| 4 Config, search, gate, actions | (this commit) | `src/{config,gate,action}.rs`: `Config::{load, search_url}`, `gate::decide`, `Action::{risk, redacted}`; done by Claude while Codex quota was at 86% | C6 |
 
 New modules go in `src/lib.rs`; `main.rs` is the CLI only. Integration tests `use iksa::…`.
 
@@ -129,9 +130,9 @@ From Claude's caveman and ponytail reviews of `1a98892`. No new behavior except 
 - `Config::load(home) -> anyhow::Result<Config>` (missing file -> write default; errors: active provider not listed, template without `{q}`); `Config::search_url(&self, q) -> String` (percent-encode everything outside `A-Za-z0-9-._~`, no crate).
 - `Action` (`#[serde(tag = "op", rename_all = "snake_case")]`): `Navigate { url }`, `Search { query }`, `Click { selector, risk = Write }`, `Type { selector, text, secret = false, risk = Write }`, `Extract { selector }`; `risk()` (Navigate/Search/Extract = Read); `redacted()` (secret text -> `"••••"`).
 
-- [ ] **Step 1: Failing tests:** `read_auto_write_needs_approval_by_default`; `financial_always_needs_approval` (`decide(Financial, Financial) == NeedsApproval`, `decide(Financial, Write) == Auto`); `default_config_written_and_reloaded`; `kagi_search_url` (`search_url("rust & c++") == "https://kagi.com/search?q=rust%20%26%20c%2B%2B"`); `custom_provider_without_q_rejected`; `unknown_active_provider_rejected`; `unknown_config_field_rejected`; `action_json_shape`; `redacted_hides_secret`.
-- [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** pass.
-- [ ] **Step 5:** Commit `feat: config, search providers, risk gate, actions`.
+- [x] **Step 1: Failing tests:** `read_auto_write_needs_approval_by_default`; `financial_always_needs_approval` (`decide(Financial, Financial) == NeedsApproval`, `decide(Financial, Write) == Auto`); `default_config_written_and_reloaded`; `kagi_search_url` (`search_url("rust & c++") == "https://kagi.com/search?q=rust%20%26%20c%2B%2B"`); `custom_provider_without_q_rejected`; `unknown_active_provider_rejected`; `unknown_config_field_rejected`; `action_json_shape`; `redacted_hides_secret`.
+- [x] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** pass.
+- [x] **Step 5:** Commit `feat: config, search providers, risk gate, actions`.
 
 ### Task 5: Challenge detection
 
@@ -251,7 +252,7 @@ Results go in `docs/perf.md` under `## Manual`.
 | C4g | 2c | `grep -c 'std::time::\|to_str()' src/cdp.rs src/cas.rs` | 0 and 0 — **done** |
 | C5 | 3 | `cargo test snapshot` + release ignored | 5 pass; overhead < 25 ms — **done** (median 8.5 ms) |
 | C5b | 3b | `grep -c 'sync_all(' src/cas.rs`; release ignored snapshot test | 0 calls; median of 5 fresh puts < 25 ms — **done** (8.5 ms) |
-| C6 | 4 | `cargo test --lib -- config:: gate:: action::` | 9 pass |
+| C6 | 4 | `cargo test --lib -- config:: gate:: action::` | 9 pass — **done** |
 | C7 | 5 | `cargo test challenge` | 7 pass |
 | C8 | 6 | `cargo test ledger` | 6 pass |
 | C9 | 7 | `cargo test audit` | 6 pass |

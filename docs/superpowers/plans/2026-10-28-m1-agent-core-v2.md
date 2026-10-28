@@ -91,9 +91,13 @@ From Claude's caveman and ponytail reviews of `1a98892`. No new behavior except 
 
 **Interfaces:** `chunks(html: &str) -> Vec<&str>`; `put(cas, html) -> io::Result<Hash>` (chunk blobs + tree blob `"tree\n"` + one hex hash per line); `get(cas, &tree) -> io::Result<String>`; `chunk_hashes(cas, &tree) -> io::Result<Vec<Hash>>`. Cut after a `>` byte when chunk ≥ 1024 bytes and `blake3::hash(last 16 bytes).as_bytes()[0] < 8`; force-cut at 16384.
 
-- [ ] **Step 1: Failing tests** (fixture: 2,000 `<div class="row" id="r{i}">item {i}</div>` rows): `chunks_concat_to_input` (+ none > 16384), `small_edit_shares_chunks` (≥ 90% shared after inserting `<b>x</b>` mid-page), `roundtrip`, `ten_step_task_under_500kb`, `put_overhead_under_25ms` (`#[ignore]`, release).
-- [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** `cargo test snapshot` + `cargo test --release snapshot -- --ignored` pass.
-- [ ] **Step 5:** Commit `feat: content-defined DOM snapshot chunking`.
+- [x] **Step 1: Failing tests** (fixture: 2,000 `<div class="row" id="r{i}">item {i}</div>` rows): `chunks_concat_to_input` (+ none > 16384), `small_edit_shares_chunks` (≥ 90% shared after inserting `<b>x</b>` mid-page), `roundtrip`, `ten_step_task_under_500kb`, `put_overhead_under_25ms` (`#[ignore]`, release).
+- [x] **Step 2:** FAIL (4 functional runtime failures; release ignored runtime failure with stubs).
+- [x] **Step 3:** implement.
+- [ ] **Step 4:** `cargo test snapshot` + `cargo test --release snapshot -- --ignored` pass.
+- [x] **Step 5:** Commit `feat: content-defined DOM snapshot chunking`.
+
+**Task 3 result — C5 BLOCKED; task not complete:** 4 snapshot functional tests pass; 52/53 chunks shared (98.11%); ten snapshots store 29,824 compressed CAS bytes. The final required full release ignored command failed with `snapshot put took 221.970542ms` on a fresh CAS (83,780-byte fixture, 53 chunks, actual writes and fsync), exceeding the unchanged < 25 ms gate. Full normal suite: 13 pass. Cargo stopped the full ignored run at that failure; separate CDP ignored run: 9 pass. Steps 1–3 are done; Step 4 remains incomplete. Detailed command logs and measurements: `target/codex/v2-task3-report.md`.
 
 ### Task 4: Config, search providers, gate, actions
 

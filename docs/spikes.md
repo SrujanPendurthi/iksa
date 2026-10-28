@@ -278,3 +278,27 @@ Raw run evidence below gives the aggregate KiB samples in run order 1/2/3. Media
 **PASS:** D and E each meet both unchanged targets (≤300 MB idle and ≤~600 MB loaded). A/B/C fail the idle target. D alone is sufficient; E has the lowest loaded median in this matrix. No target relaxation is needed for this one-agent workload. This is not evidence for five tabs/three agents, nor a production rollout of these flags. All 15 samples completed without a measurement blocker; the final browser processes were closed.
 
 Validation: Python syntax compiled; audit of all 15 logs verified 15 distinct 0700 profiles, pinned version/revision, real Wikipedia content, exact per-PID byte parsing and sums (204 PID samples), browser-only PID sets, target inventories, and both omitted WebUI URLs for all D/E idle and loaded samples. Audit summary: `.spike-home/logs/s5-audit.json`.
+
+## Spike 2 — S3'
+
+**PASS:** two serial 120 s fresh-profile idle runs on 2026-10-28 each report `HOST_LIST=[]`, `NON_LOOPBACK=0`. Pinned headful Chrome/156.0.8078.47, revision `1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775`; existing final privacy flags and `--use-mock-keychain`, with `--log-net-log=<unique path>` and `--net-log-capture-mode=Default`. No additional endpoint-specific flag or pref was needed. These are the initial runs; no failed evidence was replaced.
+
+```sh
+SPIKE_S3_VARIANT=noext python3 spikes/raw_probe.py s3 > .spike-home/logs/s3-noext.log 2>&1
+SPIKE_S3_VARIANT=ext python3 spikes/raw_probe.py s3 > .spike-home/logs/s3-ext.log 2>&1
+```
+
+The runner sets child HOME, CFFIXED_USER_HOME and TMPDIR beneath `.spike-home`, creates a unique 0700 profile, starts only `about:blank`, records version and target inventories, idles 120 s, sends `Browser.close`, waits for exit 0, and parses the flushed JSON. No fixture navigation, search, extension page, native-message call or user activity occurs. The extension variant adds only `--load-extension=<repo>/spikes/ext`. This retains the existing loopback TCP spike CDP transport; Task 4's pipe client is not implemented here. All browsers finished before the next launch.
+
+| Variant | Actual idle seconds | Flushed netlog under `.spike-home/logs/` | Bytes | Total events | Request/resolver/socket events | Hosts | NON_LOOPBACK |
+| --- | ---: | --- | ---: | ---: | ---: | --- | ---: |
+| No extension | 120.0050346670032 | `netlog-s3-noext-1793225129933737000.json` | 56,293 | 23 | 0 | `[]` | 0 |
+| Loaded extension | 120.0050460420025 | `netlog-s3-ext-1793225253802573000.json` | 56,362 | 23 | 0 | `[]` | 0 |
+
+Extension loading is corroborated after clean close by `Default/Secure Preferences`: ID `dmoglpnbfpfncbfhnbjokgfiecjofdcm`, exact repository `spikes/ext` path, `disable_reasons=[]`, active nativeMessaging and duckduckgo.com searchProvider permissions, and enabled persisted default-search override. This pin has no `state` key for this fixture. Extracted evidence: `.spike-home/logs/s3-ext-enabled.json`. The fixture has no background service worker, so target absence would not establish failure to load.
+
+The parser decodes all 648 `logEventTypes` and 55 `logSourceType` constants, selects `URL_REQUEST_START_JOB`, any event/source name containing `SOCKET` or `HOST_RESOLVER` (including e.g. TCP_CONNECT on a SOCKET source), and recursively scans nested string URL, host, alias, destination, address/address_list and endpoint fields. URL domains, failed DNS hostnames and resolved remote IPs all count; host:port and bracketed IPv6 endpoints are normalized. Only IP loopback and localhost names are allowed. Internal `chrome://`, `chrome-extension://` and other non-network URL schemes are excluded from egress and listed separately when present. Target inventories show internal `chrome://omnibox-popup.top-chrome/` and its `omnibox_popup_aim.html`; neither appears as a network host. No internal URL exclusion was needed in the actual selected event sets. The loopback CDP server itself is outside Chromium's network-service netlog and therefore does not appear in these host lists.
+
+Both complete netlogs were additionally inspected across **all** events/params, not only selected events. Each has cookie-store lifecycle, cert verifier creation, HTTP-server-properties initialization/cache/prefs, network-quality changes and empty QUIC-pool cleanup records; no omitted URL/resolver/socket event or host-bearing parameter was found. Selected events being zero is actual absence, not a numeric-constant mismatch. Each `.audit.json` beside the netlog retains the complete decoded constants, all/selected event-source counts, selected string parameters, host evidence and exclusions. `s3-noext-audit-check.log` and `s3-ext-audit-check.log` retain independently enumerated all-event parameter strings and counts.
+
+Focused synthetic sanity evidence (`s3-parser-synthetic.json`, `.audit.json`, `s3-parser-sanity.log`) verifies numeric constants, source-type SOCKET selection, HTTP URL, failed hostname:port, nested resolver aliases and IPv4/IPv6 address_list, IPv4/IPv6 loopback and internal schemes. It yields seven hosts, exactly five non-loopback, two allowed loopbacks and two excluded internal URLs. Python syntax compilation also passed. No blocker or browser failure occurred. Limits: this is Chromium netlog evidence for two fresh-profile 120 s idle windows, not an OS packet capture, future-launch guarantee, or extension interaction/search/native-messaging egress test.

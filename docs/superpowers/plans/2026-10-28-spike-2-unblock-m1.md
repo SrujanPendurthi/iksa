@@ -67,11 +67,11 @@
 
 **Files:** Modify `spikes/raw_probe.py` (new mode `s3`); results under `## Spike 2 — S3'`.
 
-- [ ] **Step 1:** `raw_probe.py s3` launches with `--log-net-log=.spike-home/logs/netlog-s3.json --net-log-capture-mode=Default`, idles 120 s on `about:blank`, closes the browser cleanly (`Browser.close`) so the netlog is flushed.
-- [ ] **Step 2:** Same script parses the netlog JSON and prints every distinct host from `URL_REQUEST_START_JOB` / `SOCKET` / `HOST_RESOLVER` events, then `NON_LOOPBACK=<n>`.
-- [ ] **Step 3:** Run with and without the loaded spike extension (`--load-extension=spikes/ext`).
-- [ ] **Step 4:** Record both host lists; PASS = `NON_LOOPBACK=0` in both. For any host found, record the flag or pref that removes it and re-run.
-- [ ] **Step 5:** Commit `docs: S3' egress via netlog`.
+- [x] **Step 1:** `raw_probe.py s3` launches with `--log-net-log=.spike-home/logs/netlog-s3.json --net-log-capture-mode=Default`, idles 120 s on `about:blank`, closes the browser cleanly (`Browser.close`) so the netlog is flushed.
+- [x] **Step 2:** Same script parses the netlog JSON and prints every distinct host from `URL_REQUEST_START_JOB` / `SOCKET` / `HOST_RESOLVER` events, then `NON_LOOPBACK=<n>`.
+- [x] **Step 3:** Run with and without the loaded spike extension (`--load-extension=spikes/ext`).
+- [x] **Step 4:** Record both host lists; PASS = `NON_LOOPBACK=0` in both. For any host found, record the flag or pref that removes it and re-run.
+- [x] **Step 5:** Commit `docs: S3' egress via netlog`.
 
 **Verifiable:** `grep NON_LOOPBACK .spike-home/logs/s3-*.log` prints `NON_LOOPBACK=0` twice.
 

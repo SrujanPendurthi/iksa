@@ -35,6 +35,7 @@ class CDP:
    self.events.append(r)
 def main():
  mode=sys.argv[1]
+ if mode=='s3':return s3_run()
  if mode=='s5' and not os.environ.get('SPIKE_S5_CHILD'):
   return s5_runs()
  profile=HOME/(('profile-raw-'+mode+'-'+str(time.time_ns())) if mode=='s5' else ('profile-raw-'+mode));profile.mkdir(mode=0o700,exist_ok=True);(profile/'DevToolsActivePort').unlink(missing_ok=True)
@@ -89,6 +90,101 @@ def main():
  finally:
   try:proc.wait(timeout=5)
   except subprocess.TimeoutExpired:proc.terminate();proc.wait(timeout=5)
+def netlog_hosts(path):
+ """Decode numeric constants and scan request/resolver/socket event and source params."""
+ import ipaddress
+ from urllib.parse import urlsplit
+ data=json.loads(path.read_text());constants=data['constants']
+ maps={key:{str(v):k for k,v in constants[key].items()} for key in ['logEventTypes','logSourceType']}
+ hosts={};excluded=set();scope={};fields={};all_counts={}
+ def add(value,event,field):
+  value=value.strip()
+  if not value:return
+  if '://' in value:
+   u=urlsplit(value)
+   if u.scheme not in ('http','https','ws','wss','ftp'):
+    excluded.add(value);return
+   host=u.hostname
+  else:
+   if value.startswith('['):host=value[1:].split(']')[0]
+   elif value.count(':')==1:host=value.split(':')[0]
+   else:host=value
+  if not host:return
+  host=host.lower().rstrip('.')
+  try:loopback=ipaddress.ip_address(host.split('%')[0]).is_loopback
+  except ValueError:loopback=host=='localhost' or host.endswith('.localhost')
+  hosts.setdefault(host,{'loopback':loopback,'evidence':[]})['evidence'].append([event,field,value])
+ def walk(value,event,field=''):
+  if isinstance(value,dict):
+   for k,v in value.items():walk(v,event,field+'.'+k)
+  elif isinstance(value,list):
+   for v in value:walk(v,event,field+'[]')
+  elif isinstance(value,str):
+   fields.setdefault(event,{}).setdefault(field,set()).add(value)
+   key=field.lower()
+   if '://' in value or any(x in key for x in ['host','address','endpoint','remote_peer','ip_endpoint','alias','destination']):
+    # Resolver diagnostic strings such as address_family are not hosts.
+    if '://' in value or re.fullmatch(r'(?:\[[0-9a-fA-F:%]+\](?::[0-9]+)?|[0-9a-fA-F:]+|[A-Za-z0-9_.-]+(?::[0-9]+)?)',value):add(value,event,field)
+ for e in data['events']:
+  event=maps['logEventTypes'].get(str(e['type']),str(e['type']))
+  source=maps['logSourceType'].get(str(e.get('source',{}).get('type')),str(e.get('source',{}).get('type')))
+  all_label=event+' / '+source;all_counts[all_label]=all_counts.get(all_label,0)+1
+  if event=='URL_REQUEST_START_JOB' or any(x in event or x in source for x in ['SOCKET','HOST_RESOLVER']):
+   label=event+' / '+source;scope[label]=scope.get(label,0)+1;walk(e.get('params',{}),label)
+ audit={'constants':maps,'all_event_source_counts':all_counts,'event_source_counts':scope,'string_params':{e:{k:sorted(v) for k,v in f.items()} for e,f in fields.items()},'hosts':hosts,'excluded_non_network_urls':sorted(excluded),'total_events':len(data['events'])}
+ audit_path=path.with_suffix('.audit.json');audit_path.write_text(json.dumps(audit,indent=2))
+ print('NETLOG_EVENTS',len(data['events']),'SELECTED_EVENTS',sum(scope.values()),'AUDIT',str(audit_path),flush=True)
+ print('EVENT_SOURCE_COUNTS',json.dumps(scope,sort_keys=True),flush=True)
+ print('EXCLUDED_NON_NETWORK_URLS',json.dumps(sorted(excluded)),flush=True)
+ for host,info in sorted(hosts.items()):print('HOST',host,'LOOPBACK='+str(info['loopback']),'EVIDENCE='+json.dumps(info['evidence']),flush=True)
+ print('HOST_LIST='+json.dumps(sorted(hosts)),flush=True)
+ print('NON_LOOPBACK='+str(sum(not info['loopback'] for info in hosts.values())),flush=True)
+ return audit
+
+def s3_run():
+ variant=os.environ.get('SPIKE_S3_VARIANT','noext')
+ if variant not in ('noext','ext'):raise ValueError('SPIKE_S3_VARIANT must be noext or ext')
+ stamp=str(time.time_ns());profile=HOME/('profile-raw-s3-'+variant+'-'+stamp);profile.mkdir(mode=0o700,parents=True)
+ (HOME/'tmp').mkdir(exist_ok=True);(HOME/'logs').mkdir(exist_ok=True)
+ path=HOME/'logs'/('netlog-s3-'+variant+'-'+stamp+'.json')
+ args=['use-mock-keychain','remote-debugging-address=127.0.0.1','remote-debugging-port=0','disable-background-networking','disable-component-update','disable-sync','no-pings','disable-domain-reliability','disable-field-trial-config','disable-breakpad','metrics-recording-only','no-default-browser-check','no-first-run','safebrowsing-disable-auto-update','log-net-log='+str(path),'net-log-capture-mode=Default','user-data-dir='+str(profile)]
+ if variant=='ext':args+=['load-extension='+str(ROOT/'spikes/ext')]
+ env=os.environ|{'HOME':str(HOME),'CFFIXED_USER_HOME':str(HOME),'TMPDIR':str(HOME/'tmp')}
+ print('VARIANT',variant,'PROFILE',str(profile),'NETLOG',str(path),'launch_args',json.dumps(args),flush=True)
+ proc=None;c=None
+ try:
+  with path.with_suffix('.browser.log').open('w') as log:
+   proc=subprocess.Popen([str(HOME/'chromium/Chromium.app/Contents/MacOS/Chromium'),*['--'+x for x in args],'about:blank'],env=env,stdout=log,stderr=log)
+   for _ in range(200):
+    if proc.poll() is not None:raise RuntimeError('browser exited during startup: '+str(proc.returncode))
+    if (profile/'DevToolsActivePort').exists():break
+    time.sleep(.1)
+   else:raise TimeoutError('DevToolsActivePort not created within 20s')
+   port,ws=(profile/'DevToolsActivePort').read_text().splitlines();c=CDP('ws://127.0.0.1:'+port+ws)
+   print('version',c.call('Browser.getVersion'),flush=True)
+   print('idle_start_targets',json.dumps(c.call('Target.getTargets')),flush=True)
+   start=time.monotonic();time.sleep(120);elapsed=time.monotonic()-start
+   print('IDLE_SECONDS='+str(elapsed),flush=True)
+   print('idle_end_targets',json.dumps(c.call('Target.getTargets')),flush=True)
+   c.call('Browser.close');proc.wait(timeout=15)
+   if proc.returncode:raise RuntimeError('Browser.close exit code '+str(proc.returncode))
+   print('BROWSER_CLOSE=clean EXIT=0 NETLOG_BYTES='+str(path.stat().st_size),flush=True)
+  netlog_hosts(path)
+  if variant=='ext':
+   prefs=json.loads((profile/'Default/Secure Preferences').read_text())
+   extension=prefs['extensions']['settings']['dmoglpnbfpfncbfhnbjokgfiecjofdcm']
+   proof={k:extension.get(k) for k in ['path','state','disable_reasons','manifest','preferences']}
+   print('EXTENSION_PERSISTED',json.dumps(proof),flush=True)
+   if extension.get('disable_reasons') or pathlib.Path(extension['path']).resolve()!=(ROOT/'spikes/ext').resolve():raise RuntimeError('extension not enabled at expected path')
+ except Exception as exc:
+  print('BLOCKED s3 '+type(exc).__name__+': '+str(exc),flush=True);raise
+ finally:
+  if c:c.s.close()
+  if proc and proc.poll() is None:
+   proc.terminate()
+   try:proc.wait(timeout=5)
+   except subprocess.TimeoutExpired:proc.kill();proc.wait()
+
 def s5_runs():
  config=os.environ.get('SPIKE_CONFIG','custom')
  if not re.fullmatch(r'[A-Za-z0-9_-]+',config):raise ValueError('unsafe SPIKE_CONFIG')

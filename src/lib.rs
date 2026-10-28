@@ -5,3 +5,6 @@ pub mod challenge;
 pub mod config;
 pub mod gate;
 pub mod snapshot;
+
+#[cfg(test)]
+pub(crate) mod testutil;

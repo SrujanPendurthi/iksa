@@ -1,6 +1,7 @@
 use crate::gate::Risk;
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{os::unix::fs::DirBuilderExt, path::Path};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,12 +47,15 @@ impl Config {
         let path = home.join("config.json");
         if !path.try_exists()? {
             let config = Config::default();
-            std::fs::create_dir_all(home)?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(home)?;
             std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
             return Ok(config);
         }
         let config: Config = serde_json::from_str(&std::fs::read_to_string(&path)?)
-            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            .with_context(|| path.display().to_string())?;
         if let Some(p) = config
             .providers
             .iter()
@@ -68,6 +72,9 @@ impl Config {
                 config.search
             );
         }
+        if config.retention_days == 0 {
+            anyhow::bail!("retention_days must be greater than zero");
+        }
         Ok(config)
     }
 
@@ -78,14 +85,16 @@ impl Config {
             .expect("active search provider")
             .url_template
             .as_str();
-        let mut encoded = String::new();
-        for b in q.bytes() {
-            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-                encoded.push(b as char);
-            } else {
-                encoded.push_str(&format!("%{b:02X}"));
-            }
-        }
+        let encoded = q
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect::<String>();
         template.replace("{q}", &encoded)
     }
 }
@@ -93,30 +102,10 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use crate::testutil::temp_dir;
 
-    struct Home(PathBuf);
-    impl Home {
-        fn new() -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            Self(std::env::temp_dir().join(format!(
-                "iksa-config-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            )))
-        }
-        fn write(&self, json: &str) {
-            std::fs::create_dir_all(&self.0).unwrap();
-            std::fs::write(self.0.join("config.json"), json).unwrap();
-        }
-    }
-    impl Drop for Home {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    fn write(home: &Path, json: &str) {
+        std::fs::write(home.join("config.json"), json).unwrap();
     }
 
     fn custom(search: &str, template: &str) -> String {
@@ -131,15 +120,31 @@ mod tests {
 
     #[test]
     fn default_config_written_and_reloaded() {
-        let home = Home::new();
-        let first = Config::load(&home.0).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let temp = temp_dir("config");
+        let home = temp.0.join("home");
+        let first = Config::load(&home).unwrap();
+        assert_eq!(
+            std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         assert_eq!(first, Config::default());
-        assert!(home.0.join("config.json").exists());
-        assert_eq!(Config::load(&home.0).unwrap(), first);
+        assert!(home.join("config.json").exists());
+        assert_eq!(Config::load(&home).unwrap(), first);
         let names: Vec<_> = first.providers.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["DuckDuckGo", "Kagi", "Brave", "SearXNG"]);
         assert_eq!(first.search, "DuckDuckGo");
         assert_eq!(first.retention_days, 30);
+    }
+
+    #[test]
+    fn zero_retention_rejected() {
+        let home = temp_dir("config");
+        let mut json = serde_json::to_value(Config::default()).unwrap();
+        json["retention_days"] = 0.into();
+        write(&home.0, &json.to_string());
+        let error = Config::load(&home.0).unwrap_err().to_string();
+        assert!(error.contains("retention_days"), "{error}");
     }
 
     #[test]
@@ -160,11 +165,11 @@ mod tests {
 
     #[test]
     fn custom_provider_without_q_rejected() {
-        let home = Home::new();
-        home.write(&custom("Mine", "https://example.com/search"));
+        let home = temp_dir("config");
+        write(&home.0, &custom("Mine", "https://example.com/search"));
         let error = Config::load(&home.0).unwrap_err().to_string();
         assert!(error.contains("Mine") && error.contains("{q}"), "{error}");
-        home.write(&custom("Mine", "https://example.com/search?q={q}"));
+        write(&home.0, &custom("Mine", "https://example.com/search?q={q}"));
         assert_eq!(
             Config::load(&home.0).unwrap().search_url("x"),
             "https://example.com/search?q=x"
@@ -173,18 +178,18 @@ mod tests {
 
     #[test]
     fn unknown_active_provider_rejected() {
-        let home = Home::new();
-        home.write(&custom("Nope", "https://example.com/?q={q}"));
+        let home = temp_dir("config");
+        write(&home.0, &custom("Nope", "https://example.com/?q={q}"));
         let error = Config::load(&home.0).unwrap_err().to_string();
         assert!(error.contains("Nope"), "{error}");
     }
 
     #[test]
     fn unknown_config_field_rejected() {
-        let home = Home::new();
+        let home = temp_dir("config");
         let mut json: serde_json::Value = serde_json::to_value(Config::default()).unwrap();
         json["bogus"] = 1.into();
-        home.write(&json.to_string());
+        write(&home.0, &json.to_string());
         let error = format!("{:#}", Config::load(&home.0).unwrap_err());
         assert!(error.contains("bogus"), "{error}");
     }

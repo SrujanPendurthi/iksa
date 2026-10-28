@@ -14,9 +14,9 @@ pub fn detect(
     html: &str,
 ) -> Option<ChallengeKind> {
     let has_header = |name: &str, value: &str| {
-        headers
-            .iter()
-            .any(|(key, val)| key.eq_ignore_ascii_case(name) && val == value)
+        headers.iter().any(|(key, val)| {
+            key.eq_ignore_ascii_case(name) && val.trim().eq_ignore_ascii_case(value)
+        })
     };
     if has_header("cf-mitigated", "challenge")
         || (matches!(status, Some(403 | 503))
@@ -28,7 +28,7 @@ pub fn detect(
         || html.contains("class=\"cf-turnstile\"")
     {
         Some(ChallengeKind::Turnstile)
-    } else if html.contains("hcaptcha.com/") || html.contains("class=\"h-captcha\"") {
+    } else if html.contains("hcaptcha.com/1/api.js") || html.contains("class=\"h-captcha\"") {
         Some(ChallengeKind::HCaptcha)
     } else if html.contains("google.com/recaptcha") || html.contains("class=\"g-recaptcha\"") {
         Some(ChallengeKind::ReCaptcha)
@@ -43,6 +43,26 @@ mod tests {
 
     fn headers(name: &str, value: &str) -> Vec<(String, String)> {
         vec![(name.into(), value.into())]
+    }
+
+    #[test]
+    fn hcaptcha_privacy_link_is_not_challenge() {
+        assert_eq!(
+            detect(None, &[], r#"<a href="https://www.hcaptcha.com/privacy">"#),
+            None
+        );
+    }
+
+    #[test]
+    fn cf_header_case_and_space() {
+        assert_eq!(
+            detect(
+                Some(403),
+                &headers("Server", " Cloudflare "),
+                "Just a moment..."
+            ),
+            Some(ChallengeKind::CloudflareChallenge)
+        );
     }
 
     #[test]

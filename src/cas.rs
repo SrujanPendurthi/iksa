@@ -114,44 +114,21 @@ impl Cas {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        fs,
-        os::unix::fs::{DirBuilderExt, PermissionsExt},
-        sync::atomic::{AtomicU64, Ordering},
-    };
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    struct Temp(PathBuf);
-    impl Temp {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "iksa-cas-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
-            Self(path)
-        }
-        fn root(&self) -> PathBuf {
-            self.0.join("cas")
-        }
-    }
-    impl Drop for Temp {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::testutil::temp_dir;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
     fn blob(root: &Path, hash: &blake3::Hash) -> PathBuf {
         let hex = hash.to_hex();
         root.join(&hex[..2]).join(&hex[2..])
     }
     #[test]
     fn put_get_roundtrip() {
-        let temp = Temp::new();
-        let cas = Cas::open(temp.root()).unwrap();
+        let temp = temp_dir("cas");
+        let cas = Cas::open(temp.0.join("cas")).unwrap();
         let hash = cas.put(b"hello").unwrap();
         assert_eq!(hash, blake3::hash(b"hello"));
         assert_eq!(cas.get(&hash).unwrap(), b"hello");
-        let path = blob(&temp.root(), &hash);
+        let path = blob(&temp.0.join("cas"), &hash);
         assert_eq!(
             zstd::decode_all(fs::File::open(&path).unwrap()).unwrap(),
             b"hello"
@@ -168,8 +145,8 @@ mod tests {
     }
     #[test]
     fn put_is_deduplicated() {
-        let temp = Temp::new();
-        let cas = Cas::open(temp.root()).unwrap();
+        let temp = temp_dir("cas");
+        let cas = Cas::open(temp.0.join("cas")).unwrap();
         let data = vec![42; 100_000];
         let hash = cas.put(&data).unwrap();
         let size = cas.disk_bytes().unwrap();
@@ -195,7 +172,7 @@ mod tests {
         assert_eq!(cas.get(&concurrent_hash).unwrap(), concurrent);
         cas.delete(&concurrent_hash).unwrap();
         assert_eq!(cas.disk_bytes().unwrap(), size);
-        assert!(!fs::read_dir(temp.root()).unwrap().any(|entry| {
+        assert!(!fs::read_dir(temp.0.join("cas")).unwrap().any(|entry| {
             entry
                 .unwrap()
                 .file_name()
@@ -205,10 +182,10 @@ mod tests {
     }
     #[test]
     fn corrupt_blob_detected() {
-        let temp = Temp::new();
-        let cas = Cas::open(temp.root()).unwrap();
+        let temp = temp_dir("cas");
+        let cas = Cas::open(temp.0.join("cas")).unwrap();
         let hash = cas.put(b"hello").unwrap();
-        let path = blob(&temp.root(), &hash);
+        let path = blob(&temp.0.join("cas"), &hash);
         fs::write(&path, b"not zstd").unwrap();
         assert_eq!(
             cas.get(&hash).unwrap_err().kind(),
@@ -224,8 +201,8 @@ mod tests {
     }
     #[test]
     fn missing_blob_is_not_found() {
-        let temp = Temp::new();
-        let cas = Cas::open(temp.root()).unwrap();
+        let temp = temp_dir("cas");
+        let cas = Cas::open(temp.0.join("cas")).unwrap();
         assert_eq!(
             cas.get(&blake3::hash(b"missing")).unwrap_err().kind(),
             io::ErrorKind::NotFound
@@ -233,8 +210,8 @@ mod tests {
     }
     #[test]
     fn root_is_owner_only() {
-        let temp = Temp::new();
-        let root = temp.root();
+        let temp = temp_dir("cas");
+        let root = temp.0.join("cas");
         Cas::open(&root).unwrap();
         assert_eq!(
             fs::metadata(&root).unwrap().permissions().mode() & 0o777,

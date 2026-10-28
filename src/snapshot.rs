@@ -64,35 +64,9 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        fs,
-        path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
-        time::Instant,
-    };
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    struct Temp(PathBuf);
-    impl Temp {
-        fn new() -> Self {
-            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target/codex")
-                .join(format!(
-                    "snapshot-{}-{}",
-                    std::process::id(),
-                    NEXT.fetch_add(1, Ordering::Relaxed)
-                ));
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-        fn cas(&self) -> Cas {
-            Cas::open(self.0.join("cas")).unwrap()
-        }
-    }
-    impl Drop for Temp {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::testutil::temp_dir;
+    use std::time::Instant;
+
     fn fixture() -> String {
         (0..2000)
             .map(|i| format!("<div class=\"row\" id=\"r{i}\">item {i}</div>"))
@@ -118,8 +92,8 @@ mod tests {
     }
     #[test]
     fn small_edit_shares_chunks() {
-        let temp = Temp::new();
-        let cas = temp.cas();
+        let temp = temp_dir("snapshot");
+        let cas = Cas::open(temp.0.join("cas")).unwrap();
         let mut html = fixture();
         let before = chunk_hashes(&cas, &put(&cas, &html).unwrap()).unwrap();
         edit(&mut html);
@@ -134,8 +108,8 @@ mod tests {
     }
     #[test]
     fn roundtrip() {
-        let temp = Temp::new();
-        let cas = temp.cas();
+        let temp = temp_dir("snapshot");
+        let cas = Cas::open(temp.0.join("cas")).unwrap();
         for html in [fixture(), String::new(), "<p>你好😀</p>".into()] {
             let tree = put(&cas, &html).unwrap();
             assert_eq!(get(&cas, &tree).unwrap(), html);
@@ -169,8 +143,8 @@ mod tests {
     }
     #[test]
     fn ten_step_task_under_500kb() {
-        let temp = Temp::new();
-        let cas = temp.cas();
+        let temp = temp_dir("snapshot");
+        let cas = Cas::open(temp.0.join("cas")).unwrap();
         let mut html = fixture();
         for step in 0..10 {
             if step > 0 {
@@ -193,8 +167,8 @@ mod tests {
         let html = fixture();
         let mut timings = Vec::new();
         for run in 1..=5 {
-            let temp = Temp::new();
-            let cas = temp.cas();
+            let temp = temp_dir("snapshot");
+            let cas = Cas::open(temp.0.join("cas")).unwrap();
             assert!(cas.all().unwrap().is_empty());
             let start = Instant::now();
             let tree = put(&cas, &html).unwrap();

@@ -6,7 +6,7 @@ fn write() -> Risk {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     Navigate {
         url: String,
@@ -57,6 +57,16 @@ impl Action {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn action_unknown_field_rejected() {
+        assert!(
+            serde_json::from_str::<Action>(
+                r##"{"op":"click","selector":"#buy","rsik":"financial"}"##
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn action_json_shape() {

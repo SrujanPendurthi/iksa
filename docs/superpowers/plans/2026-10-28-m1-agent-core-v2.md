@@ -162,16 +162,18 @@ From Claude's caveman and ponytail reviews of `e451c1b` and `1439d7a`. One commi
 - `Config::load`: create `home` with `DirBuilder::new().recursive(true).mode(0o700)`; parse errors via `anyhow::Context::with_context(|| path.display().to_string())`; reject `retention_days == 0` with an error containing `retention_days`. `search_url` encodes with one `q.bytes().map(..).collect::<String>()` expression.
 - `challenge::detect`: header values compared with `val.trim().eq_ignore_ascii_case(value)`; hCaptcha rule becomes `hcaptcha.com/1/api.js` or `class="h-captcha"` (a bare `hcaptcha.com/` link no longer matches).
 
-- [ ] **Step 1: Tests first.**
+- [x] **Step 1: Tests first.**
   - `action::tests::action_unknown_field_rejected`: `{"op":"click","selector":"#buy","rsik":"financial"}` fails to parse.
   - `config::tests::default_config_written_and_reloaded`: also asserts the created `home` dir mode & 0o777 == 0o700 (use a nested `home` path inside the temp dir so `load` creates it).
   - `config::tests::zero_retention_rejected`: `retention_days: 0` -> `Err` containing `retention_days`.
   - `challenge::tests::hcaptcha_privacy_link_is_not_challenge`: `<a href="https://www.hcaptcha.com/privacy">` -> `None`.
   - `challenge::tests::cf_header_case_and_space`: status 403, headers `("Server", " Cloudflare ")`, html `Just a moment...` -> `CloudflareChallenge`.
-- [ ] **Step 2:** `cargo test --lib` — exactly those 5 fail.
-- [ ] **Step 3:** Implement the Interfaces; move cas/snapshot/config tests to `testutil::temp_dir` (snapshot tests stop writing under `target/codex`).
-- [ ] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass.
-- [ ] **Step 5:** Commit `fix: strict action JSON, 0700 home, captcha match tightening, shared test temp dir`.
+- [x] **Step 2:** `cargo test --lib` — exactly those 5 fail.
+- [x] **Step 3:** Implement the Interfaces; move cas/snapshot/config tests to `testutil::temp_dir` (snapshot tests stop writing under `target/codex`).
+- [x] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass.
+- [x] **Step 5:** Commit `fix: strict action JSON, 0700 home, captcha match tightening, shared test temp dir`.
+
+**Task 5b validation:** exactly the five listed regressions failed at runtime before implementation (28 passed, 5 failed, 1 ignored). C7b passes with 33 passed and 1 ignored; full normal suite passes and full release ignored suite passes (1 snapshot + 9 CDP). C7c has no matches (grep exit 1). The C7b expected wording “5 new tests; previous + 5” counts five regressions: four new test functions plus one strengthened existing test, so the actual library count increases from 29 to 33 passed. No assertions or performance thresholds were weakened. Evidence: `target/codex/v2-task5b-report.md`.
 
 ### Task 6: Ledger (SQLite)
 

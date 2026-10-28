@@ -77,8 +77,8 @@ After each run, Claude reviews the diff against the task before the next one sta
 - `pub(crate) fn split_frames(buf: &mut Vec<u8>) -> Vec<Vec<u8>>` — drains complete NUL-terminated frames, keeps the partial tail.
 - `tests/common/mod.rs`: `chromium() -> PathBuf` (env `CHROMIUM`, panic with a clear message if unset), `temp_profile() -> PathBuf` (fresh 0700 dir under `std::env::temp_dir()`), `test_args(profile) -> Vec<String>` (Global Constraints list + `--use-mock-keychain`), `serve(routes: &[(&str, Response)]) -> u16` (~25-line `TcpListener` thread; `Response { status: u16, headers: Vec<(String,String)>, body: String, hang: bool }`).
 
-- [ ] **Step 1: Failing unit tests (`src/cdp.rs`):** `split_frames_partial` (`b"{\"a\":1}\0{\"b\""` -> one frame, tail `{"b"` kept), `split_frames_many` (3 frames -> 3, buffer empty), `split_frames_none` (no NUL -> nothing, buffer unchanged).
-- [ ] **Step 2: Failing integration tests (`tests/cdp.rs`, `#[ignore]`):**
+- [x] **Step 1: Failing unit tests (`src/cdp.rs`):** `split_frames_partial` (`b"{\"a\":1}\0{\"b\""` -> one frame, tail `{"b"` kept), `split_frames_many` (3 frames -> 3, buffer empty), `split_frames_none` (no NUL -> nothing, buffer unchanged).
+- [x] **Step 2: Failing integration tests (`tests/cdp.rs`, `#[ignore]`):**
   - `version_over_pipe`: `Browser.getVersion` -> `product` starts with `Chrome/156`.
   - `no_tcp_listener`: `lsof -nP -a -p <pid> -iTCP -sTCP:LISTEN` prints nothing.
   - `hidden_target_navigate_eval_type`: context; hidden target; attach flatten; `Page.enable`; subscribe; `Page.navigate` to the fixture form (`<input id=q><button id=go onclick="out.textContent=q.value"><output id=out>`); wait for that session's `Page.loadEventFired` (5 s); focus `#q`; `Input.insertText("pipe typed")`; JS click `#go`; `#out` == `"pipe typed"`.
@@ -86,10 +86,10 @@ After each run, Claude reviews the diff against the task before the next one sta
   - `cdp_error_is_err`: `call("Nope.nope", json!({}), None)` -> `Err` containing `-32601`.
   - `browser_exit_fails_pending`: SIGKILL the pid; next call -> `Err` containing `browser closed` within 2 s.
   - `drop_kills_browser`: drop `Browser`; within 2 s `kill(pid, 0)` fails.
-- [ ] **Step 3:** `cargo test cdp` + the ignored command for `--test cdp` — FAIL.
-- [ ] **Step 4:** Implement.
-- [ ] **Step 5:** Same commands — 3 + 7 pass.
-- [ ] **Step 6:** Commit `feat: pipe-transport CDP client`.
+- [x] **Step 3:** `cargo test cdp` + the ignored command for `--test cdp` — FAIL.
+- [x] **Step 4:** Implement.
+- [x] **Step 5:** Same commands — 3 + 7 pass.
+- [x] **Step 6:** Commit `feat: pipe-transport CDP client`.
 
 ### Task 2: CAS blob store
 

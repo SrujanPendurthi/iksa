@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "iksa feasibility",
+  "version": "0.0.1",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwFsKfWPJyTHAuDMovUymVVxSALJPMyUwEbXYBj2p2sORx81rzFYNAWUigKNDojEZ3lho81uYcnlIZaHY0FvDYIWn99zVjfQWXXLyvpFOIp/W0N7Iue/zbKFCu0gtIeYE0kTQIkNCEuDxHomof0uMNSmAwNm9CCQw7IlXQIU5otDLLMpAATISkUFHSDdu2z6YTE/+MpVZ1dToHP/irmNSm5iIy+xZYcsBqYzJ+yBHMlHtZvprNAC/+RxwJtX2dVj3YaI2Op8COicT/UyurcwZblLu7YRu5txx/WOKBugrEevrFNZJZWx2yu29oVGbUxJZUyudomciUC6xfnyOFH54LQIDAQAB",
+  "permissions": [
+    "nativeMessaging"
+  ],
+  "chrome_settings_overrides": {
+    "search_provider": {
+      "name": "Spike DuckDuckGo",
+      "keyword": "spikeddg",
+      "search_url": "https://duckduckgo.com/?q={searchTerms}",
+      "favicon_url": "https://duckduckgo.com/favicon.ico",
+      "encoding": "UTF-8",
+      "is_default": true
+    }
+  }
+}

@@ -302,3 +302,48 @@ The parser decodes all 648 `logEventTypes` and 55 `logSourceType` constants, sel
 Both complete netlogs were additionally inspected across **all** events/params, not only selected events. Each has cookie-store lifecycle, cert verifier creation, HTTP-server-properties initialization/cache/prefs, network-quality changes and empty QUIC-pool cleanup records; no omitted URL/resolver/socket event or host-bearing parameter was found. Selected events being zero is actual absence, not a numeric-constant mismatch. Each `.audit.json` beside the netlog retains the complete decoded constants, all/selected event-source counts, selected string parameters, host evidence and exclusions. `s3-noext-audit-check.log` and `s3-ext-audit-check.log` retain independently enumerated all-event parameter strings and counts.
 
 Focused synthetic sanity evidence (`s3-parser-synthetic.json`, `.audit.json`, `s3-parser-sanity.log`) verifies numeric constants, source-type SOCKET selection, HTTP URL, failed hostname:port, nested resolver aliases and IPv4/IPv6 address_list, IPv4/IPv6 loopback and internal schemes. It yields seven hosts, exactly five non-loopback, two allowed loopbacks and two excluded internal URLs. Python syntax compilation also passed. No blocker or browser failure occurred. Limits: this is Chromium netlog evidence for two fresh-profile 120 s idle windows, not an OS packet capture, future-launch guarantee, or extension interaction/search/native-messaging egress test.
+
+## Spike 2 — S2'
+
+**PASS:** on 2026-10-28 the hidden target produced **60 frames in 6 s** with an explicit viewport and immediate acknowledgements; actual mouse input forwarding produced `forwarded_out=forwarded`. The visible positive control produced **47 frames in 6 s**, exceeding the expected ≥30. Evidence: `.spike-home/logs/s2-viewport-ack.log`; browser stderr: `.spike-home/logs/raw-s2-browser.log`; local server: `.spike-home/logs/s2-fixture-server.log`.
+
+The stdlib TCP spike harness uses the pinned headful Chrome/156.0.8078.47, revision `1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775`, final Spike 1 privacy flags and `--use-mock-keychain`. This run used a fresh 0700 profile under `.spike-home`; browser and fixture server HOME/CFFIXED_USER_HOME/TMPDIR were scoped there. The loopback-only fixture server was started for this run and stopped afterward; the browser also exited. No production client or dependency was introduced.
+
+`CDP.frame()` sends `Page.screencastFrameAck` immediately on the frame's target session before returning. Send-only acknowledgements get unique request IDs; ordinary calls retain their own saved ID, and ack replies are consumed separately. The log reports 107 successful acknowledgement responses and zero pending acknowledgements. This fixes the earlier delayed-ack positive control, which stalled at three frames.
+
+Both targets enable Page, set `Emulation.setDeviceMetricsOverride` to width 1280, height 800, deviceScaleFactor 1, mobile false before screencasting, and load the same local form. Both report `innerWidth=1280`, `innerHeight=800`. A 100 ms interval alternates the body background red/blue. The sampler continuously receives and acknowledges during its six-second interval, then stops screencasting; it does not sleep six seconds before draining events.
+
+| Variant | Frames | Actual sample seconds | Outcome |
+| --- | ---: | ---: | --- |
+| Hidden, viewport + immediate ack | 60 | 6.001852041998063 | PASS |
+| Hidden, viewport + focus emulation | Not run | — | Conditional fallback unnecessary: first variant >0 |
+| Visible control, same viewport + immediate ack | 47 | 6.00189733300067 | PASS (≥30) |
+
+```text
+hidden_window_error={"code": -32000, "message": "Browser window not found"}
+hidden_frames_viewport=60
+forwarded_click_center={"x": 171.89453125, "y": 90.625}
+forwarded_out=forwarded
+visible_control_frames=47
+ack_responses=107 pending_acks=0
+```
+
+The hidden input check focuses `#q` with Runtime.evaluate, sends `Input.insertText` with `forwarded`, computes the `#go` center from `getBoundingClientRect`, dispatches actual `Input.dispatchMouseEvent` mousePressed and mouseReleased with button left and clickCount 1 at that point, then reads `#out`. No JavaScript `.click()` was used as input proof. The target remains hidden: its browser-window query returns the exact error above. The conditional focus-emulation retry remains in the reproduction script and runs only if the first hidden variant yields zero frames.
+
+Reproduce with the scoped local form server running at `127.0.0.1:8765`:
+
+```sh
+HOME="$PWD/.spike-home" CFFIXED_USER_HOME="$PWD/.spike-home" TMPDIR="$PWD/.spike-home/tmp" \
+  python3 spikes/raw_probe.py s2 > .spike-home/logs/s2-viewport-ack.log 2>&1
+```
+
+This result resolves the raw-CDP screencast/input subcheck on this pin. It does not test chromiumoxide integration or implement Task 4's pipe client. Earlier Spike 1 zero/three-frame evidence remains historical. Syntax compilation and `git diff --check` pass. Tasks 1/2 measurements were retained; no redundant memory or idle-egress runs were needed for this frame-ack change.
+
+| Case | Actual Tasks 1–3 outcome | Result |
+| --- | --- | --- |
+| V1 Idle physical footprint | D 223.17 MB; E 224.11 MB median | PASS ≤300 MB |
+| V2 One hidden agent physical footprint | D 385.36 MB; E 366.14 MB median | PASS ≤~600 MB |
+| V3 Egress without extension | `NON_LOOPBACK=0`, host list `[]`, 120 s idle | PASS |
+| V4 Egress with extension | `NON_LOOPBACK=0`, host list `[]`, 120 s idle | PASS |
+| V5 Hidden screencast | Viewport 60 frames/6 s; focus retry unnecessary; visible 47/6 s | PASS |
+| V6 Hidden input forwarding | `forwarded_out=forwarded` after real mouse press/release | PASS |

@@ -79,12 +79,12 @@
 
 **Files:** Modify `spikes/raw_probe.py` (`s2` mode); results under `## Spike 2 — S2'`.
 
-- [ ] **Step 1:** In `CDP.frame()`, when a message's `method == "Page.screencastFrame"`, send `Page.screencastFrameAck { sessionId: params.sessionId }` on the same session before returning.
-- [ ] **Step 2:** On the hidden target, before `Page.startScreencast`, call `Emulation.setDeviceMetricsOverride { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false }`. Count frames over 6 s with the animated page (same as Spike 1).
-- [ ] **Step 3:** Also try `Emulation.setFocusEmulationEnabled { enabled: true }` if Step 2 yields 0 frames, and record each variant separately.
-- [ ] **Step 4:** Input forwarding check on the hidden target: `Input.dispatchMouseEvent` (`mousePressed` + `mouseReleased`, `button: "left"`, `clickCount: 1`) at the `#go` button's center (from `DOM.getBoxModel` or `getBoundingClientRect`) after `Input.insertText("forwarded")`; read `#out`.
-- [ ] **Step 5:** Record: frames per variant (hidden), frames (visible control, now acked), `#out` value. PASS = hidden frames > 0 and `#out == "forwarded"`.
-- [ ] **Step 6:** Commit `docs: S2' hidden screencast with viewport + ack`.
+- [x] **Step 1:** In `CDP.frame()`, when a message's `method == "Page.screencastFrame"`, send `Page.screencastFrameAck { sessionId: params.sessionId }` on the same session before returning.
+- [x] **Step 2:** On the hidden target, before `Page.startScreencast`, call `Emulation.setDeviceMetricsOverride { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false }`. Count frames over 6 s with the animated page (same as Spike 1).
+- [x] **Step 3:** Also try `Emulation.setFocusEmulationEnabled { enabled: true }` if Step 2 yields 0 frames, and record each variant separately.
+- [x] **Step 4:** Input forwarding check on the hidden target: `Input.dispatchMouseEvent` (`mousePressed` + `mouseReleased`, `button: "left"`, `clickCount: 1`) at the `#go` button's center (from `DOM.getBoxModel` or `getBoundingClientRect`) after `Input.insertText("forwarded")`; read `#out`.
+- [x] **Step 5:** Record: frames per variant (hidden), frames (visible control, now acked), `#out` value. PASS = hidden frames > 0 and `#out == "forwarded"`.
+- [x] **Step 6:** Commit `docs: S2' hidden screencast with viewport + ack`.
 
 **Verifiable:** log lines `hidden_frames_<variant>=<n>`, `visible_control_frames=<n>` (expect ≥ 30 in 6 s now that frames are acked), `forwarded_out=forwarded`.
 

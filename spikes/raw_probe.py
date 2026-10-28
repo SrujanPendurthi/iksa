@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Throwaway stdlib-only CDP websocket, to separate protocol from crate behavior."""
-import socket,base64,os,hashlib,struct,json,time,subprocess,pathlib,urllib.request,sys,shlex,re,statistics
+import socket,base64,os,hashlib,struct,json,time,subprocess,pathlib,urllib.request,sys,shlex,re,statistics,select
 ROOT=pathlib.Path.cwd(); HOME=ROOT/'.spike-home'
 class CDP:
  def __init__(self,url):
@@ -8,7 +8,7 @@ class CDP:
   u=urlparse(url);self.s=socket.create_connection((u.hostname,u.port),timeout=30);key=base64.b64encode(os.urandom(16)).decode();self.s.sendall(f'GET {u.path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n'.encode());b=b''
   while not b.endswith(b'\r\n\r\n'):b+=self.s.recv(1)
   assert b'101' in b,b
-  self.i=0;self.events=[]
+  self.i=0;self.events=[];self.acks=set();self.ack_responses=0
  def recv(self,n):
   b=b''
   while len(b)<n:
@@ -22,23 +22,35 @@ class CDP:
   elif n==127:n=struct.unpack('!Q',self.recv(8))[0]
   mask=self.recv(4) if b&128 else None;v=self.recv(n)
   if mask:v=bytes(x^mask[i%4] for i,x in enumerate(v))
-  return json.loads(v)
- def call(self,m,p=None,session=None):
+  message=json.loads(v)
+  if message.get('method')=='Page.screencastFrame':
+   # Send only: a recursive call would consume the outer request's reply.
+   ack=self.send('Page.screencastFrameAck',{'sessionId':message['params']['sessionId']},message.get('sessionId'))
+   self.acks.add(ack)
+  if message.get('id') in self.acks:
+   self.acks.remove(message['id']);self.ack_responses+=1
+   if 'error' in message:raise RuntimeError('screencast ack: '+json.dumps(message['error']))
+   return {}
+  return message
+ def send(self,m,p=None,session=None):
   self.i+=1;d={'id':self.i,'method':m,'params':p or {}}
   if session:d['sessionId']=session
   b=json.dumps(d).encode();n=len(b);mask=os.urandom(4);h=bytes([129,128|(n if n<126 else 126)])+(struct.pack('!H',n) if n>=126 else b'');self.s.sendall(h+mask+bytes(x^mask[i%4] for i,x in enumerate(b)))
+  return self.i
+ def call(self,m,p=None,session=None):
+  request_id=self.send(m,p,session)
   while True:
    r=self.frame()
-   if r.get('id')==self.i:
+   if r.get('id')==request_id:
     if 'error' in r:raise RuntimeError(json.dumps(r['error']))
     return r.get('result',{})
-   self.events.append(r)
+   if r:self.events.append(r)
 def main():
  mode=sys.argv[1]
  if mode=='s3':return s3_run()
  if mode=='s5' and not os.environ.get('SPIKE_S5_CHILD'):
   return s5_runs()
- profile=HOME/(('profile-raw-'+mode+'-'+str(time.time_ns())) if mode=='s5' else ('profile-raw-'+mode));profile.mkdir(mode=0o700,exist_ok=True);(profile/'DevToolsActivePort').unlink(missing_ok=True)
+ profile=HOME/(('profile-raw-'+mode+'-'+str(time.time_ns())) if mode in ('s5','s2') else ('profile-raw-'+mode));profile.mkdir(mode=0o700,exist_ok=True);(profile/'DevToolsActivePort').unlink(missing_ok=True)
  args=['use-mock-keychain','remote-debugging-address=127.0.0.1','remote-debugging-port=0','disable-background-networking','disable-component-update','disable-sync','no-pings','disable-domain-reliability','disable-field-trial-config','disable-breakpad','metrics-recording-only','no-default-browser-check','no-first-run','safebrowsing-disable-auto-update']
  if mode=='s5':
   extras=shlex.split(os.environ.get('SPIKE_ARGS',''))
@@ -54,21 +66,7 @@ def main():
   c=CDP('ws://127.0.0.1:'+port+path);print('version',c.call('Browser.getVersion'),flush=True)
   ctx=c.call('Target.createBrowserContext')['browserContextId']
   if mode=='s2':
-   tid=c.call('Target.createTarget',{'url':'about:blank','hidden':True,'browserContextId':ctx})['targetId'];print('hidden_target',tid,flush=True)
-   try:print('hidden_window',c.call('Browser.getWindowForTarget',{'targetId':tid}),flush=True)
-   except Exception as e:print('hidden_window_error',str(e),flush=True)
-   s=c.call('Target.attachToTarget',{'targetId':tid,'flatten':True})['sessionId'];c.call('Page.enable',session=s);print('navigate',c.call('Page.navigate',{'url':'http://127.0.0.1:8765/form.html'},s),flush=True);time.sleep(1)
-   def js(x):return c.call('Runtime.evaluate',{'expression':x,'returnByValue':True},s)
-   print('content',js('document.documentElement.outerHTML'),flush=True)
-   print('focus',js("document.querySelector('#q').focus();''"),flush=True);c.call('Input.insertText',{'text':'raw typed'},s);print('click',js("document.querySelector('#go').click();document.querySelector('#out').textContent"),flush=True)
-   c.call('Page.startScreencast',{},s);js("setInterval(()=>document.body.style.background=Math.random()>.5?'red':'blue',100);''");time.sleep(6);js('document.title');print('screencast_frames',sum(x.get('method')=='Page.screencastFrame' and x.get('sessionId')==s for x in c.events),flush=True)
-   try:print('activate',c.call('Target.activateTarget',{'targetId':tid}),flush=True)
-   except Exception as e:print('activate_error',str(e),flush=True)
-   try:print('activated_window',c.call('Browser.getWindowForTarget',{'targetId':tid}),flush=True)
-   except Exception as e:print('activated_window_error',str(e),flush=True)
-   js("document.cookie='spike=same-context;path=/';document.cookie")
-   v=c.call('Target.createTarget',{'url':'http://127.0.0.1:8765/form.html','browserContextId':ctx})['targetId'];vs=c.call('Target.attachToTarget',{'targetId':v,'flatten':True})['sessionId'];time.sleep(1);print('handoff_window',c.call('Browser.getWindowForTarget',{'targetId':v}),flush=True);print('handoff_cookie',c.call('Runtime.evaluate',{'expression':'document.cookie','returnByValue':True},vs),flush=True);c.call('Page.enable',{},vs);c.call('Page.startScreencast',{},vs);c.call('Runtime.evaluate',{'expression':"setInterval(()=>document.body.style.background=Math.random()>.5?'red':'blue',100);''"},vs);time.sleep(6);c.call('Runtime.evaluate',{'expression':'document.title'},vs);visible_frames=[e for e in c.events if e.get('method')=='Page.screencastFrame' and e.get('sessionId')==vs];print('visible_control_frames',len(visible_frames),flush=True)
-   for e in visible_frames:c.call('Page.screencastFrameAck',{'sessionId':e['params']['sessionId']},vs)
+   s2_experiment(c,ctx)
   if mode=='s5':
    time.sleep(10);print('idle_targets',json.dumps(c.call('Target.getTargets')),flush=True);print(subprocess.check_output([sys.executable,'spikes/measure.py','idle',str(proc.pid)],text=True),flush=True)
    t=c.call('Target.createTarget',{'url':'about:blank','hidden':True,'browserContextId':ctx})['targetId'];s=c.call('Target.attachToTarget',{'targetId':t,'flatten':True})['sessionId'];c.call('Page.enable',{},s);print('agent_navigation',c.call('Page.navigate',{'url':'https://en.wikipedia.org/wiki/Rust_(programming_language)'},s),flush=True);time.sleep(15);print('loaded_targets',json.dumps(c.call('Target.getTargets')),flush=True);print('agent_content',c.call('Runtime.evaluate',{'expression':'JSON.stringify({title:document.title,bytes:document.documentElement.outerHTML.length})','returnByValue':True},s),flush=True);print(subprocess.check_output([sys.executable,'spikes/measure.py','agent',str(proc.pid)],text=True),flush=True)
@@ -86,10 +84,63 @@ def main():
      if e.get('method')=='Network.responseReceived' and e.get('sessionId')==s and e['params'].get('type')=='Document':
       z=e['params']['response'];print(label,'response',z['url'],z['status'],z['headers'],flush=True)
   c.call('Browser.close')
- except Exception as e:print('ERROR',repr(e),flush=True);raise
+ except Exception as e:print('BLOCKED s2' if mode=='s2' else 'ERROR',type(e).__name__+': '+str(e),flush=True);raise
  finally:
   try:proc.wait(timeout=5)
   except subprocess.TimeoutExpired:proc.terminate();proc.wait(timeout=5)
+def s2_experiment(c,ctx):
+ viewport={'width':1280,'height':800,'deviceScaleFactor':1,'mobile':False}
+ url='http://127.0.0.1:8765/form.html'
+ def evaluate(session,expression):
+  result=c.call('Runtime.evaluate',{'expression':expression,'returnByValue':True},session)
+  if 'exceptionDetails' in result:raise RuntimeError(json.dumps(result['exceptionDetails']))
+  return result['result'].get('value')
+ def prepare(hidden):
+  params={'url':'about:blank','browserContextId':ctx}
+  if hidden:params['hidden']=True
+  target=c.call('Target.createTarget',params)['targetId']
+  print(('hidden' if hidden else 'visible')+'_target='+target,flush=True)
+  try:print(('hidden' if hidden else 'visible')+'_window',c.call('Browser.getWindowForTarget',{'targetId':target}),flush=True)
+  except RuntimeError as exc:print('hidden_window_error='+str(exc),flush=True)
+  session=c.call('Target.attachToTarget',{'targetId':target,'flatten':True})['sessionId']
+  c.call('Page.enable',{},session)
+  c.call('Emulation.setDeviceMetricsOverride',viewport,session)
+  print('navigate',c.call('Page.navigate',{'url':url},session),flush=True)
+  deadline=time.monotonic()+10
+  while not evaluate(session,"document.readyState==='complete' && !!document.querySelector('#go')"):
+   if time.monotonic()>deadline:raise TimeoutError('fixture not ready within 10s')
+   time.sleep(.05)
+  evaluate(session,"window.spikeTick=0;setInterval(()=>{document.body.style.background=(++window.spikeTick%2)?'red':'blue'},100);''")
+  print('viewport',evaluate(session,'JSON.stringify({width:innerWidth,height:innerHeight,url:location.href})'),flush=True)
+  return session
+ def sample(session,label):
+  # Receive throughout the sample: sleeping here would exhaust the frame window.
+  c.call('Page.startScreencast',{},session)
+  start=time.monotonic();deadline=start+6;count=0
+  while time.monotonic()<deadline:
+   if not select.select([c.s],[],[],max(0,deadline-time.monotonic()))[0]:break
+   event=c.frame()
+   if event.get('method')=='Page.screencastFrame' and event.get('sessionId')==session:count+=1
+  c.call('Page.stopScreencast',{},session)
+  print(label+'='+str(count),flush=True)
+  print(label+'_sample_seconds='+str(time.monotonic()-start),flush=True)
+  return count
+ hidden=prepare(True)
+ frames=sample(hidden,'hidden_frames_viewport')
+ if not frames:
+  c.call('Emulation.setFocusEmulationEnabled',{'enabled':True},hidden)
+  sample(hidden,'hidden_frames_viewport_focus')
+ evaluate(hidden,"document.querySelector('#q').focus();''")
+ c.call('Input.insertText',{'text':'forwarded'},hidden)
+ point=evaluate(hidden,"(()=>{const r=document.querySelector('#go').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()")
+ print('forwarded_click_center='+json.dumps(point),flush=True)
+ for kind in ['mousePressed','mouseReleased']:
+  c.call('Input.dispatchMouseEvent',{'type':kind,'button':'left','clickCount':1,**point},hidden)
+ print('forwarded_out='+str(evaluate(hidden,"document.querySelector('#out').textContent")),flush=True)
+ visible=prepare(False)
+ sample(visible,'visible_control_frames')
+ print('ack_responses='+str(c.ack_responses)+' pending_acks='+str(len(c.acks)),flush=True)
+
 def netlog_hosts(path):
  """Decode numeric constants and scan request/resolver/socket event and source params."""
  import ipaddress

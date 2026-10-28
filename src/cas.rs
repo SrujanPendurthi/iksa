@@ -62,27 +62,15 @@ impl Cas {
     }
     pub fn get(&self, hash: &blake3::Hash) -> io::Result<Vec<u8>> {
         let path = self.path(hash);
-        let file = File::open(&path)?;
-        let result = zstd::decode_all(file)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-            .and_then(|data| {
-                if blake3::hash(&data) == *hash {
-                    Ok(data)
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "CAS hash mismatch",
-                    ))
-                }
-            });
-        if result
-            .as_ref()
-            .is_err_and(|error| error.kind() == io::ErrorKind::InvalidData)
-        {
+        let data = zstd::decode_all(File::open(&path)?)
+            .ok()
+            .filter(|d| blake3::hash(d) == *hash);
+        data.ok_or_else(|| {
             let _ = fs::remove_file(path);
-        }
-        result
+            io::Error::new(io::ErrorKind::InvalidData, "CAS corrupt blob")
+        })
     }
+
     pub fn delete(&self, hash: &blake3::Hash) -> io::Result<()> {
         fs::remove_file(self.path(hash))
     }
@@ -91,22 +79,20 @@ impl Cas {
         for shard in fs::read_dir(&self.root)? {
             let shard = shard?;
             let prefix = shard.file_name();
-            let Some(prefix) = prefix.to_str() else {
-                continue;
-            };
             if !shard.file_type()?.is_dir() {
                 continue;
             }
             for blob in fs::read_dir(shard.path())? {
                 let blob = blob?;
-                let suffix = blob.file_name();
-                let Some(suffix) = suffix.to_str() else {
-                    continue;
-                };
-                if blob.file_type()?.is_file() {
-                    if let Some(hash) = blake3::Hash::from_hex(format!("{prefix}{suffix}")).ok() {
-                        hashes.push(hash);
-                    }
+                let name = blob.file_name();
+                if let Some(hash) = blake3::Hash::from_hex(format!(
+                    "{}{}",
+                    prefix.to_string_lossy(),
+                    name.to_string_lossy()
+                ))
+                .ok()
+                {
+                    hashes.push(hash);
                 }
             }
         }

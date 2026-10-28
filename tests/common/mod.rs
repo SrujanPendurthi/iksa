@@ -95,3 +95,37 @@ pub fn serve(routes: &[(&str, Response)]) -> u16 {
     });
     port
 }
+
+/// Transitive children from one process snapshot, excluding the root.
+pub fn descendants(pid: u32) -> Vec<u32> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let pairs: Vec<(u32, u32)> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut cols = line.split_whitespace();
+            (
+                cols.next().unwrap().parse().unwrap(),
+                cols.next().unwrap().parse().unwrap(),
+            )
+        })
+        .collect();
+    let mut tree = vec![pid];
+    loop {
+        let added: Vec<_> = pairs
+            .iter()
+            .filter(|(pid, parent)| tree.contains(parent) && !tree.contains(pid))
+            .map(|(pid, _)| *pid)
+            .collect();
+        if added.is_empty() {
+            break;
+        }
+        tree.extend(added);
+    }
+    tree.remove(0);
+    tree
+}

@@ -59,74 +59,31 @@ Notes for Codex runs (from Tasks 0–2):
 
 ---
 
-### Task 0: Close out spikes, rename docs
+## Done
 
-**Files:** rename `gemini-code-1793212240267.md` -> `PRD.md`, `gemini-code-1793212267498.md` -> `CLAUDE.md`; delete `spikes/src/`, `spikes/Cargo.toml`, `spikes/Cargo.lock`, `spikes/capture_window.py`, `docs/briefs/BRIEF_1_RESULT.md`; rewrite `spikes/README.md`; fill `CLAUDE.md`.
+| Task | Commit | What landed | Checks |
+| --- | --- | --- | --- |
+| 0 Close out spikes, rename docs | `4f82a25` | `PRD.md`, `CLAUDE.md`, spike Rust crate removed | C1 |
+| 1 Pipe CDP client | `516da26` | `src/cdp.rs`: `launch`, `Browser::{call, events, pid}`, `Event`, `split_frames`; `tests/common/mod.rs` (`chromium`, `temp_profile`, `test_args`, `serve`, `Response`) | C2, C3 |
+| 2 CAS blob store | `96193d0` | `src/cas.rs`: `Cas::{open, put, get, delete, all, disk_bytes}` | C4 |
+| 2b Review fixes | `1a98892` | `src/lib.rs` (`pub mod cas; pub mod cdp;`), clean `Browser.close` in `Drop`, CAS `sync_all` + plain rename + self-heal on corrupt read, superseded plans and briefs deleted | C4b–C4e |
 
-- [x] **Step 1:** `mv` the two docs (they're untracked), `git add PRD.md CLAUDE.md`.
-- [x] **Step 2:** `git rm -r` the files above. `spikes/README.md` becomes ≤ 8 lines: how to run `raw_probe.py s3|s5`, and that the whole `spikes/` dir is deleted at the end of Task 8.
-- [x] **Step 3:** `CLAUDE.md`: one-paragraph architecture (this plan's Architecture), module map (`cdp`, `cas`, `snapshot`, `config`, `gate`, `action`, `challenge`, `ledger`, `audit`, `engine`, `setup`, `main`), the test commands from Global Constraints, the rule "ignored tests must be run before a task is done", and "Codex implements; Claude plans and reviews".
-- [x] **Step 4:** Commit `chore: close spike 1/2, adopt PRD.md and CLAUDE.md`.
+New modules go in `src/lib.rs`; `main.rs` is the CLI only. Integration tests `use iksa::…`.
 
-### Task 1: Crate scaffold + pipe CDP client
+### Task 2c: Review trims (one commit, before Task 3)
 
-**Files:** Create `Cargo.toml`, `src/main.rs` (`mod cdp; fn main() {}`), `src/cdp.rs`, `tests/common/mod.rs`, `tests/cdp.rs`; `.gitignore` adds `/target`.
+From Claude's caveman and ponytail reviews of `1a98892`. No new behavior except item 1.
 
-**Interfaces — produces `cdp`:**
-- `pub struct Event { pub method: String, pub params: Value, pub session_id: Option<String> }` (Clone)
-- `pub struct Browser` — owns the child; `Drop` kills and reaps it.
-- `pub fn launch(exe: &Path, args: &[String]) -> anyhow::Result<Browser>` — appends `--remote-debugging-pipe`; child fd 3 reads our requests, fd 4 writes responses (`std::io::pipe()` + `libc::dup2` in `CommandExt::pre_exec`); a `std::thread` reads fd 4.
-- `Browser::call(&self, method: &str, params: Value, session: Option<&str>) -> anyhow::Result<Value>` — CDP error -> `Err` containing its `code` and `message`; EOF -> every pending call gets `Err("browser closed")`.
-- `Browser::events(&self) -> tokio::sync::broadcast::Receiver<Event>` (capacity 1024). Callers subscribe **before** the call whose events they need.
-- `Browser::pid(&self) -> u32`
-- `pub(crate) fn split_frames(buf: &mut Vec<u8>) -> Vec<Vec<u8>>` — drains complete NUL-terminated frames, keeps the partial tail.
-- `tests/common/mod.rs`: `chromium() -> PathBuf` (env `CHROMIUM`, panic with a clear message if unset), `temp_profile() -> PathBuf` (fresh 0700 dir under `std::env::temp_dir()`), `test_args(profile) -> Vec<String>` (Global Constraints list + `--use-mock-keychain`), `serve(routes: &[(&str, Response)]) -> u16` (~25-line `TcpListener` thread; `Response { status: u16, headers: Vec<(String,String)>, body: String, hang: bool }`).
-
-- [x] **Step 1: Failing unit tests (`src/cdp.rs`):** `split_frames_partial` (`b"{\"a\":1}\0{\"b\""` -> one frame, tail `{"b"` kept), `split_frames_many` (3 frames -> 3, buffer empty), `split_frames_none` (no NUL -> nothing, buffer unchanged).
-- [x] **Step 2: Failing integration tests (`tests/cdp.rs`, `#[ignore]`):**
-  - `version_over_pipe`: `Browser.getVersion` -> `product` starts with `Chrome/156`.
-  - `no_tcp_listener`: `lsof -nP -a -p <pid> -iTCP -sTCP:LISTEN` prints nothing.
-  - `hidden_target_navigate_eval_type`: context; hidden target; attach flatten; `Page.enable`; subscribe; `Page.navigate` to the fixture form (`<input id=q><button id=go onclick="out.textContent=q.value"><output id=out>`); wait for that session's `Page.loadEventFired` (5 s); focus `#q`; `Input.insertText("pipe typed")`; JS click `#go`; `#out` == `"pipe typed"`.
-  - `large_eval_roundtrip`: `'x'.repeat(2_000_000)` with `returnByValue` -> length 2,000,000.
-  - `cdp_error_is_err`: `call("Nope.nope", json!({}), None)` -> `Err` containing `-32601`.
-  - `browser_exit_fails_pending`: SIGKILL the pid; next call -> `Err` containing `browser closed` within 2 s.
-  - `drop_kills_browser`: drop `Browser`; within 2 s `kill(pid, 0)` fails.
-- [x] **Step 3:** `cargo test cdp` + the ignored command for `--test cdp` — FAIL.
-- [x] **Step 4:** Implement.
-- [x] **Step 5:** Same commands — 3 + 7 pass.
-- [x] **Step 6:** Commit `feat: pipe-transport CDP client`.
-
-### Task 2: CAS blob store
-
-**Files:** `src/cas.rs`.
-
-**Interfaces:** `Cas::open(root) -> io::Result<Cas>` (creates root 0700); `put(&[u8]) -> io::Result<blake3::Hash>` (idempotent, zstd level 3, write `tmp-<random>` then `rename`); `get(&Hash) -> io::Result<Vec<u8>>` (`InvalidData` on hash mismatch); `delete(&Hash)`; `all() -> io::Result<Vec<Hash>>`; `disk_bytes() -> io::Result<u64>`. Layout `root/ab/cdef…`.
-
-- [x] **Step 1: Failing tests:** `put_get_roundtrip` (hash == `blake3::hash(b"hello")`), `put_is_deduplicated` (second 100 KB put leaves `disk_bytes` unchanged), `corrupt_blob_detected` (`InvalidData`), `missing_blob_is_not_found` (`NotFound`), `root_is_owner_only` (mode & 0o777 == 0o700).
-- [x] **Step 2:** `cargo test cas` — FAIL. **Step 3:** implement. **Step 4:** 5 pass.
-- [x] **Step 5:** Commit `feat: CAS blob store (BLAKE3 + zstd)`.
-
-### Task 2b: Review fixes (CDP shutdown, lib crate, CAS crash safety, cleanup)
-
-From Claude's review of `516da26` and `96193d0` and the ponytail audit. Replaces `docs/briefs/BRIEF_1B_CDP_FIXES.md` (delete that file in this task).
-
-**Files:** `src/cdp.rs`, `src/cas.rs`, new `src/lib.rs`, `src/main.rs`, `tests/cdp.rs`, `tests/common/mod.rs`, `Cargo.toml`, `.gitignore`, `CLAUDE.md`, this plan; delete `docs/superpowers/plans/2026-10-28-agentic-browser-m1-agent-core.md`, `docs/superpowers/plans/2026-10-28-spike-2-unblock-m1.md`, `docs/briefs/` (whole dir).
+**Files:** `src/cdp.rs`, `src/cas.rs`, `tests/cdp.rs`, `tests/common/mod.rs`.
 
 **Interfaces:**
-- `src/lib.rs`: `pub mod cas; pub mod cdp;` — every later module is added here; `main.rs` holds only the CLI and uses `iksa::…`.
-- `cdp::Browser` `Drop`: write `{"id":0,"method":"Browser.close","params":{}}` + `\0` to the pipe (ignore errors), poll `child.try_wait()` every 50 ms up to 5 s, then `kill()` + `wait()`, then `state.close()`.
-- `Cas::put`: temp file `format!("tmp-{}-{:?}-{}", std::process::id(), std::thread::current().id(), hash.to_hex())` via `File::create`; shard dir via `fs::create_dir_all`; `sync_all()` before `fs::rename` (plain rename; delete `publish`, `renamex_np`, the Linux branch and the `/dev/urandom` loop; keep `TempBlob`).
-- `Cas::get`: on `InvalidData` (decode error or hash mismatch) `fs::remove_file` the blob, then return the error.
-- `Cas::all`: `blake3::Hash::from_hex(format!("{prefix}{name}")).ok()` over shard dirs; no `is_hex`, no length checks, no sort. `Cas::disk_bytes`: sum of `fs::metadata(self.path(h))?.len()` over `self.all()?`.
+- `tests/common/mod.rs`: `pub fn descendants(pid: u32) -> Vec<u32>` — every transitive child of `pid` from one `ps -axo pid=,ppid=` snapshot, excluding `pid` itself. Task 8's `tree_footprint_kib` uses it.
 
-- [x] **Step 1: Tests first.**
-  - `tests/cdp.rs`: replace `#[path = "../src/cdp.rs"] mod cdp;` with `use iksa::cdp;`. Add `#[ignore]` `drop_closes_gracefully` (after drop, `<profile>/Default/Preferences` exists and parses as JSON) and `drop_leaves_no_helpers` (descendant PIDs of the browser from `ps -axo pid=,ppid=` taken before drop are all gone within 5 s of drop).
-  - `src/cas.rs`: in `corrupt_blob_detected`, replace the "re-put leaves the corrupt blob" assertion with self-heal: after the failed `get`, `put(b"hello")` then `get` returns `b"hello"`. In `put_is_deduplicated`, drop the mtime assertion; compare `all()` results as sorted copies.
-- [x] **Step 2:** `cargo test` and the ignored `--test cdp` command — the new tests FAIL.
-- [x] **Step 3:** Implement the Interfaces above. Also: `tests/common/mod.rs` `temp_profile` becomes a single `DirBuilder::new().mode(0o700).create(&p).unwrap()` (no retry loop); `Cargo.toml` tokio features drop `process`; `.gitignore` drops `/spikes/target`; `CLAUDE.md` module map says "modules live in `src/lib.rs`; `main.rs` is the CLI only".
-- [x] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release --test cdp -- --ignored --test-threads=1` — all pass.
-- [x] **Step 5: Cleanup (untracked, no commit needed):** `rm -rf spikes/target .spike-home/downloads .spike-home/Library .spike-home/profile-raw-* .spike-home/profile-s4-fresh-*` and every `*.md`, `*.patch`, `*.py` directly under `.spike-home/` (not in subdirs). Keep `.spike-home/chromium/`, `.spike-home/logs/`, `.spike-home/profile/`, `.spike-home/www/`, `.spike-home/tmp/`, `.spike-home/ext-id`.
-- [x] **Step 6:** `git rm` the two superseded plans and `docs/briefs/`. Commit `fix: clean Chromium shutdown, lib crate, CAS crash safety; drop superseded plans`.
+- [x] **Step 1:** `tests/cdp.rs`: `drop_leaves_no_helpers` uses `common::descendants` (its inline `ps` walk goes away). `drop_closes_gracefully` additionally asserts `prefs["profile"]["exit_type"] == "Normal"`.
+- [x] **Step 2:** `src/cdp.rs` `Drop`: before writing `Browser.close`, set the writer fd non-blocking (`libc::fcntl(fd, F_SETFL, flags | O_NONBLOCK)`), so a wedged Chromium with a full pipe can't block `Drop` before the 5 s deadline. Add `use std::time::{Duration, Instant};` and drop the `std::time::` prefixes.
+- [x] **Step 3:** `src/cas.rs`: `get` becomes `let data = zstd::decode_all(File::open(&path)?).ok().filter(|d| blake3::hash(d) == *hash);` then `ok_or_else` that removes the file and returns `InvalidData` (`NotFound` from `File::open` still propagates). `all()`: no `to_str` let-else blocks and no `is_file` check; `Hash::from_hex(format!("{}{}", prefix.to_string_lossy(), name.to_string_lossy())).ok()`; keep the `is_dir()` check on shard entries.
+- [x] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release --test cdp -- --ignored --test-threads=1` — 8 unit, 9 ignored pass.
+- [x] **Step 5:** Commit `fix: non-blocking close write, clean exit check, trims`.
 
 ### Task 3: DOM snapshot chunking
 
@@ -199,7 +156,7 @@ From Claude's review of `516da26` and `96193d0` and the ponytail audit. Replaces
 
 ### Task 8: Engine on `cdp::Browser` + pillar tests
 
-**Files:** `src/engine.rs`, `tests/engine.rs`, `tests/pillars.rs`; extend `tests/common/mod.rs` with `tree_footprint_kib(pid) -> u64` (sum of `footprint -p <pid> -f bytes` `phys_footprint` over the pid and all descendants from `ps -axo pid=,ppid=`, ÷ 1024) and `netlog_hosts(path) -> Vec<String>` (every `params.url` host, `params.host`, `params.address` host across all events, loopback filtered out).
+**Files:** `src/engine.rs`, `tests/engine.rs`, `tests/pillars.rs`; extend `tests/common/mod.rs` with `tree_footprint_kib(pid) -> u64` (sum of `footprint -p <pid> -f bytes` `phys_footprint` over `pid` plus `common::descendants(pid)`, ÷ 1024) and `netlog_hosts(path) -> Vec<String>` (every `params.url` host, `params.host`, `params.address` host across all events, loopback filtered out).
 
 **Interfaces:**
 - `engine::launch_args(profile: &Path, mock_keychain: bool) -> Vec<String>` — exactly the Global Constraints list.
@@ -230,7 +187,7 @@ Fixture routes (`common::serve`): `/form` (`<h1>Form</h1>` + the Task 1 form), `
 - [ ] **Step 2:** `cargo test engine` + ignored `--test engine` and `--test pillars` — FAIL.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** Same commands — all pass. Record the numbers from the pillar tests (footprints, hosts) in `docs/perf.md`.
-- [ ] **Step 5:** `git rm -r spikes/` (the Rust tests replace it); update `CLAUDE.md` module map.
+- [ ] **Step 5:** `git rm -r spikes/` and `rm -rf .spike-home/profile .spike-home/www .spike-home/ext-id` (the Rust tests replace them; keep `.spike-home/chromium/` and `.spike-home/logs/`); update `CLAUDE.md` module map.
 - [ ] **Step 6:** Commit `feat: CDP engine with gates, snapshots, challenge pause; pillar tests`.
 
 ### Task 9: CLI, setup, end to end
@@ -258,14 +215,16 @@ Results go in `docs/perf.md` under `## Manual`.
 
 | # | Task | Check | Pass |
 | --- | --- | --- | --- |
-| C1 | 0 | `git ls-files spikes/src spikes/Cargo.toml` | empty |
-| C2 | 1 | `cargo test cdp` | 3 pass |
-| C3 | 1 | ignored `--test cdp` | 7 pass incl. `no_tcp_listener`, `browser_exit_fails_pending` |
-| C4 | 2 | `cargo test cas` | 5 pass |
-| C4b | 2b | `cargo test` + ignored `--test cdp` | unit all pass; 9 cdp pass incl. `drop_closes_gracefully`, `drop_leaves_no_helpers` |
-| C4c | 2b | `grep -c 'renamex_np\|urandom\|#\[path' src/cas.rs tests/cdp.rs` | 0 and 0 |
-| C4d | 2b | `git ls-files docs/briefs docs/superpowers/plans` | only `2026-10-28-m1-agent-core-v2.md` |
-| C4e | 2b | `du -sh spikes/target .spike-home` | `spikes/target` gone; `.spike-home` ≈ chromium + logs |
+| C1 | 0 | `git ls-files spikes/src spikes/Cargo.toml` | empty — **done** |
+| C2 | 1 | `cargo test cdp` | 3 pass — **done** |
+| C3 | 1 | ignored `--test cdp` | 7 pass incl. `no_tcp_listener`, `browser_exit_fails_pending` — **done** |
+| C4 | 2 | `cargo test cas` | 5 pass — **done** |
+| C4b | 2b | `cargo test` + ignored `--test cdp` | unit all pass; 9 cdp pass incl. `drop_closes_gracefully`, `drop_leaves_no_helpers` — **done** |
+| C4c | 2b | `grep -c 'renamex_np\|urandom\|#\[path' src/cas.rs tests/cdp.rs` | 0 and 0 — **done** |
+| C4d | 2b | `git ls-files docs/briefs docs/superpowers/plans` | only `2026-10-28-m1-agent-core-v2.md` — **done** |
+| C4e | 2b | `du -sh spikes/target .spike-home` | `spikes/target` gone; `.spike-home` ≈ chromium + logs — **done** |
+| C4f | 2c | `cargo test` + ignored `--test cdp` | 8 unit, 9 cdp pass; `drop_closes_gracefully` sees `exit_type == "Normal"` |
+| C4g | 2c | `grep -c 'std::time::\|to_str()' src/cdp.rs src/cas.rs` | 0 and 0 |
 | C5 | 3 | `cargo test snapshot` + release ignored | 5 pass; overhead < 25 ms |
 | C6 | 4 | `cargo test config gate action` | 9 pass |
 | C7 | 5 | `cargo test challenge` | 7 pass |

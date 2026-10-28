@@ -12,6 +12,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 use tokio::sync::{broadcast, oneshot};
 #[derive(Clone, Debug)]
@@ -180,17 +181,17 @@ impl Browser {
 }
 impl Drop for Browser {
     fn drop(&mut self) {
-        let _ = self
-            .writer
-            .lock()
-            .unwrap()
-            .write_all(b"{\"id\":0,\"method\":\"Browser.close\",\"params\":{}}\0");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
+        let mut writer = self.writer.lock().unwrap();
+        let fd = writer.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        let _ = writer.write_all(b"{\"id\":0,\"method\":\"Browser.close\",\"params\":{}}\0");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(50));
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -212,6 +213,55 @@ pub(crate) fn split_frames(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn drop_with_full_pipe_respects_deadline() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let fd = writer.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        loop {
+            match writer.write(&[0; 4096]) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill pipe: {error}"),
+            }
+        }
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let (events, _) = broadcast::channel(1);
+        let browser = Browser {
+            child,
+            writer: Mutex::new(writer),
+            state: Arc::new(Mutex::new(State::default())),
+            events,
+            next_id: AtomicU64::new(1),
+        };
+        // Release a blocked legacy write after seven seconds, so failure cannot hang.
+        let (done, wait) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(7));
+            drop(reader);
+        });
+        let start = Instant::now();
+        drop(browser);
+        let elapsed = start.elapsed();
+        let _ = done.send(());
+        watchdog.join().unwrap();
+        assert_ne!(
+            unsafe { libc::kill(pid as i32, 0) },
+            0,
+            "child survived drop"
+        );
+        assert!(
+            elapsed < Duration::from_millis(6500),
+            "drop took {elapsed:?}"
+        );
+    }
     #[test]
     fn split_frames_partial() {
         let mut b = b"{\"a\":1}\0{\"b\"".to_vec();

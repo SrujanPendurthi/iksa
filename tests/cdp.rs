@@ -220,7 +220,8 @@ async fn drop_closes_gracefully() {
     let _ = session(f.b()).await;
     drop(f.browser.take());
     let prefs = std::fs::read(f.profile.join("Default/Preferences")).unwrap();
-    let _: serde_json::Value = serde_json::from_slice(&prefs).unwrap();
+    let prefs: serde_json::Value = serde_json::from_slice(&prefs).unwrap();
+    assert_eq!(prefs["profile"]["exit_type"], "Normal");
 }
 
 #[tokio::test]
@@ -228,35 +229,7 @@ async fn drop_closes_gracefully() {
 async fn drop_leaves_no_helpers() {
     let mut f = Fixture::new();
     let _ = session(f.b()).await;
-    let output = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid="])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let pairs: Vec<(u32, u32)> = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| {
-            let mut cols = line.split_whitespace();
-            (
-                cols.next().unwrap().parse().unwrap(),
-                cols.next().unwrap().parse().unwrap(),
-            )
-        })
-        .collect();
-    let mut tree = vec![f.b().pid()];
-    loop {
-        let added: Vec<_> = pairs
-            .iter()
-            .filter(|(pid, parent)| tree.contains(parent) && !tree.contains(pid))
-            .map(|(pid, _)| *pid)
-            .collect();
-        if added.is_empty() {
-            break;
-        }
-        tree.extend(added);
-    }
-    let helpers = &tree[1..];
+    let helpers = common::descendants(f.b().pid());
     assert!(!helpers.is_empty(), "browser must have helpers before drop");
     drop(f.browser.take());
     tokio::time::timeout(Duration::from_secs(5), async {

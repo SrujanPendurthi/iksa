@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Throwaway stdlib-only CDP websocket, to separate protocol from crate behavior."""
-import socket,base64,os,hashlib,struct,json,time,subprocess,pathlib,urllib.request,sys
+import socket,base64,os,hashlib,struct,json,time,subprocess,pathlib,urllib.request,sys,shlex,re,statistics
 ROOT=pathlib.Path.cwd(); HOME=ROOT/'.spike-home'
 class CDP:
  def __init__(self,url):
@@ -34,10 +34,18 @@ class CDP:
     return r.get('result',{})
    self.events.append(r)
 def main():
- mode=sys.argv[1];profile=HOME/(('profile-raw-'+mode+'-'+str(time.time_ns())) if mode=='s5' else ('profile-raw-'+mode));profile.mkdir(mode=0o700,exist_ok=True);(profile/'DevToolsActivePort').unlink(missing_ok=True)
+ mode=sys.argv[1]
+ if mode=='s5' and not os.environ.get('SPIKE_S5_CHILD'):
+  return s5_runs()
+ profile=HOME/(('profile-raw-'+mode+'-'+str(time.time_ns())) if mode=='s5' else ('profile-raw-'+mode));profile.mkdir(mode=0o700,exist_ok=True);(profile/'DevToolsActivePort').unlink(missing_ok=True)
  args=['use-mock-keychain','remote-debugging-address=127.0.0.1','remote-debugging-port=0','disable-background-networking','disable-component-update','disable-sync','no-pings','disable-domain-reliability','disable-field-trial-config','disable-breakpad','metrics-recording-only','no-default-browser-check','no-first-run','safebrowsing-disable-auto-update']
+ if mode=='s5':
+  extras=shlex.split(os.environ.get('SPIKE_ARGS',''))
+  if any(x.startswith('-') or not x for x in extras):raise ValueError('SPIKE_ARGS requires space-separated bare keys')
+  args+=extras
+  print('launch_args',json.dumps(args), 'profile',str(profile),flush=True)
  env=os.environ|{'HOME':str(HOME),'CFFIXED_USER_HOME':str(HOME),'TMPDIR':str(HOME/'tmp')}
- log=open(HOME/'logs'/('raw-'+mode+'-browser.log'),'w');proc=subprocess.Popen([str(HOME/'chromium/Chromium.app/Contents/MacOS/Chromium'),*['--'+x for x in args],'--user-data-dir='+str(profile),'about:blank'],env=env,stdout=log,stderr=log)
+ log=open(HOME/'logs'/('s5-'+os.environ.get('SPIKE_CONFIG','custom')+'-'+os.environ.get('SPIKE_RUN','1')+'-browser.log' if mode=='s5' else 'raw-'+mode+'-browser.log'),'w');proc=subprocess.Popen([str(HOME/'chromium/Chromium.app/Contents/MacOS/Chromium'),*['--'+x for x in args],'--user-data-dir='+str(profile),'about:blank'],env=env,stdout=log,stderr=log)
  try:
   for _ in range(100):
    try:port,path=(profile/'DevToolsActivePort').read_text().splitlines();break
@@ -61,8 +69,8 @@ def main():
    v=c.call('Target.createTarget',{'url':'http://127.0.0.1:8765/form.html','browserContextId':ctx})['targetId'];vs=c.call('Target.attachToTarget',{'targetId':v,'flatten':True})['sessionId'];time.sleep(1);print('handoff_window',c.call('Browser.getWindowForTarget',{'targetId':v}),flush=True);print('handoff_cookie',c.call('Runtime.evaluate',{'expression':'document.cookie','returnByValue':True},vs),flush=True);c.call('Page.enable',{},vs);c.call('Page.startScreencast',{},vs);c.call('Runtime.evaluate',{'expression':"setInterval(()=>document.body.style.background=Math.random()>.5?'red':'blue',100);''"},vs);time.sleep(6);c.call('Runtime.evaluate',{'expression':'document.title'},vs);visible_frames=[e for e in c.events if e.get('method')=='Page.screencastFrame' and e.get('sessionId')==vs];print('visible_control_frames',len(visible_frames),flush=True)
    for e in visible_frames:c.call('Page.screencastFrameAck',{'sessionId':e['params']['sessionId']},vs)
   if mode=='s5':
-   time.sleep(10);print('idle_targets',json.dumps(c.call('Target.getTargets')),flush=True);print(subprocess.check_output([sys.executable,'spikes/measure.py','idle'],text=True),flush=True)
-   t=c.call('Target.createTarget',{'url':'about:blank','hidden':True,'browserContextId':ctx})['targetId'];s=c.call('Target.attachToTarget',{'targetId':t,'flatten':True})['sessionId'];c.call('Page.enable',{},s);print('agent_navigation',c.call('Page.navigate',{'url':'https://en.wikipedia.org/wiki/Rust_(programming_language)'},s),flush=True);time.sleep(15);print('loaded_targets',json.dumps(c.call('Target.getTargets')),flush=True);print('agent_content',c.call('Runtime.evaluate',{'expression':'JSON.stringify({title:document.title,bytes:document.documentElement.outerHTML.length})','returnByValue':True},s),flush=True);print(subprocess.check_output([sys.executable,'spikes/measure.py','agent'],text=True),flush=True)
+   time.sleep(10);print('idle_targets',json.dumps(c.call('Target.getTargets')),flush=True);print(subprocess.check_output([sys.executable,'spikes/measure.py','idle',str(proc.pid)],text=True),flush=True)
+   t=c.call('Target.createTarget',{'url':'about:blank','hidden':True,'browserContextId':ctx})['targetId'];s=c.call('Target.attachToTarget',{'targetId':t,'flatten':True})['sessionId'];c.call('Page.enable',{},s);print('agent_navigation',c.call('Page.navigate',{'url':'https://en.wikipedia.org/wiki/Rust_(programming_language)'},s),flush=True);time.sleep(15);print('loaded_targets',json.dumps(c.call('Target.getTargets')),flush=True);print('agent_content',c.call('Runtime.evaluate',{'expression':'JSON.stringify({title:document.title,bytes:document.documentElement.outerHTML.length})','returnByValue':True},s),flush=True);print(subprocess.check_output([sys.executable,'spikes/measure.py','agent',str(proc.pid)],text=True),flush=True)
   if mode=='s6':
    # No discoverTargets/autoAttach or target sessions during visible control load.
    for label,params in [('visible',{'url':'https://nowsecure.nl'}),('hidden',{'url':'about:blank','hidden':True,'browserContextId':ctx})]:
@@ -81,4 +89,25 @@ def main():
  finally:
   try:proc.wait(timeout=5)
   except subprocess.TimeoutExpired:proc.terminate();proc.wait(timeout=5)
+def s5_runs():
+ config=os.environ.get('SPIKE_CONFIG','custom')
+ if not re.fullmatch(r'[A-Za-z0-9_-]+',config):raise ValueError('unsafe SPIKE_CONFIG')
+ samples={'idle':[], 'agent':[], 'idle_rss':[]}
+ for run in range(1,4):
+  path=HOME/'logs'/f's5-{config}-{run}.log'
+  print('RUN',config,run,str(path),flush=True)
+  with path.open('w') as log:
+   result=subprocess.run([sys.executable,__file__,'s5'],env=os.environ|{'SPIKE_S5_CHILD':'1','SPIKE_RUN':str(run)},stdout=log,stderr=subprocess.STDOUT)
+  data=path.read_text()
+  if result.returncode:raise RuntimeError(f'{path}: child exit {result.returncode}')
+  for label in ['idle','agent']:
+   match=re.search(r'^'+label+r' FOOTPRINT_KiB=([\d.]+)$',data,re.M)
+   if match:samples[label].append(float(match[1]))
+   else:
+    causes=[line for line in data.splitlines() if 'BLOCKED' in line]
+    print('BLOCKED',config,run,label,'log='+str(path),'cause='+repr(causes or ['FOOTPRINT_KiB line missing']),flush=True)
+  match=re.search(r'^idle .* RSS_KiB=([\d.]+)$',data,re.M)
+  if match:samples['idle_rss'].append(float(match[1]))
+ for label,values in samples.items():
+  print('MEDIAN',config,label,'KiB='+str(statistics.median(values)) if len(values)==3 else 'BLOCKED', 'samples='+str(values),flush=True)
 if __name__=='__main__':main()

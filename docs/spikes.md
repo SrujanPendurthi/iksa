@@ -229,3 +229,52 @@ Final explicit privacy/runtime argument list (shell form; Rust `.args()` takes t
 ```
 
 Extension-free Rust launch additionally emits `--disable-extensions`; extension runs instead emit `--load-extension=<repo>/spikes/ext`. Both use headful mode and no `--enable-automation`. `--use-mock-keychain` is the user-requested macOS spike workaround, not an egress finding. Native messaging adds no listening port; the existing CDP port is loopback-only.
+
+## Spike 2 — S5'
+
+Run date: 2026-10-28, same arm64 machine and pinned Chrome/156.0.8078.47 (`Browser.getVersion` revision `1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775`). This rerun corrects S5's metric to **summed macOS `phys_footprint`**, median of three fresh-profile runs per config. MB below is decimal: `KiB × 1024 / 1,000,000`; no MiB/MB substitution. The targets remain ≤300 MB idle and ≤~600 MB with one hidden agent.
+
+`measure.py` snapshots the exact browser PID and descendants, excludes Python/ps/footprint helpers, and uses the identical PID set for RSS and footprint. Each `footprint -p PID -f bytes` output is retained, parsing the `phys_footprint:` auxiliary line, converting exact bytes to KiB, and summing. `-f bytes` avoids the tool's default per-process MB rounding. Access/parsing/timeout failures report BLOCKED instead of a partial total. RSS remains available for comparison, but it counts shared pages repeatedly and is not the decision metric. The earlier S5 driver-inclusive RSS is not directly comparable; these RSS samples consistently include only the browser tree. Process footprint samples are sequential, not simultaneous.
+
+Each run launches headful with the final Spike 1 privacy args, `--use-mock-keychain`, one visible `about:blank` and no extension. It creates an empty isolated browser context, settles 10 s, records idle targets and both metrics; creates exactly one hidden target in that context, navigates to Wikipedia's Rust article, settles 15 s, records loaded targets/content and both metrics. All final runs report the real Wikipedia title and 1,380,174–1,595,673 DOM characters (live-page variation). HOME, CFFIXED_USER_HOME, TMPDIR, unique 0700 profiles, downloads and logs stay under `.spike-home`. Browsers run serially and close after sampling. This uses the existing loopback TCP spike harness; it does not implement the new Task 4 pipe client.
+
+D uses `--disable-features=PreloadTopChromeWebUI,WebUIOmniboxPopup,WebUIOmniboxAimPopup`. Names are verified against the exact running Chromium revision: [`ui_features.cc`](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/chrome/browser/ui/ui_features.cc) defines `kPreloadTopChromeWebUI` enabled by default (line 205); [`webui_contents_preload_manager.cc`](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/chrome/browser/ui/webui/top_chrome/webui_contents_preload_manager.cc) checks it (line 95); [`omnibox_next_features.cc`](https://chromium.googlesource.com/chromium/src/+/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/chrome/browser/ui/omnibox/omnibox_next_features.cc) defines the two popup features enabled by default (lines 48/52). Saved sources and URL manifest are in `.spike-home/downloads/`. D is a combined lever; this experiment does not attribute the savings separately to its three features. A/B/C idle inventories retain both `chrome://omnibox-popup.top-chrome/` and `.../omnibox_popup_aim.html`; D/E inventories contain only `about:blank`, corroborating removal of both idle WebUI targets.
+
+Reproduce from the repository root (each command performs three serial fresh-profile runs; arguments are bare keys):
+
+```sh
+spike_s5() {
+  env HOME="$PWD/.spike-home" CFFIXED_USER_HOME="$PWD/.spike-home" \
+    TMPDIR="$PWD/.spike-home/tmp" SPIKE_CONFIG="$1" SPIKE_ARGS="$2" \
+    python3 spikes/raw_probe.py s5
+}
+spike_s5 A ''
+spike_s5 B 'renderer-process-limit=2'
+spike_s5 C 'process-per-site'
+spike_s5 D 'disable-features=PreloadTopChromeWebUI,WebUIOmniboxPopup,WebUIOmniboxAimPopup'
+spike_s5 E 'renderer-process-limit=2 process-per-site disable-features=PreloadTopChromeWebUI,WebUIOmniboxPopup,WebUIOmniboxAimPopup'
+```
+
+Evidence: `.spike-home/logs/s5-<A–E>-<1–3>.log`, plus `s5-<config>-summary.log` and separate `s5-<config>-<run>-browser.log`. Each run retains flags/profile, version, target inventories, content proof, `PROCESS` ancestry/RSS, full per-PID footprint output, `PID_FOOTPRINT_KiB=`, aggregate `idle FOOTPRINT_KiB=` and `agent FOOTPRINT_KiB=`, and idle/agent `RSS_KiB=`. An initial default-formatted A1 was replaced with a new exact-byte run before computing this final matrix; all final 15 logs use bytes. A summary was regenerated from those final logs.
+
+| Config / extra flags | Idle median footprint MB | Loaded median footprint MB | Idle median RSS MB |
+| --- | ---: | ---: | ---: |
+| A baseline | 398.53 | 557.79 | 988.32 |
+| B `renderer-process-limit=2` | 380.43 | 549.45 | 882.29 |
+| C `process-per-site` | 402.74 | 557.28 | 990.81 |
+| D disable the three WebUI features above | 223.17 | 385.36 | 774.86 |
+| E B + C + D | 224.11 | 366.14 | 777.58 |
+
+Raw run evidence below gives the aggregate KiB samples in run order 1/2/3. Median footprint columns trace to `FOOTPRINT_KiB=`; idle RSS traces to its companion `RSS_KiB=` over the same PIDs.
+
+| Config | Idle footprint KiB, runs 1/2/3 | Loaded footprint KiB, runs 1/2/3 | Idle RSS KiB, runs 1/2/3 |
+| --- | --- | --- | --- |
+| A | 394376.859375, 389192.671875, 388984.6484375 | 548234.359375, 543898.125, 544714.1484375 | 970112, 963152, 965152 |
+| B | 371591.640625, 371511.5, 365687.453125 | 536569.140625, 586121.0234375, 507960.9296875 | 865136, 861408, 861616 |
+| C | 393304.6953125, 395688.8828125, 388152.765625 | 549530.171875, 531194.3359375, 544218.171875 | 967584, 970624, 960624 |
+| D | 218855.359375, 217527.1953125, 217943.21875 | 377832.859375, 372920.6953125, 376328.71875 | 760496, 751328, 756704 |
+| E | 220919.3125, 218567.40625, 218855.03125 | 357559.59375, 359655.6640625, 343111.5234375 | 757984, 759664, 759360 |
+
+**PASS:** D and E each meet both unchanged targets (≤300 MB idle and ≤~600 MB loaded). A/B/C fail the idle target. D alone is sufficient; E has the lowest loaded median in this matrix. No target relaxation is needed for this one-agent workload. This is not evidence for five tabs/three agents, nor a production rollout of these flags. All 15 samples completed without a measurement blocker; the final browser processes were closed.
+
+Validation: Python syntax compiled; audit of all 15 logs verified 15 distinct 0700 profiles, pinned version/revision, real Wikipedia content, exact per-PID byte parsing and sums (204 PID samples), browser-only PID sets, target inventories, and both omitted WebUI URLs for all D/E idle and loaded samples. Audit summary: `.spike-home/logs/s5-audit.json`.

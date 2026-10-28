@@ -1,5 +1,4 @@
-#[path = "../src/cdp.rs"]
-mod cdp;
+use iksa::cdp;
 mod common;
 use serde_json::json;
 use std::time::Duration;
@@ -212,4 +211,62 @@ async fn drop_kills_browser() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn drop_closes_gracefully() {
+    let mut f = Fixture::new();
+    let _ = session(f.b()).await;
+    drop(f.browser.take());
+    let prefs = std::fs::read(f.profile.join("Default/Preferences")).unwrap();
+    let _: serde_json::Value = serde_json::from_slice(&prefs).unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn drop_leaves_no_helpers() {
+    let mut f = Fixture::new();
+    let _ = session(f.b()).await;
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let pairs: Vec<(u32, u32)> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut cols = line.split_whitespace();
+            (
+                cols.next().unwrap().parse().unwrap(),
+                cols.next().unwrap().parse().unwrap(),
+            )
+        })
+        .collect();
+    let mut tree = vec![f.b().pid()];
+    loop {
+        let added: Vec<_> = pairs
+            .iter()
+            .filter(|(pid, parent)| tree.contains(parent) && !tree.contains(pid))
+            .map(|(pid, _)| *pid)
+            .collect();
+        if added.is_empty() {
+            break;
+        }
+        tree.extend(added);
+    }
+    let helpers = &tree[1..];
+    assert!(!helpers.is_empty(), "browser must have helpers before drop");
+    drop(f.browser.take());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while helpers
+            .iter()
+            .any(|pid| unsafe { libc::kill(*pid as i32, 0) } == 0)
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("browser helpers survived drop");
 }

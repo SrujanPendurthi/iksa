@@ -180,9 +180,21 @@ impl Browser {
 }
 impl Drop for Browser {
     fn drop(&mut self) {
-        self.state.lock().unwrap().close();
+        let _ = self
+            .writer
+            .lock()
+            .unwrap()
+            .write_all(b"{\"id\":0,\"method\":\"Browser.close\",\"params\":{}}\0");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.state.lock().unwrap().close();
     }
 }
 pub(crate) fn split_frames(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {

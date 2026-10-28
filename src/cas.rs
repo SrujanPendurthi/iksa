@@ -1,11 +1,7 @@
 use std::{
-    ffi::CString,
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
-    },
+    fs::{self, File},
+    io::{self, Write},
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -25,29 +21,6 @@ fn private_dir(path: &Path) -> io::Result<()> {
         ));
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-}
-
-// Renaming exclusively keeps an existing immutable blob intact even when writers race.
-fn publish(from: &Path, to: &Path) -> io::Result<()> {
-    let from = CString::new(from.as_os_str().as_bytes())?;
-    let to = CString::new(to.as_os_str().as_bytes())?;
-    #[cfg(target_os = "macos")]
-    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
-    #[cfg(target_os = "linux")]
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
 }
 
 struct TempBlob(PathBuf);
@@ -74,44 +47,41 @@ impl Cas {
         if destination.try_exists()? {
             return Ok(hash);
         }
-        private_dir(destination.parent().unwrap())?;
-        let mut entropy = File::open("/dev/urandom")?;
-        let (temp, mut file) = loop {
-            let mut bytes = [0u8; 16];
-            entropy.read_exact(&mut bytes)?;
-            let suffix: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-            let path = self.root.join(format!("tmp-{suffix}"));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-            {
-                Ok(file) => break (TempBlob(path), file),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        };
+        fs::create_dir_all(destination.parent().unwrap())?;
+        let temp = TempBlob(self.root.join(format!(
+            "tmp-{}-{:?}-{}",
+            std::process::id(),
+            std::thread::current().id(),
+            hash.to_hex()
+        )));
+        let mut file = File::create(&temp.0)?;
         file.write_all(&zstd::encode_all(data, 3)?)?;
-        drop(file);
-        match publish(&temp.0, &destination) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
+        file.sync_all()?;
+        fs::rename(&temp.0, &destination)?;
         Ok(hash)
     }
     pub fn get(&self, hash: &blake3::Hash) -> io::Result<Vec<u8>> {
-        let file = File::open(self.path(hash))?;
-        let data = zstd::decode_all(file)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if blake3::hash(&data) != *hash {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "CAS hash mismatch",
-            ));
+        let path = self.path(hash);
+        let file = File::open(&path)?;
+        let result = zstd::decode_all(file)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            .and_then(|data| {
+                if blake3::hash(&data) == *hash {
+                    Ok(data)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "CAS hash mismatch",
+                    ))
+                }
+            });
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::InvalidData)
+        {
+            let _ = fs::remove_file(path);
         }
-        Ok(data)
+        result
     }
     pub fn delete(&self, hash: &blake3::Hash) -> io::Result<()> {
         fs::remove_file(self.path(hash))
@@ -124,7 +94,7 @@ impl Cas {
             let Some(prefix) = prefix.to_str() else {
                 continue;
             };
-            if prefix.len() != 2 || !is_hex(prefix) || !shard.file_type()?.is_dir() {
+            if !shard.file_type()?.is_dir() {
                 continue;
             }
             for blob in fs::read_dir(shard.path())? {
@@ -133,39 +103,20 @@ impl Cas {
                 let Some(suffix) = suffix.to_str() else {
                     continue;
                 };
-                if suffix.len() == 62 && is_hex(suffix) && blob.file_type()?.is_file() {
-                    let hash = blake3::Hash::from_hex(format!("{prefix}{suffix}"))
-                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                    hashes.push(hash);
-                }
-            }
-        }
-        hashes.sort_by_key(|hash| *hash.as_bytes());
-        Ok(hashes)
-    }
-    pub fn disk_bytes(&self) -> io::Result<u64> {
-        let mut bytes = 0;
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                bytes += entry.metadata()?.len();
-            } else if entry.file_type()?.is_dir() {
-                for blob in fs::read_dir(entry.path())? {
-                    let blob = blob?;
-                    if blob.file_type()?.is_file() {
-                        bytes += blob.metadata()?.len();
+                if blob.file_type()?.is_file() {
+                    if let Some(hash) = blake3::Hash::from_hex(format!("{prefix}{suffix}")).ok() {
+                        hashes.push(hash);
                     }
                 }
             }
         }
-        Ok(bytes)
+        Ok(hashes)
     }
-}
-
-fn is_hex(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    pub fn disk_bytes(&self) -> io::Result<u64> {
+        self.all()?.iter().try_fold(0, |bytes, hash| {
+            Ok(bytes + fs::metadata(self.path(hash))?.len())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -231,16 +182,8 @@ mod tests {
         let hash = cas.put(&data).unwrap();
         let size = cas.disk_bytes().unwrap();
         assert!(size > 0);
-        let original = fs::metadata(blob(&temp.root(), &hash)).unwrap();
         assert_eq!(cas.put(&data).unwrap(), hash);
         assert_eq!(cas.disk_bytes().unwrap(), size);
-        assert_eq!(
-            fs::metadata(blob(&temp.root(), &hash))
-                .unwrap()
-                .modified()
-                .unwrap(),
-            original.modified().unwrap()
-        );
         let concurrent = vec![99; 100_000];
         let concurrent_hash = blake3::hash(&concurrent);
         let barrier = std::sync::Barrier::new(8);
@@ -254,7 +197,9 @@ mod tests {
         });
         let mut expected = vec![hash, concurrent_hash];
         expected.sort_by_key(|hash| *hash.as_bytes());
-        assert_eq!(cas.all().unwrap(), expected);
+        let mut actual = cas.all().unwrap();
+        actual.sort_by_key(|hash| *hash.as_bytes());
+        assert_eq!(actual, expected);
         assert_eq!(cas.get(&concurrent_hash).unwrap(), concurrent);
         cas.delete(&concurrent_hash).unwrap();
         assert_eq!(cas.disk_bytes().unwrap(), size);
@@ -278,7 +223,7 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         cas.put(b"hello").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"not zstd");
+        assert_eq!(cas.get(&hash).unwrap(), b"hello");
         fs::write(path, zstd::encode_all(&b"wrong"[..], 3).unwrap()).unwrap();
         assert_eq!(
             cas.get(&hash).unwrap_err().kind(),

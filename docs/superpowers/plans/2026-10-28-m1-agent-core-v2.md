@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Supersedes:** `2026-10-28-agentic-browser-m1-agent-core.md` (all tasks) and `2026-10-28-spike-2-unblock-m1.md` Tasks 4–6. Those files stay as history; do not execute them.
+**Supersedes:** the v1 M1 plan and the Spike 2 plan (deleted in Task 2b; both are in git history at `e3c5fb5`).
 
 **Goal:** A CLI agent core: queue scripted tasks, run them in hidden isolated Chromium tabs behind risk gates, pause on CAPTCHA or approval, and emit a private, deduplicated audit log plus Markdown report — with memory and egress checked by tests.
 
@@ -36,6 +36,7 @@
 
 ## Review Focus
 
+- **iksa exits while Chromium runs**: Chromium closes cleanly (cookies and prefs flushed) and no helper process survives. Tests `drop_closes_gracefully`, `drop_leaves_no_helpers` (Task 2b).
 - **Chromium crashes mid-call**: pending calls fail fast with `browser closed`, no hang. Test `browser_exit_fails_pending` (Task 1).
 - **Process killed mid-task**: next `iksa run` requeues it at its saved cursor. Test `recover_requeues_executing` (Task 6).
 - **Secret typed into a form**: never in record JSON, report, or DB. Test `secret_never_rendered` (Task 7).
@@ -51,6 +52,10 @@ Read docs/superpowers/plans/2026-10-28-m1-agent-core-v2.md. Do Task <N> only, TD
 ```
 
 After each run, Claude reviews the diff against the task before the next one starts.
+
+Notes for Codex runs (from Tasks 0–2):
+- Your per-task scratch reports go in `.spike-home/` and are deleted in Task 2b. From Task 3 on, write scratch to `target/codex/` (gitignored via `/target`) instead.
+- `cdp::Browser::call` writes synchronously under a mutex. Fine while Chromium is alive; if a step deadline fires because Chromium itself is wedged, the engine drops the `Browser` (Task 2b makes that a clean close + kill). Don't build a separate async writer.
 
 ---
 
@@ -100,6 +105,28 @@ After each run, Claude reviews the diff against the task before the next one sta
 - [x] **Step 1: Failing tests:** `put_get_roundtrip` (hash == `blake3::hash(b"hello")`), `put_is_deduplicated` (second 100 KB put leaves `disk_bytes` unchanged), `corrupt_blob_detected` (`InvalidData`), `missing_blob_is_not_found` (`NotFound`), `root_is_owner_only` (mode & 0o777 == 0o700).
 - [x] **Step 2:** `cargo test cas` — FAIL. **Step 3:** implement. **Step 4:** 5 pass.
 - [x] **Step 5:** Commit `feat: CAS blob store (BLAKE3 + zstd)`.
+
+### Task 2b: Review fixes (CDP shutdown, lib crate, CAS crash safety, cleanup)
+
+From Claude's review of `516da26` and `96193d0` and the ponytail audit. Replaces `docs/briefs/BRIEF_1B_CDP_FIXES.md` (delete that file in this task).
+
+**Files:** `src/cdp.rs`, `src/cas.rs`, new `src/lib.rs`, `src/main.rs`, `tests/cdp.rs`, `tests/common/mod.rs`, `Cargo.toml`, `.gitignore`, `CLAUDE.md`, this plan; delete `docs/superpowers/plans/2026-10-28-agentic-browser-m1-agent-core.md`, `docs/superpowers/plans/2026-10-28-spike-2-unblock-m1.md`, `docs/briefs/` (whole dir).
+
+**Interfaces:**
+- `src/lib.rs`: `pub mod cas; pub mod cdp;` — every later module is added here; `main.rs` holds only the CLI and uses `iksa::…`.
+- `cdp::Browser` `Drop`: write `{"id":0,"method":"Browser.close","params":{}}` + `\0` to the pipe (ignore errors), poll `child.try_wait()` every 50 ms up to 5 s, then `kill()` + `wait()`, then `state.close()`.
+- `Cas::put`: temp file `format!("tmp-{}-{:?}-{}", std::process::id(), std::thread::current().id(), hash.to_hex())` via `File::create`; shard dir via `fs::create_dir_all`; `sync_all()` before `fs::rename` (plain rename; delete `publish`, `renamex_np`, the Linux branch and the `/dev/urandom` loop; keep `TempBlob`).
+- `Cas::get`: on `InvalidData` (decode error or hash mismatch) `fs::remove_file` the blob, then return the error.
+- `Cas::all`: `blake3::Hash::from_hex(format!("{prefix}{name}")).ok()` over shard dirs; no `is_hex`, no length checks, no sort. `Cas::disk_bytes`: sum of `fs::metadata(self.path(h))?.len()` over `self.all()?`.
+
+- [x] **Step 1: Tests first.**
+  - `tests/cdp.rs`: replace `#[path = "../src/cdp.rs"] mod cdp;` with `use iksa::cdp;`. Add `#[ignore]` `drop_closes_gracefully` (after drop, `<profile>/Default/Preferences` exists and parses as JSON) and `drop_leaves_no_helpers` (descendant PIDs of the browser from `ps -axo pid=,ppid=` taken before drop are all gone within 5 s of drop).
+  - `src/cas.rs`: in `corrupt_blob_detected`, replace the "re-put leaves the corrupt blob" assertion with self-heal: after the failed `get`, `put(b"hello")` then `get` returns `b"hello"`. In `put_is_deduplicated`, drop the mtime assertion; compare `all()` results as sorted copies.
+- [x] **Step 2:** `cargo test` and the ignored `--test cdp` command — the new tests FAIL.
+- [x] **Step 3:** Implement the Interfaces above. Also: `tests/common/mod.rs` `temp_profile` becomes a single `DirBuilder::new().mode(0o700).create(&p).unwrap()` (no retry loop); `Cargo.toml` tokio features drop `process`; `.gitignore` drops `/spikes/target`; `CLAUDE.md` module map says "modules live in `src/lib.rs`; `main.rs` is the CLI only".
+- [x] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release --test cdp -- --ignored --test-threads=1` — all pass.
+- [x] **Step 5: Cleanup (untracked, no commit needed):** `rm -rf spikes/target .spike-home/downloads .spike-home/Library .spike-home/profile-raw-* .spike-home/profile-s4-fresh-*` and every `*.md`, `*.patch`, `*.py` directly under `.spike-home/` (not in subdirs). Keep `.spike-home/chromium/`, `.spike-home/logs/`, `.spike-home/profile/`, `.spike-home/www/`, `.spike-home/tmp/`, `.spike-home/ext-id`.
+- [x] **Step 6:** `git rm` the two superseded plans and `docs/briefs/`. Commit `fix: clean Chromium shutdown, lib crate, CAS crash safety; drop superseded plans`.
 
 ### Task 3: DOM snapshot chunking
 
@@ -164,7 +191,7 @@ After each run, Claude reviews the diff against the task before the next one sta
 - `StepRecord::new(step, &Action, decision, after, outcome)` stores `action.redacted()` and forces `after = None` for `Financial` risk.
 - `Ledger::record_step(id, &StepRecord)`, `Ledger::records(id) -> Vec<StepRecord>`, `Ledger::delete_task(id)`.
 - `audit::render(&Task, &[StepRecord], &Cas) -> io::Result<String>`: `# Task {id}: {title}`, state line, per step `## Step N — {op}`, action JSON, decision, outcome (≤ 2,000 chars), `DOM: {changed}/{total} chunks changed` vs previous snapshot, or `DOM: not stored`.
-- `audit::gc(&Ledger, &Cas, retention_days, now_ms) -> anyhow::Result<(usize, usize)>`: drop finished tasks older than retention, then mark-and-sweep unreachable blobs.
+- `audit::gc(&Ledger, &Cas, retention_days, now_ms) -> anyhow::Result<(usize, usize)>`: drop finished tasks older than retention, then mark-and-sweep unreachable blobs. Also removes `tmp-*` files in the CAS root older than 1 hour (left by crashes). Must not run while any task is `Executing` (M1 only calls it before tasks start).
 
 - [ ] **Step 1: Failing tests:** `report_lists_every_step`, `secret_never_rendered`, `financial_step_stores_no_snapshot`, `records_roundtrip`, `dom_change_summary`, `gc_removes_old_tasks_and_orphan_blobs` (shared blobs kept, running task untouched).
 - [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** pass.
@@ -192,6 +219,7 @@ How `run` maps to CDP (algorithm, since the signatures don't fix it):
 5. `challenge::detect(..)`. For `Turnstile`, poll `document.querySelector('[name="cf-turnstile-response"]')?.value` every 250 ms for up to `TURNSTILE_WAIT`; non-empty -> not a challenge. Any remaining kind -> `AwaitingHandoff(Challenge(k))`, return without advancing the cursor.
 6. Error/timeout: record outcome `error: …` / `timeout at step N`; `Failed(..)`; return.
 7. `set_cursor(cursor + 1)`; after the last step `Committed`. Always `Target.disposeBrowserContext`.
+8. Event receivers: on `broadcast::error::RecvError::Lagged` keep receiving (log the skip count); only `Closed` is an error.
 
 Fixture routes (`common::serve`): `/form` (`<h1>Form</h1>` + the Task 1 form), `/cf` (403, `cf-mitigated: challenge`), `/slow` (hang), `/search?q=…` (echoes decoded q in `<h1>`), `/turnstile` (`<div class="cf-turnstile"></div><input name="cf-turnstile-response">`, no token), `/turnstile-auto` (same, plus a script that sets the input's `.value = "tok"` after 1 s).
 
@@ -234,6 +262,10 @@ Results go in `docs/perf.md` under `## Manual`.
 | C2 | 1 | `cargo test cdp` | 3 pass |
 | C3 | 1 | ignored `--test cdp` | 7 pass incl. `no_tcp_listener`, `browser_exit_fails_pending` |
 | C4 | 2 | `cargo test cas` | 5 pass |
+| C4b | 2b | `cargo test` + ignored `--test cdp` | unit all pass; 9 cdp pass incl. `drop_closes_gracefully`, `drop_leaves_no_helpers` |
+| C4c | 2b | `grep -c 'renamex_np\|urandom\|#\[path' src/cas.rs tests/cdp.rs` | 0 and 0 |
+| C4d | 2b | `git ls-files docs/briefs docs/superpowers/plans` | only `2026-10-28-m1-agent-core-v2.md` |
+| C4e | 2b | `du -sh spikes/target .spike-home` | `spikes/target` gone; `.spike-home` ≈ chromium + logs |
 | C5 | 3 | `cargo test snapshot` + release ignored | 5 pass; overhead < 25 ms |
 | C6 | 4 | `cargo test config gate action` | 9 pass |
 | C7 | 5 | `cargo test challenge` | 7 pass |

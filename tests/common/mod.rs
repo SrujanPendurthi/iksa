@@ -13,19 +13,15 @@ pub fn chromium() -> PathBuf {
 }
 pub fn temp_profile() -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    loop {
-        let p = std::env::temp_dir().join(format!(
-            "iksa-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        match std::fs::DirBuilder::new().mode(0o700).create(&p) {
-            Ok(()) => return p,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => panic!("create profile: {e}"),
-        }
-    }
+    let p = std::env::temp_dir().join(format!(
+        "iksa-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+    p
 }
+
 pub fn test_args(profile: &Path) -> Vec<String> {
     let mut a = vec![format!("--user-data-dir={}", profile.display())];
     a.extend(

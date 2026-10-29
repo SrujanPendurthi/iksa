@@ -38,9 +38,10 @@
 
 - **iksa exits while Chromium runs**: Chromium closes cleanly (cookies and prefs flushed) and no helper process survives. Tests `drop_closes_gracefully`, `drop_leaves_no_helpers` (Task 2b).
 - **Typo in a task's `risk` field** (e.g. `"rsik":"financial"`): task is rejected, never silently downgraded to `write` and auto-run. Test `action_unknown_field_rejected` (Task 5b).
+- **Approval in the middle of a form**: after `approve`, typed fields are back before the approved click; if repeating an earlier click would be needed, the task fails safely instead. Tests `approval_resume_replays_typed_fields`, `resume_with_click_before_cursor_fails_safely` (Task 8b).
 - **Chromium crashes mid-call**: pending calls fail fast with `browser closed`, no hang. Test `browser_exit_fails_pending` (Task 1).
 - **Process killed mid-task**: next `iksa run` requeues it at its saved cursor. Test `recover_requeues_executing` (Task 6).
-- **Secret typed into a form**: never in record JSON or report; erased from `ledger.db` and `ledger.db-wal` bytes once the task is `Committed` or `Failed`. Tests `secret_never_rendered`, `secret_erased_on_failed` (Task 7b).
+- **Secret typed into a form**: never in record JSON, outcomes, snapshots or report; erased from `ledger.db` and `ledger.db-wal` bytes once the task is `Committed` or `Failed`. Tests `secret_never_rendered`, `secret_erased_on_failed` (Task 7b).
 - **Selector never appears / page hangs**: step times out, task `Failed("timeout at step N")`, report still renders. Test `hung_page_fails_with_timeout` (Task 8).
 - **Turnstile that auto-passes**: agent continues instead of pausing. Test `turnstile_auto_pass_continues` (Task 8).
 
@@ -79,66 +80,41 @@ Notes for Codex runs (from Tasks 0–2):
 | 6b Ledger hardening | `0067be2` | conditional `UPDATE … AND state=?` in `transition`/`approve`, `fallible_uint` conversions, SQL `unixepoch`, `const SELECT`. (rusqlite 0.41 already sets a 5 s busy timeout; the explicit call stays.) | C8b, C8c |
 | 7 Audit | `6ac1079` | `src/audit.rs`: `StepRecord { step, action, decision: String /* "auto"|"approved" */, after: Option<String> /* tree hex */, outcome, at_ms }`, `StepRecord::new(step, &Action, decision, after, outcome)` (redacts; no snapshot for Financial), `render(&Task, &[StepRecord], &Cas) -> io::Result<String>`, `gc(&Ledger, &Cas, retention_days, now_ms) -> anyhow::Result<(usize, usize)>`; `Ledger::{record_step, records, delete_task}`. C9 BLOCKED on secret in `tasks.steps` → Task 7b | C9 (5/6) |
 | 7b Secrets erased, append-only audit | `b933cd9` | terminal `transition` rewrites `tasks.steps` redacted + `secure_delete` + `wal_checkpoint(TRUNCATE)`; `steps.seq` append-only, FK cascade; `gc`/`render` skip missing trees; `audit::now_ms()` | C9, C9b |
+| 7c Non-fatal checkpoint | `1d443eb` | busy WAL checkpoint returns `Ok`; checkpoint on `open`/`Drop`; `Cas::path` `pub(crate)`; audit test `setup()` | C9d |
+| 8 Engine + pillar tests | `cb51b42` | `src/engine.rs`: `launch_args(profile, mock_keychain)`, `Engine::{launch, run, run_with_timeout}`, `STEP_TIMEOUT`, `CAPTCHA_WAIT`; `tests/{engine,pillars}.rs`; `spikes/` removed; numbers in `docs/perf.md` | C10–C14 |
 
 New modules go in `src/lib.rs`; `main.rs` is the CLI only. Integration tests `use iksa::…`.
 
-### Task 7c: Non-fatal checkpoint + trims (before Task 8)
+### Task 8b: Engine fixes (resume, secrets in snapshots) + trims
 
-From Claude's caveman and ponytail reviews of `b933cd9`.
+From Claude's caveman and ponytail reviews of `cb51b42`. Two bugs must be fixed before Task 9 builds the CLI on the engine.
 
-**Problem:** `wal_checkpoint(TRUNCATE)` runs after the terminal `UPDATE` has committed. If another connection holds a read (e.g. `iksa list` alongside `iksa run`), the checkpoint is busy, `transition` returns `Err`, but the state change already persisted. The engine would treat a committed task as an error, and a retry hits `Illegal`.
+**Bug 1 — approval resume loses typed fields.** Each run uses a fresh browser context and replays only the last `Navigate`/`Search` before the cursor. Login flow `Navigate, Type email, Type password (secret), Click #login (Financial)`: it pauses at the click, and after `approve` the resumed run clicks login on an empty form.
+**Bug 2 — secrets leak into snapshots and outcomes.** After `Type { secret: true }` the engine stores `outerHTML`; pages that mirror input (our `/form` fixture, strength meters, frameworks that set the `value` attribute) put the secret into the CAS for up to `retention_days`. A later `Extract` of a mirrored element also writes it into the record's `outcome`.
 
-**Files:** `src/ledger.rs`, `src/audit.rs`, `src/cas.rs`.
+**Files:** `src/engine.rs`, `src/audit.rs` (one ignored test), `tests/engine.rs`, `tests/common/mod.rs`.
 
-**Interfaces:**
-- `Ledger::transition` (terminal): if the checkpoint reports busy, return `Ok(())`; the secret leaves the WAL at the next checkpoint.
-- `Ledger::open` runs `PRAGMA wal_checkpoint(TRUNCATE)` after the pragmas (result ignored); `impl Drop for Ledger` runs it again (errors ignored). Old WAL frames don't survive a clean open/close cycle.
-- `transition` fetches the task once (`let task = self.get(id)?;`) and passes `task.steps` into `transition_from` when the target is terminal (`None` from `resume`). No second `get`.
-- `Cas::path` becomes `pub(crate)`; tests use it instead of building `root/ab/cdef…` by hand.
-- `audit.rs` tests share `fn setup(label: &str) -> (TempDir, Ledger, Cas)`.
+**Interfaces / rules:**
+- `fn url_of(a: &Action, cfg: &Config) -> Option<String>` (Navigate → url, Search → `cfg.search_url(query)`), used by `action()` and by resume.
+- Resume (cursor > 0): let `nav` = index of the last step before the cursor where `url_of` is `Some`. Navigate to it, then re-run every `Type` in `nav+1..cursor` (no records, no gate). If any `Click` lies in that range, end with `Failed("cannot resume: step {i} would repeat a click")` and record it.
+- Secret hygiene: the engine keeps `secrets: Vec<&str>` = the `text` of every `Type { secret: true }` in the task. A `secret_on_page` flag is set when a secret `Type` runs and cleared when a `Navigate`/`Search` completes. While it is set (including the secret step itself), store no snapshot (`after = None`). Every `outcome` and failure message passes through `scrub(s, &secrets)`, which replaces each secret with `"••••"` before `record_step`.
+- Same-document navigation: `Page.navigate` with no `loaderId` and empty `errorText` returns `Ok((None, vec![]))` immediately.
+- `eval` errors include `exceptionDetails.exception.description` (or `.text`).
+- One failure path: the step loop returns `Err` for timeout/error; only the outer handler records the failure and transitions to `Failed`. Its record's `decision` is `"approved"` if `approved_step == Some(cursor)`, else `"auto"`.
+- Headers: `serde_json::from_value::<HashMap<String, String>>(r["headers"].clone()).unwrap_or_default().into_iter().collect()`.
+- Remove the timing instrumentation from `Engine` (`call_time`, `overheads`, `step_overheads()`, the `call()` wrapper — call `b.call` directly; `Engine` becomes `{ browser: RefCell<Option<Browser>> }`). The 25 ms check moves out of `tests/engine.rs` (delete `step_overhead_under_25ms`) to `audit::tests::step_bookkeeping_under_25ms` (`#[ignore]`, release): 20 distinct ~80 KB fixture pages, each `snapshot::put` + `record_step` + `set_cursor` timed; median < 25 ms.
+- `tests/common::test_args` is deleted; tests call `iksa::engine::launch_args(&profile, true)`. `tree_footprint_kib` keeps parse + sum + assert only (no files written to `target/codex`, no `println!`).
 
-- [x] **Step 1: Failing test** `ledger::tests::terminal_transition_ok_while_reader_open`: a task with a secret `Type` (`hunter2`); a second `rusqlite::Connection` on the same file runs `BEGIN; SELECT count(*) FROM tasks;` and keeps the transaction open; the first `Ledger` transitions to `Executing` then `Committed` → `Ok` (it may take up to the 5 s busy timeout), and `get(id).state == Committed`. Then roll back and drop the reader, drop the `Ledger`, reopen and drop it once more: neither `ledger.db` nor `ledger.db-wal` (if present) contains `hunter2`.
-- [x] **Step 2:** `cargo test --lib -- ledger::terminal_transition_ok_while_reader_open` selected 0 tests (filter typo). Effective filter `ledger::tests::terminal_transition_ok_while_reader_open` genuinely failed with the busy error before the fix and passed afterward.
-- [x] **Step 3:** Implement the Interfaces.
-- [x] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass.
-- [x] **Step 5:** Commit `fix: non-fatal WAL checkpoint, checkpoint on open/drop; test trims`.
-
-### Task 8: Engine on `cdp::Browser` + pillar tests
-
-**Files:** `src/engine.rs`, `tests/engine.rs`, `tests/pillars.rs`; extend `tests/common/mod.rs` with `tree_footprint_kib(pid) -> u64` (sum of `footprint -p <pid> -f bytes` `phys_footprint` over `pid` plus `common::descendants(pid)`, ÷ 1024) and `netlog_hosts(path) -> Vec<String>` (every `params.url` host, `params.host`, `params.address` host across all events, loopback filtered out).
-
-**Interfaces:**
-- `engine::launch_args(profile: &Path, mock_keychain: bool) -> Vec<String>` — exactly the Global Constraints list.
-- `Engine::launch(chromium: &Path, profile: &Path, mock_keychain: bool) -> anyhow::Result<Engine>` (profile dir created 0700).
-- `Engine::run(&self, &Ledger, &Cas, &Config, id) -> anyhow::Result<State>`; `Engine::run_with_timeout(.., step_timeout: Duration)`; `const STEP_TIMEOUT: Duration = Duration::from_secs(30)`; `const CAPTCHA_WAIT: Duration = Duration::from_secs(10)`.
-
-How `run` maps to CDP (algorithm, since the signatures don't fix it):
-1. `transition(Executing)`; `Target.createBrowserContext`; hidden target in it; attach flatten; `Page.enable`, `Network.enable`, `Emulation.setDeviceMetricsOverride { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false }`. If cursor > 0, re-navigate to the last `Navigate`/`Search` URL before cursor.
-2. Per step from cursor: `gate::decide(cfg.auto_max, action.risk())`; `NeedsApproval` and `approved_step != Some(cursor)` -> `AwaitingHandoff(Approval)`, return.
-3. Run the action under the step timeout:
-   - Navigate/Search (`cfg.search_url`): subscribe; `Page.navigate` (non-empty `errorText` -> error); take status + headers from the `Network.responseReceived` with `type == "Document"` and the returned `loaderId`; wait for `Page.loadEventFired` on the session.
-   - Locate `selector`: poll every 100 ms with `Runtime.evaluate` until `document.querySelector(sel)` exists, then `scrollIntoView({block:"center"})` and return its rect center.
-   - Click: `Input.dispatchMouseEvent` `mousePressed` + `mouseReleased` at the center (`button: "left"`, `clickCount: 1`).
-   - Type: Click, then `Input.insertText(text)`.
-   - Extract: located element's `innerText` -> outcome.
-4. One snapshot after the action: `document.documentElement.outerHTML` -> `snapshot::put` (skipped for Financial); `record_step`.
-5. `challenge::detect(..)`. For `Turnstile`, `ReCaptcha` and `HCaptcha` (invisible/score-based widgets, e.g. reCAPTCHA v3, pass without a human), poll every 250 ms for up to `CAPTCHA_WAIT` for a non-empty `.value` on `[name="cf-turnstile-response"]`, `[name="g-recaptcha-response"]` or `[name="h-captcha-response"]` respectively; non-empty -> not a challenge. Any remaining kind -> `AwaitingHandoff(Challenge(k))`, return without advancing the cursor.
-6. Error/timeout: record outcome `error: …` / `timeout at step N`; `Failed(..)`; return.
-7. `set_cursor(cursor + 1)`; after the last step `Committed`. Always `Target.disposeBrowserContext`.
-8. Event receivers: on `broadcast::error::RecvError::Lagged` keep receiving (log the skip count); only `Closed` is an error.
-9. Run tasks one after another on the caller's future. Do not `tokio::spawn` `run`: `Ledger` holds a `rusqlite::Connection` (not `Sync`). M2's daemon will need `Mutex<Ledger>` or a connection per worker.
-
-Fixture routes (`common::serve`): `/form` (`<h1>Form</h1>` + the Task 1 form), `/cf` (403, `cf-mitigated: challenge`), `/slow` (hang), `/search?q=…` (echoes decoded q in `<h1>`), `/turnstile` (`<div class="cf-turnstile"></div><input name="cf-turnstile-response">`, no token), `/turnstile-auto` (same, plus a script that sets the input's `.value = "tok"` after 1 s), `/recaptcha-v3` (`<script src="https://www.google.com/recaptcha/api.js?render=k"></script><textarea name="g-recaptcha-response"></textarea>` plus a script setting its `.value = "tok"` after 1 s; the external script fails to load offline, which is fine).
-
-- [x] **Step 1: Failing tests.**
-  - Unit: `launch_args_exact` (contains `--disable-features=PreloadTopChromeWebUI,WebUIOmniboxPopup,WebUIOmniboxAimPopup` and all privacy flags; no `--enable-automation`, no `remote-debugging-port`); `mock_keychain_only_when_asked` (absent when `false`).
-  - `tests/engine.rs` (`#[ignore]`): `runs_read_task_to_committed` (Extract `h1` == "Form"); `search_uses_configured_provider` (provider `Local` -> fixture `/search?q={q}`; Search "a b"; Extract `h1` == "a b"); `write_step_waits_for_approval` (Type -> `AwaitingHandoff(Approval)`, cursor 1; `approve`; run -> `Committed`; Extract shows typed value); `click_uses_real_input` (Type "hi" into `#q` + Click `#go` with `auto_max: Write` -> `#out` == "hi"); `challenge_pauses` (`/cf` -> `AwaitingHandoff(Challenge(CloudflareChallenge))`); `turnstile_blocks_without_token` (`/turnstile` -> `AwaitingHandoff(Challenge(Turnstile))`); `turnstile_auto_pass_continues` (`/turnstile-auto` then Extract -> `Committed`); `recaptcha_v3_auto_pass_continues` (`/recaptcha-v3` then Extract -> `Committed`); `hung_page_fails_with_timeout` (`run_with_timeout` 2 s on `/slow` -> `Failed` containing `timeout`; `render` works); `contexts_are_isolated` (cookie from task A invisible to task B); `step_overhead_under_25ms` (median over 20 Extract steps of step wall time minus time spent inside `call`, < 25 ms).
-  - `tests/pillars.rs` (`#[ignore]`, need network): `netlog_sees_real_navigation` (launch with `--log-net-log=<tmp>`; hidden tab navigates `https://example.com`; close; `netlog_hosts` contains `example.com`) — **the positive control; if it fails, the next test means nothing**; `idle_egress_is_loopback_only` (same launch, idle 60 s on `about:blank`, `netlog_hosts` empty); `idle_footprint_under_300mb` (median of 3 fresh launches, 10 s settle, `tree_footprint_kib` < 307,200); `five_tabs_three_agents_under_1200mb` (5 visible targets + 3 hidden agent contexts on Wikipedia articles `Rust_(programming_language)`, `Linux`, `Chromium_(web_browser)`, `SQLite`, `Mozilla`, `Python_(programming_language)`, `Tokio_(software)`, `WebKit`; 20 s settle; < 1,228,800).
-- [x] **Step 2:** `cargo test engine` + ignored `--test engine` and `--test pillars` — FAIL.
-- [x] **Step 3:** Implement.
-- [x] **Step 4:** Same commands — all pass, including the full 25 ignored tests. Final affected-engine rerun after focus fix: 11/11; normal suite passes. Actual overhead 0.394916 ms; C11 example.com, C12 0 hosts, C13 median 213911 KiB, C14 three-run median 1167745 KiB. Full evidence and intermediate failures in `docs/perf.md` and `target/codex/v2-task8-report.md`.
-- [x] **Step 5:** `git rm -r spikes/` and `rm -rf .spike-home/profile .spike-home/www .spike-home/ext-id` (the Rust tests replace them; keep `.spike-home/chromium/` and `.spike-home/logs/`); update `CLAUDE.md` module map.
-- [x] **Step 6:** Commit `feat: CDP engine with gates, snapshots, challenge pause; pillar tests`.
+- [ ] **Step 1: Failing tests (`tests/engine.rs`, `#[ignore]`):**
+  - `approval_resume_replays_typed_fields`: steps Navigate `/form`, Type `#q` "hi", Click `#go` (`risk: financial`), default `auto_max` raised to `Write`; run → `AwaitingHandoff(Approval)` at cursor 2; `approve`; run → `Committed`; a final Extract step `#out` == "hi".
+  - `resume_with_click_before_cursor_fails_safely`: Navigate `/form`, Click `#go` (auto), Type `#q` "x" (Financial-risk `Type`); run → approval at cursor 2; `approve`; run → `Failed` containing `would repeat a click`.
+  - `secret_never_in_snapshots_or_outcomes`: `auto_max: Write`; Navigate `/form`, Type `#q` secret "hunter2", Click `#go`, Extract `#out`, Navigate `/form`, Extract `h1` → `Committed`; no blob from `cas.all()` contains `hunter2`; `records` JSON doesn't contain it; the `#out` Extract outcome is `"••••"`; the records for steps 1–3 have `after == None`, and the step 4 and 5 records have `Some`.
+  - `same_document_navigation_commits`: Navigate `/form`, Navigate `/form#x`, Extract `h1` → `Committed`.
+  - `bad_selector_error_is_explained`: Extract `##bad` → `Failed` whose message contains `SyntaxError` or `not a valid selector`.
+- [ ] **Step 2:** `cargo test` + ignored `--test engine` — the 5 new tests fail (`same_document…` and `bad_selector…` may already pass partially; they guard the change).
+- [ ] **Step 3:** Implement the rules above; `rm -rf .spike-home/Library` (untracked leftovers).
+- [ ] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass, including `step_bookkeeping_under_25ms` and the 4 pillar tests. Update `docs/perf.md` C10 with the new bookkeeping median, and add a "Watch (M3)" line: C14's worst sample was 1,206,946 KiB = 98% of budget.
+- [ ] **Step 5:** Commit `fix: resume replays typed fields, secret-free snapshots and outcomes; engine trims`.
 
 ### Task 9: CLI, setup, end to end
 
@@ -193,6 +169,9 @@ Results go in `docs/perf.md` under `## Manual`.
 | C12 | 8 | `idle_egress_is_loopback_only` | 0 hosts after 60 s — **done** |
 | C13 | 8 | `idle_footprint_under_300mb` | samples 213511/213911/214695 KiB; median 213911 < 307200 KiB — **done** |
 | C14 | 8 | `five_tabs_three_agents_under_1200mb` | samples 1206946/1167745/1143666 KiB; median 1167745 < 1228800 KiB; all individual checks pass — **done** |
+| C14b | 8b | ignored `--test engine` | 15 pass (11 − `step_overhead_under_25ms` + 5 new) |
+| C14c | 8b | release ignored `audit::tests::step_bookkeeping_under_25ms` | median < 25 ms |
+| C14d | 8b | `grep -c 'call_time\|step_overheads\|fn test_args\|target/codex' src/engine.rs tests/common/mod.rs` | 0 and 0 |
 | C15 | 9 | `cargo test --test cli` + `e2e_report` | 12 pass |
 | C16 | 9 | binary size / CAS size | < 60 MB / < 500 KB |
 | C17 | 10 | H1 keychain | ≤ 1 prompt, none after Always Allow |

@@ -3,7 +3,7 @@ use crate::{
     cas::Cas,
     gate::Risk,
     ledger::{Ledger, State, Task},
-    snapshot,
+    snapshot::{self, invalid_data},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -38,15 +38,15 @@ impl StepRecord {
                 after
             },
             outcome,
-            at_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            at_ms: now_ms(),
         }
     }
 }
-fn invalid_data(error: impl std::fmt::Display) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 fn tree_hash(hex: &str) -> io::Result<blake3::Hash> {
     blake3::Hash::from_hex(hex).map_err(invalid_data)
@@ -58,7 +58,7 @@ pub fn render(task: &Task, records: &[StepRecord], cas: &Cas) -> io::Result<Stri
     );
     let mut previous = HashSet::new();
     for record in records {
-        let action = serde_json::to_value(record.action.redacted()).map_err(invalid_data)?;
+        let action = serde_json::to_value(&record.action).map_err(invalid_data)?;
         let op = action["op"]
             .as_str()
             .ok_or_else(|| invalid_data("missing action op"))?;
@@ -71,7 +71,15 @@ pub fn render(task: &Task, records: &[StepRecord], cas: &Cas) -> io::Result<Stri
             record.outcome.chars().take(2000).collect::<String>()
         ));
         if let Some(after) = &record.after {
-            let chunks = snapshot::chunk_hashes(cas, &tree_hash(after)?)?;
+            let tree = tree_hash(after)?;
+            let chunks = match snapshot::chunk_hashes(cas, &tree) {
+                Ok(chunks) => chunks,
+                Err(error) => {
+                    text.push_str(&format!("DOM: unavailable ({error})\n"));
+                    previous.clear();
+                    continue;
+                }
+            };
             let changed = chunks
                 .iter()
                 .filter(|hash| !previous.contains(*hash))
@@ -112,8 +120,10 @@ pub fn gc(
         for record in ledger.records(task.id)? {
             if let Some(after) = record.after {
                 let tree = tree_hash(&after)?;
-                reachable.insert(tree);
-                reachable.extend(snapshot::chunk_hashes(cas, &tree)?);
+                if let Ok(chunks) = snapshot::chunk_hashes(cas, &tree) {
+                    reachable.insert(tree);
+                    reachable.extend(chunks);
+                }
             }
         }
     }
@@ -145,7 +155,7 @@ mod tests {
     use crate::{gate::Risk, ledger::State, snapshot, testutil::temp_dir};
     use std::{
         fs,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, UNIX_EPOCH},
     };
     fn action() -> Action {
         Action::Extract {
@@ -181,43 +191,153 @@ mod tests {
             io::ErrorKind::InvalidData
         );
     }
-    #[test]
-    fn secret_never_rendered() {
+    fn assert_secret_erased(terminal: State) {
         let dir = temp_dir("audit-secret");
-        let path = dir.0.join("db");
+        let path = dir.0.join("ledger.db");
         let cas = Cas::open(dir.0.join("cas")).unwrap();
         let ledger = Ledger::open(&path).unwrap();
-        let secret = "TASK7-unique-password-925746";
         let typed = Action::Type {
             selector: "#password".into(),
-            text: secret.into(),
+            text: "hunter2".into(),
             secret: true,
             risk: Risk::Write,
         };
         let id = ledger.add("secret", &[typed.clone()]).unwrap();
-        let rec = StepRecord::new(0, &typed, "approved".into(), None, "typed".into());
-        ledger.record_step(id, &rec).unwrap();
+        assert_eq!(ledger.get(id).unwrap().steps, vec![typed.clone()]);
+        ledger
+            .record_step(
+                id,
+                &StepRecord::new(0, &typed, "approved".into(), None, "typed".into()),
+            )
+            .unwrap();
         let records = ledger.records(id).unwrap();
-        assert!(!serde_json::to_string(&records).unwrap().contains(secret));
+        assert!(!serde_json::to_string(&records).unwrap().contains("hunter2"));
         assert!(
             !render(&ledger.get(id).unwrap(), &records, &cas)
                 .unwrap()
-                .contains(secret)
+                .contains("hunter2")
         );
-        let db = rusqlite::Connection::open(&path).unwrap();
-        let json: String = db
-            .query_row("SELECT json FROM steps WHERE task_id=?1", [id], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert!(!json.contains(secret));
-        let queued: String = db
-            .query_row("SELECT steps FROM tasks WHERE id=?1", [id], |r| r.get(0))
-            .unwrap();
+        ledger.transition(id, State::Executing).unwrap();
+        ledger.transition(id, terminal).unwrap();
+        let task = ledger.get(id).unwrap();
+        drop(ledger);
+        for file in [&path, &dir.0.join("ledger.db-wal")] {
+            match fs::read(file) {
+                Ok(bytes) => assert!(
+                    !bytes.windows(b"hunter2".len()).any(|w| w == b"hunter2"),
+                    "secret in {}",
+                    file.display()
+                ),
+                Err(error) if file != &path && error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => panic!("{}: {error}", file.display()),
+            }
+        }
+        assert_eq!(task.steps, vec![typed.redacted()]);
+        assert!(serde_json::to_string(&task.steps).unwrap().contains("••••"));
+        let ledger = Ledger::open(&path).unwrap();
+        assert_eq!(ledger.get(id).unwrap().steps, task.steps);
         assert!(
-            !queued.contains(secret),
-            "BLOCKED: queued tasks.steps persists secret typed text"
+            !serde_json::to_string(&ledger.records(id).unwrap())
+                .unwrap()
+                .contains("hunter2")
         );
+        assert!(!render(&task, &records, &cas).unwrap().contains("hunter2"));
+    }
+    #[test]
+    fn secret_never_rendered() {
+        assert_secret_erased(State::Committed);
+    }
+    #[test]
+    fn secret_erased_on_failed() {
+        assert_secret_erased(State::Failed("x".into()));
+    }
+    #[test]
+    fn rerun_step_keeps_both_records() {
+        let dir = temp_dir("audit-rerun");
+        let ledger = Ledger::open(dir.0.join("db")).unwrap();
+        let cas = Cas::open(dir.0.join("cas")).unwrap();
+        let id = ledger.add("rerun", &[action()]).unwrap();
+        for outcome in ["challenge", "ok"] {
+            let mut rec = record(0, None);
+            rec.outcome = outcome.into();
+            ledger.record_step(id, &rec).unwrap();
+        }
+        let records = ledger.records(id).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.outcome.as_str())
+                .collect::<Vec<_>>(),
+            vec!["challenge", "ok"]
+        );
+        assert_eq!(
+            render(&ledger.get(id).unwrap(), &records, &cas)
+                .unwrap()
+                .matches("## Step 0")
+                .count(),
+            2
+        );
+    }
+    #[test]
+    fn render_survives_missing_tree() {
+        let dir = temp_dir("audit-missing-render");
+        let ledger = Ledger::open(dir.0.join("db")).unwrap();
+        let cas = Cas::open(dir.0.join("cas")).unwrap();
+        let id = ledger.add("missing", &[]).unwrap();
+        let tree = snapshot::put(&cas, "<p>missing</p>").unwrap();
+        fs::remove_file(
+            cas.root()
+                .join(&tree.to_hex()[..2])
+                .join(&tree.to_hex()[2..]),
+        )
+        .unwrap();
+        let text = render(
+            &ledger.get(id).unwrap(),
+            &[record(0, Some(tree.to_hex().to_string())), record(1, None)],
+            &cas,
+        )
+        .unwrap();
+        assert!(text.contains("DOM: unavailable"));
+        assert!(text.contains("## Step 1"));
+    }
+    #[test]
+    fn gc_survives_missing_tree() {
+        let dir = temp_dir("audit-missing-gc");
+        let path = dir.0.join("db");
+        let ledger = Ledger::open(&path).unwrap();
+        let cas = Cas::open(dir.0.join("cas")).unwrap();
+        let mut trees = Vec::new();
+        for html in ["<p>first</p>", "<p>second</p>"] {
+            let tree = snapshot::put(&cas, html).unwrap();
+            trees.push(tree);
+            let id = ledger.add("old", &[]).unwrap();
+            ledger
+                .record_step(id, &record(0, Some(tree.to_hex().to_string())))
+                .unwrap();
+            ledger.transition(id, State::Executing).unwrap();
+            ledger.transition(id, State::Committed).unwrap();
+        }
+        fs::remove_file(
+            cas.root()
+                .join(&trees[0].to_hex()[..2])
+                .join(&trees[0].to_hex()[2..]),
+        )
+        .unwrap();
+        // A retained record references the missing tree, exercising the mark phase too.
+        let retained = ledger.add("retained", &[]).unwrap();
+        ledger
+            .record_step(retained, &record(0, Some(trees[0].to_hex().to_string())))
+            .unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET finished_ms=0 WHERE finished_ms IS NOT NULL",
+                [],
+            )
+            .unwrap();
+        assert_eq!(gc(&ledger, &cas, 1, 3 * 86_400_000).unwrap().0, 2);
+        assert!(cas.all().unwrap().is_empty());
+        assert_eq!(ledger.list().unwrap().len(), 1);
     }
     #[test]
     fn financial_step_stores_no_snapshot() {
@@ -247,20 +367,13 @@ mod tests {
         let other = ledger.add("keep", &[]).unwrap();
         let first = record(0, None);
         let second = record(5, None);
-        assert!(
-            first.at_ms.abs_diff(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64
-            ) < 5000
-        );
+        assert!(first.at_ms.abs_diff(now_ms()) < 5000);
         ledger.record_step(id, &second).unwrap();
         ledger.record_step(id, &first).unwrap();
         ledger.record_step(other, &first).unwrap();
         drop(ledger);
         let ledger = Ledger::open(&path).unwrap();
-        assert_eq!(ledger.records(id).unwrap(), vec![first.clone(), second]);
+        assert_eq!(ledger.records(id).unwrap(), vec![second, first.clone()]);
         ledger.delete_task(id).unwrap();
         assert!(ledger.get(id).is_err());
         assert!(ledger.records(id).unwrap().is_empty());
@@ -337,10 +450,7 @@ mod tests {
             ledger.transition(id, State::Committed).unwrap();
         }
         ledger.transition(running, State::Executing).unwrap();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let now = now_ms();
         rusqlite::Connection::open(&path)
             .unwrap()
             .execute(

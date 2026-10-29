@@ -46,13 +46,13 @@ impl Ledger {
         let conn = rusqlite::Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY, title TEXT NOT NULL, steps TEXT NOT NULL,
                 cursor INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL,
                 approved_step INTEGER, finished_ms INTEGER
             );
-            CREATE TABLE IF NOT EXISTS steps (task_id INTEGER NOT NULL, step INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(task_id, step));",
+            CREATE TABLE IF NOT EXISTS steps (seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, step INTEGER NOT NULL, json TEXT NOT NULL);",
         )?;
         Ok(Self { conn })
     }
@@ -61,9 +61,8 @@ impl Ledger {
         id: i64,
         record: &crate::audit::StepRecord,
     ) -> Result<(), LedgerError> {
-        self.get(id)?;
         self.conn.execute(
-            "INSERT OR REPLACE INTO steps (task_id, step, json) VALUES (?1, ?2, ?3)",
+            "INSERT INTO steps (task_id, step, json) VALUES (?1, ?2, ?3)",
             rusqlite::params![id, record.step, serde_json::to_string(record)?],
         )?;
         Ok(())
@@ -71,21 +70,14 @@ impl Ledger {
     pub fn records(&self, id: i64) -> Result<Vec<crate::audit::StepRecord>, LedgerError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT json FROM steps WHERE task_id=?1 ORDER BY step")?;
-        let mut rows = stmt.query([id])?;
-        let mut records = Vec::new();
-        while let Some(row) = rows.next()? {
-            records.push(serde_json::from_str(&row.get::<_, String>(0)?)?);
-        }
-        Ok(records)
+            .prepare("SELECT json FROM steps WHERE task_id=?1 ORDER BY seq")?;
+        let rows = stmt.query_map([id], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
     pub fn delete_task(&self, id: i64) -> Result<(), LedgerError> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM steps WHERE task_id=?1", [id])?;
-        if tx.execute("DELETE FROM tasks WHERE id=?1", [id])? == 0 {
+        if self.conn.execute("DELETE FROM tasks WHERE id=?1", [id])? == 0 {
             return Err(LedgerError::NotFound(id));
         }
-        tx.commit()?;
         Ok(())
     }
     pub fn add(&self, title: &str, steps: &[Action]) -> Result<i64, LedgerError> {
@@ -158,11 +150,36 @@ impl Ledger {
         self.transition_from(id, from, to)
     }
     fn transition_from(&self, id: i64, from: State, to: State) -> Result<(), LedgerError> {
+        let terminal = matches!(to, State::Committed | State::Failed(_));
+        let redacted = if terminal {
+            Some(serde_json::to_string(
+                &self
+                    .get(id)?
+                    .steps
+                    .iter()
+                    .map(Action::redacted)
+                    .collect::<Vec<_>>(),
+            )?)
+        } else {
+            None
+        };
         if self.conn.execute(
-            "UPDATE tasks SET state=?2, finished_ms=CASE WHEN ?3 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) END WHERE id=?1 AND state=?4",
-            rusqlite::params![id, serde_json::to_string(&to)?, matches!(to, State::Committed | State::Failed(_)), serde_json::to_string(&from)?],
+            "UPDATE tasks SET state=?2, finished_ms=CASE WHEN ?3 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) END, steps=COALESCE(?5, steps) WHERE id=?1 AND state=?4",
+            rusqlite::params![id, serde_json::to_string(&to)?, terminal, serde_json::to_string(&from)?, redacted],
         )? == 0 {
             return Err(LedgerError::Illegal { from: self.get(id)?.state, to });
+        }
+        if terminal {
+            let busy: i64 = self
+                .conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+            if busy != 0 {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    Some("terminal secret erasure WAL checkpoint busy".into()),
+                )
+                .into());
+            }
         }
         Ok(())
     }
@@ -207,6 +224,30 @@ impl Ledger {
 mod tests {
     use super::*;
     use crate::testutil::temp_dir;
+    #[test]
+    fn delete_task_cascades() {
+        let dir = temp_dir("ledger-cascade");
+        let ledger = Ledger::open(dir.0.join("db")).unwrap();
+        let id = ledger.add("cascade", &[]).unwrap();
+        let rec = crate::audit::StepRecord::new(
+            0,
+            &Action::Extract {
+                selector: "h1".into(),
+            },
+            "auto".into(),
+            None,
+            "ok".into(),
+        );
+        ledger.record_step(id, &rec).unwrap();
+        ledger.delete_task(id).unwrap();
+        assert_eq!(
+            ledger
+                .conn
+                .query_row("SELECT count(*) FROM steps", [], |r| r.get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+    }
     #[test]
     fn concurrent_writer_waits() {
         let dir = temp_dir("ledger-concurrent");

@@ -95,17 +95,17 @@ From Claude's caveman and ponytail reviews of `0067be2`/`6ac1079` and Codex's C9
 - `audit::render`: no second `redacted()`. If a record's tree can't be read, write `DOM: unavailable ({error})` and continue.
 - `audit::gc`: if `chunk_hashes` fails for a record's tree, skip that tree and keep sweeping (a damaged blob was already deleted by `Cas::get`).
 
-- [ ] **Step 1: Tests first** (temp dirs via `crate::testutil::temp_dir`).
+- [x] **Step 1: Tests first** (temp dirs via `crate::testutil::temp_dir`).
   - Rewrite `audit::tests::secret_never_rendered`: add a task with `Type { text: "hunter2", secret: true }`, record a step, `transition` to `Executing` then `Committed`, drop the `Ledger`. Then the raw bytes of `ledger.db` and of `ledger.db-wal` (if it exists) don't contain `hunter2`; `records` JSON and `render` output never contain it; `get(id).steps` shows `"••••"`.
   - `audit::tests::secret_erased_on_failed`: same, ending in `Failed("x")`.
   - `audit::tests::rerun_step_keeps_both_records`: `record_step` twice with `step: 0` (outcomes `"challenge"`, `"ok"`) → `records` has 2 entries in that order; `render` contains `## Step 0` twice.
   - `audit::tests::gc_survives_missing_tree`: two committed old tasks with snapshots; delete one task's tree blob file directly; `gc` returns `Ok` and removes both tasks' blobs.
   - `audit::tests::render_survives_missing_tree`: record with an `after` tree whose blob is missing → `render` is `Ok` and contains `DOM: unavailable`.
   - `ledger::tests::delete_task_cascades`: after `record_step` + `delete_task`, `SELECT count(*) FROM steps` = 0.
-- [ ] **Step 2:** `cargo test --lib -- audit:: ledger::` — the 6 tests above fail (the cascade test may pass if delete still runs both statements; it guards the rewrite).
-- [ ] **Step 3:** Implement the Interfaces.
-- [ ] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass.
-- [ ] **Step 5:** Commit `fix: erase secrets on finish, append-only audit, resilient gc/report`.
+- [x] **Step 2:** `cargo test --lib -- audit:: ledger::` — the 6 tests above fail (the cascade test may pass if delete still runs both statements; it guards the rewrite).
+- [x] **Step 3:** Implement the Interfaces.
+- [x] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass.
+- [x] **Step 5:** Commit `fix: erase secrets on finish, append-only audit, resilient gc/report`.
 
 ### Task 8: Engine on `cdp::Browser` + pillar tests
 
@@ -189,8 +189,8 @@ Results go in `docs/perf.md` under `## Manual`.
 | C8 | 6 | `cargo test ledger` | 6 pass — **done** |
 | C8b | 6b | `cargo test --lib -- ledger::` | 9 pass incl. `concurrent_writer_waits`, `stale_handle_transition_rejected`, `finished_ms_is_epoch_ms` — **done** |
 | C8c | 6b | `grep -c 'try_from\|SystemTime'` in `src/ledger.rs` non-test code | 0 — **done** |
-| C9 | 7 | `cargo test audit` | 6 pass — 5/6, `secret_never_rendered` BLOCKED (spec), moved to 7b |
-| C9b | 7b | `cargo test --lib -- audit:: ledger::` | all pass incl. `secret_never_rendered`, `secret_erased_on_failed`, `rerun_step_keeps_both_records`, `gc_survives_missing_tree`, `render_survives_missing_tree`, `delete_task_cascades` |
+| C9 | 7 | `cargo test audit` | 6 pass — 5/6, `secret_never_rendered` BLOCKED (spec), moved to 7b; **RESOLVED in 7b: 10/10 pass under finish-time erasure contract** |
+| C9b | 7b | `cargo test --lib -- audit:: ledger::` | 20/20 pass (10 audit + 10 ledger), incl. `secret_never_rendered`, `secret_erased_on_failed`, `rerun_step_keeps_both_records`, `gc_survives_missing_tree`, `render_survives_missing_tree`, `delete_task_cascades` |
 | C10 | 8 | ignored `--test engine` | 11 pass |
 | C11 | 8 | `netlog_sees_real_navigation` | `example.com` found |
 | C12 | 8 | `idle_egress_is_loopback_only` | 0 hosts |

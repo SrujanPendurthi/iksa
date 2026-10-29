@@ -57,7 +57,7 @@ pub fn chunk_hashes(cas: &Cas, tree: &Hash) -> io::Result<Vec<Hash>> {
         .collect()
 }
 
-fn invalid_data(error: impl std::fmt::Display) -> io::Error {
+pub(crate) fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 

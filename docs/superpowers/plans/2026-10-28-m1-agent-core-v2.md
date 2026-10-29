@@ -168,7 +168,7 @@ Results go in `docs/perf.md` under `## Manual`.
 | C14f | 9a | `grep -rn 'struct F \|struct Fixture\|target/codex\|TODO launch' tests/` | **done** — no matches |
 | C15 | 9 | `cargo test --test cli` + `e2e_report` | 12 pass — **done** (11 pass + `e2e_report` ignored pass = 12) |
 | C16 | 9 | binary size / CAS size | < 60 MB / < 500 KB — **done** (4,316,240 bytes; CAS 268 KiB) |
-| C17 | 10 | H1 keychain | ≤ 1 prompt, none after Always Allow |
+| C17 | 10 | H1 keychain | ≤ 1 prompt, none after Always Allow — **done**: real `setup` ok, run committed, 0 prompts (off-the-record agent contexts; see `docs/perf.md` Manual) |
 | C18 | 10 | H2 address bar | dropdown works; bubble noted |
 
 

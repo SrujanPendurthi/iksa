@@ -49,3 +49,12 @@ Evidence: `target/codex/9a-{red,normal-final,engine,all-ignored,loaded2,loaded3}
 Task 9 final validation, 2026-10-29: `cargo test` passes (60 lib, 11 cli + 1 ignored, others) and the complete release ignored suite passes (2 lib, 9 CDP, 1 cli `e2e_report`, 16 engine, 4 pillars). Release binary `ls -l target/release/iksa` = **4,316,240 bytes** (< 60 MB). CAS after `e2e_report`, `du -sk` = **268 KiB** (< 500). C11 found `example.com`; C12 observed **0 nonloopback hosts** after 60s; C13 samples **209,799 / 212,599 / 212,967 KiB**, median **212,599 KiB < 307,200**; C14 loaded sample **1,117,778 KiB < 1,228,800**.
 
 Pillar fix: `idle_egress_is_loopback_only` once saw 2 page targets because `PillarBrowser::normalize` closed pages once and created one, racing Chromium's startup tab. It now polls until exactly one `about:blank` page is stable for 5 consecutive checks (closing extras, creating if absent); the 60s zero-host and one-page assertions are unchanged. Log: `target/codex/claude-full-ignored.log`.
+
+## Manual
+
+**H1 — real setup + Keychain (2026-10-29, user's normal Terminal, `IKSA_MOCK_KEYCHAIN`/`CHROMIUM`/`IKSA_HOME` unset):** PASS.
+- `iksa setup` downloaded, SHA-256-verified and installed the pinned build to `~/.iksa/chromium/`; the path printed.
+- `iksa run` against `https://example.com` committed (task 2). Task 1 failed `timeout at step 1` because example.com no longer has an `<h1>` (its body is a single `<p>`); a crash-resume re-check with `Extract p` committed in 0.66 s total.
+- A Ctrl-C mid-run left a task `Executing`; the next `run` recovered it as designed.
+- **No Keychain prompt** on any run. Expected: agent tasks run in off-the-record browser contexts, so nothing is encrypted to disk. The first real prompt should come with human browsing in iksa's profile (M3).
+- UX found: `add -` waits silently on a terminal; `run` with an empty queue prints nothing and still launches Chromium; timeout messages don't name the selector. Fixed in M2's first commit.

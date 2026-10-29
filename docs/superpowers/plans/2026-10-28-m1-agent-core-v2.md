@@ -32,7 +32,7 @@
 - Data dir `$IKSA_HOME` (default `~/.iksa`), mode 0700: `config.json`, `ledger.db`, `cas/`, `chromium/`, `profile/`.
 - Launch args (exact, shell form, `cdp::launch` passes them verbatim): `--user-data-dir=<profile>`, `--disable-background-networking`, `--disable-component-update`, `--disable-sync`, `--no-pings`, `--disable-domain-reliability`, `--disable-field-trial-config`, `--disable-breakpad`, `--metrics-recording-only`, `--no-default-browser-check`, `--no-first-run`, `--safebrowsing-disable-auto-update`, `--disable-features=PreloadTopChromeWebUI,WebUIOmniboxPopup,WebUIOmniboxAimPopup`; plus `--use-mock-keychain` only when `mock_keychain` is true. Never `--enable-automation`, never `--remote-debugging-port`.
 - Dependencies: only the Tech Stack list.
-- Tests: unit tests in-module; Chromium tests `#[ignore]` in `tests/`, run with `CHROMIUM=$PWD/.spike-home/chromium/Chromium.app/Contents/MacOS/Chromium cargo test --release -- --ignored --test-threads=1`. **A task is not done until its ignored tests have been run and pass.**
+- Tests: unit tests in-module; Chromium tests `#[ignore]` in `tests/`, run with `CHROMIUM=$PWD/.spike-home/chromium/Chromium.app/Contents/MacOS/Chromium cargo test --release -- --ignored --test-threads=1`. **A task is not done until its ignored tests have been run and pass.** Tests never write under `target/codex` (Codex scratch only).
 
 ## Review Focus
 
@@ -82,39 +82,31 @@ Notes for Codex runs (from Tasks 0–2):
 | 7b Secrets erased, append-only audit | `b933cd9` | terminal `transition` rewrites `tasks.steps` redacted + `secure_delete` + `wal_checkpoint(TRUNCATE)`; `steps.seq` append-only, FK cascade; `gc`/`render` skip missing trees; `audit::now_ms()` | C9, C9b |
 | 7c Non-fatal checkpoint | `1d443eb` | busy WAL checkpoint returns `Ok`; checkpoint on `open`/`Drop`; `Cas::path` `pub(crate)`; audit test `setup()` | C9d |
 | 8 Engine + pillar tests | `cb51b42` | `src/engine.rs`: `launch_args(profile, mock_keychain)`, `Engine::{launch, run, run_with_timeout}`, `STEP_TIMEOUT`, `CAPTCHA_WAIT`; `tests/{engine,pillars}.rs`; `spikes/` removed; numbers in `docs/perf.md` | C10–C14 |
+| 8b Engine fixes | `96f1e8b` | resume re-types `Type` steps after the last navigation (fails safely if a `Click` would repeat); no snapshots while a secret is on the page; `scrub` on outcomes/failures; same-document navigation; JS error causes; one failure path; timing moved to `audit::tests::step_bookkeeping_under_25ms` | C14b–C14d |
 
 New modules go in `src/lib.rs`; `main.rs` is the CLI only. Integration tests `use iksa::…`.
 
-### Task 8b: Engine fixes (resume, secrets in snapshots) + trims
+### Task 9a: Test-fixture consolidation + non-HTTP navigation (before Task 9)
 
-From Claude's caveman and ponytail reviews of `cb51b42`. Two bugs must be fixed before Task 9 builds the CLI on the engine.
+From Claude's caveman and ponytail reviews of `96f1e8b`. Task 9 adds `tests/cli.rs` next to these files, so consolidate first.
 
-**Bug 1 — approval resume loses typed fields.** Each run uses a fresh browser context and replays only the last `Navigate`/`Search` before the cursor. Login flow `Navigate, Type email, Type password (secret), Click #login (Financial)`: it pauses at the click, and after `approve` the resumed run clicks login on an empty form.
-**Bug 2 — secrets leak into snapshots and outcomes.** After `Type { secret: true }` the engine stores `outerHTML`; pages that mirror input (our `/form` fixture, strength meters, frameworks that set the `value` attribute) put the secret into the CAS for up to `retention_days`. A later `Extract` of a mirrored element also writes it into the record's `outcome`.
+**Files:** `tests/common/mod.rs`, `tests/cdp.rs`, `tests/engine.rs`, `tests/pillars.rs`, `src/engine.rs`.
 
-**Files:** `src/engine.rs`, `src/audit.rs` (one ignored test), `tests/engine.rs`, `tests/common/mod.rs`.
+**Interfaces:**
+- `tests/common/mod.rs`: `pub struct Chrome { pub b: Option<cdp::Browser>, pub profile: PathBuf }` with `Chrome::new(extra_args: &[String]) -> Chrome` (launches `iksa::engine::launch_args(&profile, true)` + `extra_args` on a fresh `temp_profile()`), `Chrome::b(&self) -> &cdp::Browser`, and `Drop` (drop browser, then `remove_dir_all(profile)`). Replaces `Fixture` (cdp.rs) and both `F` structs (engine.rs, pillars.rs); test-specific helpers (`normalize`, `targets`, ledger/cas handles) stay in their files as free functions or small wrappers around `Chrome`.
+- `tests/pillars.rs`: delete the two `"TODO launch args…"` asserts in the fixture (covered by `launch_args_exact`); `artifact()` writes into a per-test temp dir (`common::temp_profile()`-style, removed on drop), never `target/codex`.
+- `src/engine.rs`:
+  - `action()` computes the outcome label once: `match a { Navigate => "navigated", Search => "searched", Click => "clicked", Type => "typed", Extract => <innerText> }`.
+  - The step result handling becomes `if let Some(k) = execution?? { …AwaitingHandoff(Challenge(k))… }` then `set_cursor`.
+  - `use std::collections::HashMap`.
+  - `navigate`: for URLs whose scheme isn't `http`/`https`, wait only for `Page.loadEventFired` and return `(None, vec![])`.
+- Rule for all tests from now on: never write under `target/codex`; Codex scratch stays out of the test code.
 
-**Interfaces / rules:**
-- `fn url_of(a: &Action, cfg: &Config) -> Option<String>` (Navigate → url, Search → `cfg.search_url(query)`), used by `action()` and by resume.
-- Resume (cursor > 0): let `nav` = index of the last step before the cursor where `url_of` is `Some`. Navigate to it, then re-run every `Type` in `nav+1..cursor` (no records, no gate). If any `Click` lies in that range, end with `Failed("cannot resume: step {i} would repeat a click")` and record it.
-- Secret hygiene: the engine keeps `secrets: Vec<&str>` = the `text` of every `Type { secret: true }` in the task. A `secret_on_page` flag is set when a secret `Type` runs and cleared when a `Navigate`/`Search` completes a fresh Document navigation (review privacy ruling: same-document navigation preserves it). While it is set (including the secret step itself), store no snapshot (`after = None`). Every `outcome` and failure message passes through `scrub(s, &secrets)`, which replaces each secret with `"••••"` before `record_step`.
-- Same-document navigation: `Page.navigate` with no `loaderId` and empty `errorText` returns `Ok((None, vec![]))` immediately.
-- `eval` errors include `exceptionDetails.exception.description` (or `.text`).
-- One failure path: the step loop returns `Err` for timeout/error; only the outer handler records the failure and transitions to `Failed`. Its record's `decision` is `"approved"` if `approved_step == Some(cursor)`, else `"auto"`.
-- Headers: `serde_json::from_value::<HashMap<String, String>>(r["headers"].clone()).unwrap_or_default().into_iter().collect()`.
-- Remove the timing instrumentation from `Engine` (`call_time`, `overheads`, `step_overheads()`, the `call()` wrapper — call `b.call` directly; `Engine` becomes `{ browser: RefCell<Option<Browser>> }`). The 25 ms check moves out of `tests/engine.rs` (delete `step_overhead_under_25ms`) to `audit::tests::step_bookkeeping_under_25ms` (`#[ignore]`, release): 20 distinct ~80 KB fixture pages, each `snapshot::put` + `record_step` + `set_cursor` timed; median < 25 ms.
-- `tests/common::test_args` is deleted; tests call `iksa::engine::launch_args(&profile, true)`. `tree_footprint_kib` keeps parse + sum + assert only (no files written to `target/codex`, no `println!`).
-
-- [x] **Step 1: Failing tests (`tests/engine.rs`, `#[ignore]`):**
-  - `approval_resume_replays_typed_fields`: steps Navigate `/form`, Type `#q` "hi", Click `#go` (`risk: financial`), default `auto_max` raised to `Write`; run → `AwaitingHandoff(Approval)` at cursor 2; `approve`; run → `Committed`; a final Extract step `#out` == "hi".
-  - `resume_with_click_before_cursor_fails_safely`: Navigate `/form`, Click `#go` (auto), Type `#q` "x" (Financial-risk `Type`); run → approval at cursor 2; `approve`; run → `Failed` containing `would repeat a click`.
-  - `secret_never_in_snapshots_or_outcomes`: `auto_max: Write`; Navigate `/form`, Type `#q` secret "hunter2", Click `#go`, Extract `#out`, Navigate `/form`, Extract `h1` → `Committed`; no blob from `cas.all()` contains `hunter2`; `records` JSON doesn't contain it; the `#out` Extract outcome is `"••••"`; the records for steps 1–3 have `after == None`, and the step 4 and 5 records have `Some`.
-  - `same_document_navigation_commits`: Navigate `/form`, Navigate `/form#x`, Extract `h1` → `Committed`.
-  - `bad_selector_error_is_explained`: Extract `##bad` → `Failed` whose message contains `SyntaxError` or `not a valid selector`.
-- [x] **Step 2:** `cargo test` + ignored `--test engine` — the 5 new tests fail (`same_document…` and `bad_selector…` may already pass partially; they guard the change).
-- [x] **Step 3:** Implement the rules above; `rm -rf .spike-home/Library` (untracked leftovers).
-- [x] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass, including `step_bookkeeping_under_25ms` and the 4 pillar tests. Update `docs/perf.md` C10 with the new bookkeeping median, and add a "Watch (M3)" line: C14's worst sample was 1,206,946 KiB = 98% of budget.
-- [x] **Step 5:** Commit `fix: resume replays typed fields, secret-free snapshots and outcomes; engine trims`.
+- [ ] **Step 1: Failing test** `tests/engine.rs::about_blank_navigation_commits` (`#[ignore]`): Navigate `/form`, Navigate `about:blank`, Navigate `data:text/html,<h1>d</h1>`, Extract `h1` == `"d"` → `Committed` within 10 s (today it hangs until the 30 s step timeout).
+- [ ] **Step 2:** ignored `--test engine -- about_blank_navigation_commits` — FAIL (timeout).
+- [ ] **Step 3:** Implement the Interfaces; `rmdir .spike-home/Library 2>/dev/null` (empty, untracked).
+- [ ] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass (engine now 16).
+- [ ] **Step 5:** Commit `refactor: shared Chrome test fixture, non-HTTP navigation, engine trims`.
 
 ### Task 9: CLI, setup, end to end
 
@@ -122,9 +114,9 @@ From Claude's caveman and ponytail reviews of `cb51b42`. Two bugs must be fixed 
 
 **Interfaces:**
 - `setup::PIN` = the spike pin (arm64 only). `setup::chromium_path(home) -> Option<PathBuf>` (`$CHROMIUM` if set, else the installed binary). `setup::install(home) -> anyhow::Result<PathBuf>`: `curl -fL`, `shasum -a 256` (mismatch -> delete file, `Err`), `hdiutil attach -nobrowse` + `cp -R` + detach, `xattr -dr com.apple.quarantine`. Idempotent: does nothing if the installed version matches `PIN`, reinstalls if not (no separate `update` command).
-- Commands (`std::env::args` match): `setup`, `add <task.json|->` (`{"title","steps"}`; `-` reads stdin so a secret never has to sit in a file; prints id; if a file path was given and any step is `Type { secret: true }`, also print to stderr `warning: <path> contains a secret; delete it — iksa keeps its own copy until the task finishes`), `run` (`recover()`, `gc`, then each queued task), `list`, `approve <id>`, `resume <id>`, `report <id>`, `gc`. Bad usage: usage text on stderr, exit 2. Error: `eprintln!("error: {e:#}")` (alternate format, so `with_context` errors keep their cause), exit 1. Before anything else `main` creates `IKSA_HOME` with mode 0700 and, if it already exists, `set_permissions` it to 0700. Tests set `IKSA_MOCK_KEYCHAIN=1` -> `mock_keychain = true`; never set by default.
+- Commands (`std::env::args` match): `setup`, `add <task.json|->` (`{"title","steps"}`; `-` reads stdin so a secret never has to sit in a file; prints id; if a file path was given and any step is `Type { secret: true }`, also print to stderr `warning: <path> contains a secret; delete it — iksa keeps its own copy until the task finishes`), `run` (`recover()`, `gc`, then each queued task), `list`, `approve <id>`, `resume <id>`, `report <id>`, `gc`. Bad usage: usage text on stderr, exit 2. Error: `eprintln!("error: {e:#}")` (alternate format, so `with_context` errors keep their cause), exit 1. Before anything else `main` creates `IKSA_HOME` with mode 0700 and, if it already exists, `set_permissions` it to 0700. Tests set `IKSA_MOCK_KEYCHAIN=1` -> `mock_keychain = true`; never set by default. `main` is `#[tokio::main]` and runs queued tasks one after another on that future (never `tokio::spawn`: `Ledger` is not `Sync`). Order in `run`: `recover()`, then `gc(.., audit::now_ms())`, then `Engine::launch` (a launch failure leaves every task `Queued`), then each `next_queued()`.
 
-- [ ] **Step 1: Failing tests** (`env!("CARGO_BIN_EXE_iksa")`, temp `IKSA_HOME`): `add_and_list`; `bad_task_json_exits_nonzero` (`{"op":"fly"}` -> exit 1, `error:`, ledger unchanged); `bad_config_exits_nonzero` (template without `{q}` -> exit 1, stderr names the provider and contains `{q}`); `unknown_config_field_shows_reason` (config with `"bogus": 1` -> exit 1, stderr contains both `config.json` and `bogus`); `existing_home_tightened_to_0700` (pre-create `IKSA_HOME` at 0755, run `list`, mode is 0700); `add_from_stdin` (pipe the task JSON into `add -` → `list` shows it); `add_secret_file_warns` (file with a secret `Type` → exit 0, stderr contains `contains a secret`); `run_after_crash_recovers_then_gcs` (leave a task `Executing` in the ledger, then `run` with `CHROMIUM=/nonexistent` → `list` shows it `Queued`, and GC did not refuse); `chromium_launch_failure_keeps_task_queued` (`CHROMIUM=/nonexistent` -> exit 1, still `Queued`); `run_without_setup_says_run_setup` (stderr contains `iksa setup`); `checksum_mismatch_aborts_install` (unit in `setup.rs`); `e2e_report` (`#[ignore]`, network: add `examples/hn.json`, `run`, `report` contains `## Step 2` and `Committed`).
+- [ ] **Step 1: Failing tests** (`env!("CARGO_BIN_EXE_iksa")`, temp `IKSA_HOME`): `add_and_list`; `bad_task_json_exits_nonzero` (`{"op":"fly"}` -> exit 1, `error:`, ledger unchanged); `bad_config_exits_nonzero` (template without `{q}` -> exit 1, stderr names the provider and contains `{q}`); `unknown_config_field_shows_reason` (config with `"bogus": 1` -> exit 1, stderr contains both `config.json` and `bogus`); `existing_home_tightened_to_0700` (pre-create `IKSA_HOME` at 0755, run `list`, mode is 0700); `add_from_stdin` (pipe the task JSON into `add -` → `list` shows it); `add_secret_file_warns` (file with a secret `Type` → exit 0, stderr contains `contains a secret`); `run_after_crash_recovers_then_gcs` (leave a task `Executing` in the ledger, then `run` with `CHROMIUM=/nonexistent` → `list` shows it `Queued`, and GC did not refuse); `chromium_launch_failure_keeps_task_queued` (`CHROMIUM=/nonexistent` -> exit 1, still `Queued`); `run_without_setup_says_run_setup` (stderr contains `iksa setup`); `checksum_mismatch_aborts_install` (unit in `setup.rs`, uses a local file, no network); `e2e_report` (`#[ignore]`, network: add `examples/hn.json`, `run`, `report` contains `## Step 2` and `Committed`).
 - [ ] **Step 2:** FAIL. **Step 3:** implement.
 - [ ] **Step 4:** `cargo test` + full ignored command — all pass.
 - [ ] **Step 5:** Pillar check into `docs/perf.md`: `ls -l target/release/iksa` (< 60 MB), `du -sk $IKSA_HOME/cas` after `e2e_report` (< 500), pillar test numbers from Task 8.
@@ -172,6 +164,8 @@ Results go in `docs/perf.md` under `## Manual`.
 | C14b | 8b | ignored `--test engine` | 15/15 pass (11 − old overhead + 5 new); all 5 new tests first failed; full release ignored 30/30 pass — **done** |
 | C14c | 8b | release ignored `audit::tests::step_bookkeeping_under_25ms` | 20 distinct 82,526-byte pages; median 6.336604 ms < 25 ms — **done** |
 | C14d | 8b | `grep -c 'call_time\|step_overheads\|fn test_args\|target/codex' src/engine.rs tests/common/mod.rs` | 0 and 0 — **done** |
+| C14e | 9a | ignored `--test engine` | 16 pass incl. `about_blank_navigation_commits` |
+| C14f | 9a | `grep -rn 'struct F \|struct Fixture\|target/codex\|TODO launch' tests/` | no matches |
 | C15 | 9 | `cargo test --test cli` + `e2e_report` | 12 pass |
 | C16 | 9 | binary size / CAS size | < 60 MB / < 500 KB |
 | C17 | 10 | H1 keychain | ≤ 1 prompt, none after Always Allow |

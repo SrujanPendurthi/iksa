@@ -74,40 +74,37 @@ Notes for Codex runs (from Tasks 0–2):
 | 4 Config, search, gate, actions | `e451c1b` | `src/{config,gate,action}.rs`: `Config::{load, search_url}`, `gate::decide`, `Action::{risk, redacted}`; done by Claude while Codex quota was at 86% | C6 |
 | 5 Challenge detection | `1439d7a` | `src/challenge.rs`: `ChallengeKind`, `detect` | C7 |
 | 5b Review fixes | `8bd8d86` | `Action` `deny_unknown_fields`; `Config::load` creates home 0700, rejects `retention_days: 0`, `with_context` errors; tighter hCaptcha + case-insensitive headers; `src/testutil.rs` (`temp_dir(label) -> TempDir`) | C7b, C7c |
+| 5c reCAPTCHA match | `1c04723` | rule 4 matches `/recaptcha/api.js`, `/recaptcha/enterprise.js`, `class="g-recaptcha"` | C7d |
+| 6 SQLite task ledger | `5f45616` | `src/ledger.rs`: `Handoff`, `State`, `Task`, `LedgerError`, `Ledger::{open, add, get, list, set_cursor, next_queued, transition, approve, resume, recover}`; WAL + `synchronous=NORMAL` | C8 |
 
 New modules go in `src/lib.rs`; `main.rs` is the CLI only. Integration tests `use iksa::…`.
 
-### Task 5c: Tighten the reCAPTCHA match
+### Task 6b: Ledger hardening (before Task 7)
 
-From Claude's caveman review of `8bd8d86`. The rule `google.com/recaptcha` matches footer links such as `https://www.google.com/recaptcha/about/` (Task 8 would then wait 10 s for a token that never appears and pause for hand-off) and misses the real embed from `www.recaptcha.net`.
+From Claude's caveman and ponytail reviews of `5f45616`. Two `iksa` processes on one `ledger.db` (e.g. `iksa approve 3` while `iksa run` is writing) must not fail or corrupt state; plus native conversions.
 
-**Files:** `src/challenge.rs`.
+**Files:** `Cargo.toml`, `src/ledger.rs`.
 
-- [x] **Step 1: Failing tests:** `recaptcha_about_link_is_not_challenge` (`<a href="https://www.google.com/recaptcha/about/">` -> `None`); `recaptcha_net_script` (`<script src="https://www.recaptcha.net/recaptcha/api.js"></script>` -> `Some(ReCaptcha)`); `recaptcha_enterprise_script` (`<script src="https://www.google.com/recaptcha/enterprise.js"></script>` -> `Some(ReCaptcha)`).
-- [x] **Step 2:** `cargo test --lib -- challenge::` — `recaptcha_about_link_is_not_challenge` fails (returns `ReCaptcha`) and `recaptcha_net_script` fails (returns `None`); `recaptcha_enterprise_script` already passes and guards the new rule.
-- [x] **Step 3:** Rule 4 becomes: html contains `/recaptcha/api.js` or `/recaptcha/enterprise.js` or `class="g-recaptcha"` -> `ReCaptcha`. Keep the existing `recaptcha_script` test passing (adjust its fixture only if it used a bare link, and say so in the commit).
-- [x] **Step 4:** `cargo test` — all pass.
-- [x] **Step 5:** Commit `fix: match reCAPTCHA scripts, not links`.
+**Interfaces (unchanged public API):**
+- `Cargo.toml`: rusqlite features `["bundled", "fallible_uint"]` — enables rusqlite's checked `FromSql`/`ToSql` for `usize`/`u64` (they're behind that feature in 0.41; that's why Task 6's first attempt failed to compile).
+- `Ledger::open`: `conn.busy_timeout(Duration::from_secs(5))?` before the pragmas.
+- One `const SELECT: &str = "SELECT id,title,steps,cursor,state,approved_step,finished_ms FROM tasks";` used by `get`, `list`, `next_queued`.
+- `Ledger::task(row)`: `cursor: row.get(3)?`, `approved_step: row.get(5)?`, `finished_ms: row.get(6)?` (no hand-written `try_from`). `set_cursor` passes `cursor` straight into `params!`.
+- `transition`: single conditional statement `UPDATE tasks SET state=?2, finished_ms=CASE WHEN ?3 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) END WHERE id=?1 AND state=?4` (`?3` = `to` is `Committed`/`Failed`, `?4` = JSON of the `from` just read). 0 rows changed -> re-read and return `Illegal { from: <current>, to }`. No `SystemTime` code.
+- `approve`: same pattern — `UPDATE … SET state=?2, approved_step=cursor, finished_ms=NULL WHERE id=?1 AND state=?3` with `?3` = JSON of `AwaitingHandoff(Approval)`; 0 rows -> `NotFound` if the id is gone, else `Illegal`.
 
-### Task 6: Ledger (SQLite)
-
-**Files:** `src/ledger.rs`.
-
-**Interfaces:**
-- `enum Handoff { Approval, Challenge(ChallengeKind) }`; `enum State { Queued, Executing, AwaitingHandoff(Handoff), Committed, Failed(String) }` (stored as JSON text).
-- `struct Task { id: i64, title: String, steps: Vec<Action>, cursor: usize, state: State, approved_step: Option<usize>, finished_ms: Option<u64> }`.
-- `enum LedgerError { Sql, Json, NotFound(i64), Illegal { from: State, to: State } }` (thiserror, `#[from]` for the first two).
-- `Ledger::open(path)` sets `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;` (one cheap sync per commit, keeps steps inside the 25 ms budget), `add(title, &[Action]) -> i64`, `get(id)`, `list()`, `set_cursor(id, usize)`, `next_queued() -> Option<Task>` (lowest id).
-- `transition(id, to)`: legal `Queued->Executing`; `Executing->{AwaitingHandoff, Committed, Failed, Queued}`; `AwaitingHandoff->{Queued, Failed}`; else `Illegal`. Sets `finished_ms` on `Committed`/`Failed`.
-- `approve(id)` only from `AwaitingHandoff(Approval)`: `approved_step = Some(cursor)`, `Queued`. `resume(id)` only from `AwaitingHandoff(Challenge(_))`: `Queued`. `recover() -> usize`: all `Executing` -> `Queued`.
-
-- [x] **Step 1: Failing tests** (temp dirs via `crate::testutil::temp_dir`): `add_then_get`, `happy_path_transitions`, `committed_is_terminal`, `approve_only_from_approval_wait`, `recover_requeues_executing` (cursor kept across reopen), `finished_ms_set_on_commit`.
-- [x] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** pass.
-- [x] **Step 5:** Commit `feat: SQLite task ledger`.
+- [ ] **Step 1: Failing tests (`src/ledger.rs`):**
+  - `concurrent_writer_waits`: open two `Ledger`s on the same file; on the first, `conn.execute_batch("BEGIN IMMEDIATE")`, spawn a thread that sleeps 200 ms then `COMMIT`s; meanwhile the second calls `add("x", &[])` — must return `Ok` (without `busy_timeout` it fails with `database is locked`).
+  - `stale_handle_transition_rejected`: two `Ledger`s on one file; handle A moves task Queued -> Executing; handle B then tries Queued -> Executing -> `Illegal { from: Executing, .. }`; state stays `Executing`.
+  - `finished_ms_is_epoch_ms`: after `Committed`, `finished_ms` is within 5,000 ms of `SystemTime::now()` in ms (guards the `unixepoch` SQL).
+- [ ] **Step 2:** `cargo test --lib -- ledger::` — `concurrent_writer_waits` fails; the other two may already pass (they guard the rewrite).
+- [ ] **Step 3:** Implement the Interfaces.
+- [ ] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass. `grep -c 'try_from\|SystemTime' src/ledger.rs` outside `#[cfg(test)]` = 0.
+- [ ] **Step 5:** Commit `fix: ledger busy timeout, conditional transitions, native int conversions`.
 
 ### Task 7: Audit records, report, retention GC
 
-**Files:** `src/audit.rs`; modify `src/ledger.rs` (`steps(task_id, step, json)` table).
+**Files:** `src/audit.rs`; modify `src/ledger.rs` (`steps(task_id, step, json)` table; reuse Task 6b's conversion and `const SELECT` style, no `try_from`).
 
 **Interfaces:**
 - `struct StepRecord { step: usize, action: Action, decision: String /* "auto"|"approved" */, after: Option<String> /* tree hex */, outcome: String, at_ms: u64 }`. A step's "before" is the previous record's `after`.
@@ -143,6 +140,7 @@ How `run` maps to CDP (algorithm, since the signatures don't fix it):
 6. Error/timeout: record outcome `error: …` / `timeout at step N`; `Failed(..)`; return.
 7. `set_cursor(cursor + 1)`; after the last step `Committed`. Always `Target.disposeBrowserContext`.
 8. Event receivers: on `broadcast::error::RecvError::Lagged` keep receiving (log the skip count); only `Closed` is an error.
+9. Run tasks one after another on the caller's future. Do not `tokio::spawn` `run`: `Ledger` holds a `rusqlite::Connection` (not `Sync`). M2's daemon will need `Mutex<Ledger>` or a connection per worker.
 
 Fixture routes (`common::serve`): `/form` (`<h1>Form</h1>` + the Task 1 form), `/cf` (403, `cf-mitigated: challenge`), `/slow` (hang), `/search?q=…` (echoes decoded q in `<h1>`), `/turnstile` (`<div class="cf-turnstile"></div><input name="cf-turnstile-response">`, no token), `/turnstile-auto` (same, plus a script that sets the input's `.value = "tok"` after 1 s), `/recaptcha-v3` (`<script src="https://www.google.com/recaptcha/api.js?render=k"></script><textarea name="g-recaptcha-response"></textarea>` plus a script setting its `.value = "tok"` after 1 s; the external script fails to load offline, which is fine).
 
@@ -197,8 +195,10 @@ Results go in `docs/perf.md` under `## Manual`.
 | C7 | 5 | `cargo test challenge` | 7 pass — **done** |
 | C7b | 5b | `cargo test --lib` | 5 new tests pass; total lib = previous + 5 — **done** |
 | C7c | 5b | `grep -rn 'struct Temp(\|struct Home\|target/codex' src/` | no matches — **done** |
-| C7d | 5c | `cargo test --lib -- challenge::` | 3 new pass (`recaptcha_about_link_is_not_challenge`, `recaptcha_net_script`, `recaptcha_enterprise_script`) |
-| C8 | 6 | `cargo test ledger` | 6 pass |
+| C7d | 5c | `cargo test --lib -- challenge::` | 3 new pass (`recaptcha_about_link_is_not_challenge`, `recaptcha_net_script`, `recaptcha_enterprise_script`) — **done** |
+| C8 | 6 | `cargo test ledger` | 6 pass — **done** |
+| C8b | 6b | `cargo test --lib -- ledger::` | 9 pass incl. `concurrent_writer_waits`, `stale_handle_transition_rejected`, `finished_ms_is_epoch_ms` |
+| C8c | 6b | `grep -c 'try_from\|SystemTime'` in `src/ledger.rs` non-test code | 0 |
 | C9 | 7 | `cargo test audit` | 6 pass |
 | C10 | 8 | ignored `--test engine` | 11 pass |
 | C11 | 8 | `netlog_sees_real_navigation` | `example.com` found |

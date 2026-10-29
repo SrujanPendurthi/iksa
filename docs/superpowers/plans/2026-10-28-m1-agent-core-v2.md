@@ -113,9 +113,11 @@ From Claude's caveman and ponytail reviews of `5f45616`. Two `iksa` processes on
 - `audit::render(&Task, &[StepRecord], &Cas) -> io::Result<String>`: `# Task {id}: {title}`, state line, per step `## Step N — {op}`, action JSON, decision, outcome (≤ 2,000 chars), `DOM: {changed}/{total} chunks changed` vs previous snapshot, or `DOM: not stored`.
 - `audit::gc(&Ledger, &Cas, retention_days, now_ms) -> anyhow::Result<(usize, usize)>`: drop finished tasks older than retention, then mark-and-sweep unreachable blobs. Also removes `tmp-*` files in the CAS root older than 1 hour (left by crashes). Must not run while any task is `Executing` (M1 only calls it before tasks start).
 
-- [ ] **Step 1: Failing tests** (temp dirs via `crate::testutil::temp_dir`): `report_lists_every_step`, `secret_never_rendered`, `financial_step_stores_no_snapshot`, `records_roundtrip`, `dom_change_summary`, `gc_removes_old_tasks_and_orphan_blobs` (shared blobs kept, running task untouched).
-- [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** pass.
-- [ ] **Step 5:** Commit `feat: audit records, report, retention GC`.
+- [x] **Step 1: Failing tests** (temp dirs via `crate::testutil::temp_dir`): `report_lists_every_step`, `secret_never_rendered`, `financial_step_stores_no_snapshot`, `records_roundtrip`, `dom_change_summary`, `gc_removes_old_tasks_and_orphan_blobs` (shared blobs kept, running task untouched).
+- [x] **Step 2:** `cargo test audit`: 0 passed, 6 runtime failures against TODO stubs; evidence in `target/codex/v2-task7-red.log`.
+- [x] **Step 3:** Implement audit records, report, and retention GC.
+- [ ] **Step 4:** BLOCKED: strict no-secret-in-DB requirement conflicts with queued raw actions in existing `tasks.steps`; see `target/codex/v2-task7-report.md`. Actual results: audit 5 passed / 1 failed; full normal 50 passed / 1 failed / 1 ignored; full pinned release ignored 10 passed. Exact failing assertion: `BLOCKED: queued tasks.steps persists secret typed text`. Queued actions are preserved for future execution; no secret vault or encryption design added.
+- [x] **Step 5:** Commit `feat: audit records, report, retention GC`.
 
 ### Task 8: Engine on `cdp::Browser` + pillar tests
 

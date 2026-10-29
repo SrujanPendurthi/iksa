@@ -34,6 +34,9 @@ impl Drop for TempBlob {
 }
 
 impl Cas {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
         private_dir(root.as_ref())?;
         Ok(Self {

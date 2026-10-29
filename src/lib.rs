@@ -7,5 +7,6 @@ pub mod gate;
 pub mod ledger;
 pub mod snapshot;
 
+pub mod audit;
 #[cfg(test)]
 pub(crate) mod testutil;

@@ -51,9 +51,42 @@ impl Ledger {
                 id INTEGER PRIMARY KEY, title TEXT NOT NULL, steps TEXT NOT NULL,
                 cursor INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL,
                 approved_step INTEGER, finished_ms INTEGER
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS steps (task_id INTEGER NOT NULL, step INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(task_id, step));",
         )?;
         Ok(Self { conn })
+    }
+    pub fn record_step(
+        &self,
+        id: i64,
+        record: &crate::audit::StepRecord,
+    ) -> Result<(), LedgerError> {
+        self.get(id)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO steps (task_id, step, json) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, record.step, serde_json::to_string(record)?],
+        )?;
+        Ok(())
+    }
+    pub fn records(&self, id: i64) -> Result<Vec<crate::audit::StepRecord>, LedgerError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT json FROM steps WHERE task_id=?1 ORDER BY step")?;
+        let mut rows = stmt.query([id])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(serde_json::from_str(&row.get::<_, String>(0)?)?);
+        }
+        Ok(records)
+    }
+    pub fn delete_task(&self, id: i64) -> Result<(), LedgerError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM steps WHERE task_id=?1", [id])?;
+        if tx.execute("DELETE FROM tasks WHERE id=?1", [id])? == 0 {
+            return Err(LedgerError::NotFound(id));
+        }
+        tx.commit()?;
+        Ok(())
     }
     pub fn add(&self, title: &str, steps: &[Action]) -> Result<i64, LedgerError> {
         self.conn.execute(

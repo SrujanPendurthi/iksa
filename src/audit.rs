@@ -168,6 +168,44 @@ mod tests {
         let cas = Cas::open(dir.0.join("cas")).unwrap();
         (dir, ledger, cas)
     }
+    #[test]
+    #[ignore]
+    fn step_bookkeeping_under_25ms() {
+        let (_dir, ledger, cas) = setup("step-bookkeeping");
+        let steps: Vec<_> = (0..20).map(|_| action()).collect();
+        let id = ledger.add("bookkeeping", &steps).unwrap();
+        ledger.transition(id, State::Executing).unwrap();
+        let pages: Vec<String> = (0..20)
+            .map(|n| {
+                let body = (0..2500)
+                    .map(|i| format!("<p>page {n:02} item {i:04} content</p>\n"))
+                    .collect::<String>();
+                format!("<html><body>{body}</body></html>")
+            })
+            .collect();
+        assert!(pages.iter().all(|p| (75000..90000).contains(&p.len())));
+        let mut times = vec![];
+        let mut hashes = std::collections::HashSet::new();
+        for (n, page) in pages.iter().enumerate() {
+            let start = std::time::Instant::now();
+            let hash = snapshot::put(&cas, page).unwrap();
+            ledger
+                .record_step(id, &record(n, Some(hash.to_hex().to_string())))
+                .unwrap();
+            ledger.set_cursor(id, n + 1).unwrap();
+            times.push(start.elapsed());
+            hashes.insert(hash);
+        }
+        assert_eq!(hashes.len(), 20);
+        assert_eq!(ledger.records(id).unwrap().len(), 20);
+        times.sort();
+        let median = (times[9] + times[10]) / 2;
+        println!(
+            "bookkeeping page bytes {}; samples {times:?}; median {median:?}",
+            pages[0].len()
+        );
+        assert!(median < Duration::from_millis(25));
+    }
     fn action() -> Action {
         Action::Extract {
             selector: "h1".into(),

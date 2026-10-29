@@ -11,7 +11,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::Path,
     time::{Duration, Instant},
@@ -42,11 +42,22 @@ pub fn launch_args(profile: &Path, mock_keychain: bool) -> Vec<String> {
     }
     a
 }
+fn url_of(a: &Action, cfg: &Config) -> Option<String> {
+    match a {
+        Action::Navigate { url } => Some(url.clone()),
+        Action::Search { query } => Some(cfg.search_url(query)),
+        _ => None,
+    }
+}
+fn scrub(s: &str, secrets: &[&str]) -> String {
+    secrets
+        .iter()
+        .filter(|s| !s.is_empty())
+        .fold(s.to_owned(), |s, secret| s.replace(secret, "••••"))
+}
 /// Sequential execution on the caller's future; the ledger is deliberately not Sync.
 pub struct Engine {
     browser: RefCell<Option<Browser>>,
-    call_time: Cell<Duration>,
-    overheads: RefCell<Vec<Duration>>,
 }
 impl Engine {
     pub fn launch(chromium: &Path, profile: &Path, mock_keychain: bool) -> anyhow::Result<Self> {
@@ -60,32 +71,24 @@ impl Engine {
                 chromium,
                 &launch_args(profile, mock_keychain),
             )?)),
-            call_time: Cell::new(Duration::ZERO),
-            overheads: RefCell::new(vec![]),
         })
     }
-    /// Measured per-step wall time less time inside CDP calls, including real CAS/ledger writes.
-    /// Intended for the release overhead check; cleared at the beginning of each run.
-    pub fn step_overheads(&self) -> Vec<Duration> {
-        self.overheads.borrow().clone()
-    }
-    async fn call(&self, b: &Browser, m: &str, p: Value, s: Option<&str>) -> anyhow::Result<Value> {
-        let start = Instant::now();
-        let result = b.call(m, p, s).await;
-        self.call_time.set(self.call_time.get() + start.elapsed());
-        result
-    }
     async fn eval(&self, b: &Browser, s: &str, expr: String) -> anyhow::Result<Value> {
-        let r = self
+        let r = b
             .call(
-                b,
                 "Runtime.evaluate",
                 json!({"expression":expr,"returnByValue":true}),
                 Some(s),
             )
             .await?;
         if r.get("exceptionDetails").is_some() {
-            anyhow::bail!("JavaScript evaluation failed");
+            anyhow::bail!(
+                "JavaScript evaluation failed: {}",
+                r["exceptionDetails"]["exception"]["description"]
+                    .as_str()
+                    .or_else(|| r["exceptionDetails"]["text"].as_str())
+                    .unwrap_or("unknown exception")
+            );
         }
         Ok(r["result"]["value"].clone())
     }
@@ -96,15 +99,13 @@ impl Engine {
         url: &str,
     ) -> anyhow::Result<(Option<u16>, Vec<(String, String)>)> {
         let mut events = b.events();
-        let nav = self
-            .call(b, "Page.navigate", json!({"url":url}), Some(s))
-            .await?;
+        let nav = b.call("Page.navigate", json!({"url":url}), Some(s)).await?;
         if let Some(error) = nav["errorText"].as_str().filter(|v| !v.is_empty()) {
             anyhow::bail!("navigation: {error}");
         }
-        let loader = nav["loaderId"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("navigation missing loaderId"))?;
+        let Some(loader) = nav["loaderId"].as_str() else {
+            return Ok((None, vec![]));
+        };
         let mut response = None;
         let mut loaded = false;
         while response.is_none() || !loaded {
@@ -126,21 +127,12 @@ impl Engine {
                 && e.params["loaderId"] == loader
             {
                 let r = &e.params["response"];
-                let headers = r["headers"]
-                    .as_object()
-                    .map(|h| {
-                        h.iter()
-                            .map(|(k, v)| {
-                                (
-                                    k.clone(),
-                                    v.as_str()
-                                        .map(str::to_owned)
-                                        .unwrap_or_else(|| v.to_string()),
-                                )
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let headers = serde_json::from_value::<std::collections::HashMap<String, String>>(
+                    r["headers"].clone(),
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
                 response = Some((r["status"].as_f64().map(|n| n as u16), headers));
             }
             if e.method == "Page.loadEventFired" {
@@ -167,19 +159,23 @@ impl Engine {
         cfg: &Config,
     ) -> anyhow::Result<(String, Option<u16>, Vec<(String, String)>)> {
         match a {
-            Action::Navigate { url } => {
-                let (st, h) = self.navigate(b, s, url).await?;
-                Ok(("navigated".into(), st, h))
-            }
-            Action::Search { query } => {
-                let (st, h) = self.navigate(b, s, &cfg.search_url(query)).await?;
-                Ok(("searched".into(), st, h))
+            Action::Navigate { .. } | Action::Search { .. } => {
+                let (st, h) = self.navigate(b, s, &url_of(a, cfg).unwrap()).await?;
+                Ok((
+                    if matches!(a, Action::Search { .. }) {
+                        "searched"
+                    } else {
+                        "navigated"
+                    }
+                    .into(),
+                    st,
+                    h,
+                ))
             }
             Action::Click { selector, .. } | Action::Type { selector, .. } => {
                 let xy = self.locate(b, s, selector).await?;
                 for kind in ["mousePressed", "mouseReleased"] {
-                    self.call(
-                        b,
+                    b.call(
                         "Input.dispatchMouseEvent",
                         json!({"type":kind,"x":xy["x"],"y":xy["y"],"button":"left","clickCount":1}),
                         Some(s),
@@ -195,7 +191,7 @@ impl Engine {
                     if focused != true {
                         anyhow::bail!("typed element could not receive focus");
                     }
-                    self.call(b, "Input.insertText", json!({"text":text}), Some(s))
+                    b.call("Input.insertText", json!({"text":text}), Some(s))
                         .await?;
                 }
                 Ok((
@@ -269,13 +265,24 @@ impl Engine {
         let b = browser
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("browser unavailable after cleanup timeout"))?;
-        self.overheads.borrow_mut().clear();
+        let task = l.get(id)?;
+        let secrets: Vec<&str> = task
+            .steps
+            .iter()
+            .filter_map(|a| match a {
+                Action::Type {
+                    text, secret: true, ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut secret_on_page = false;
         l.transition(id, State::Executing)?;
         let mut context = None;
         let result: anyhow::Result<State> = async {
             let ctx = tokio::time::timeout(
                 timeout,
-                self.call(b, "Target.createBrowserContext", json!({}), None),
+                b.call("Target.createBrowserContext", json!({}), None),
             )
             .await??;
             let ctx = ctx["browserContextId"]
@@ -284,17 +291,15 @@ impl Engine {
                 .to_owned();
             context = Some(ctx.clone());
             let result = tokio::time::timeout(timeout, async {
-                let target = self
+                let target = b
                     .call(
-                        b,
                         "Target.createTarget",
                         json!({"url":"about:blank","hidden":true,"browserContextId":ctx}),
                         None,
                     )
                     .await?;
-                let session = self
+                let session = b
                     .call(
-                        b,
                         "Target.attachToTarget",
                         json!({"targetId":target["targetId"],"flatten":true}),
                         None,
@@ -305,10 +310,9 @@ impl Engine {
                     .ok_or_else(|| anyhow::anyhow!("missing session id"))?
                     .to_owned();
                 for method in ["Page.enable", "Network.enable"] {
-                    self.call(b, method, json!({}), Some(&s)).await?;
+                    b.call(method, json!({}), Some(&s)).await?;
                 }
-                self.call(
-                    b,
+                b.call(
                     "Emulation.setDeviceMetricsOverride",
                     json!({"width":1280,"height":800,"deviceScaleFactor":1,"mobile":false}),
                     Some(&s),
@@ -316,14 +320,28 @@ impl Engine {
                 .await?;
                 let task = l.get(id)?;
                 if task.cursor > 0 {
-                    for a in task.steps[..task.cursor].iter().rev() {
-                        let url = match a {
-                            Action::Navigate { url } => url.clone(),
-                            Action::Search { query } => cfg.search_url(query),
-                            _ => continue,
-                        };
-                        self.navigate(b, &s, &url).await?;
-                        break;
+                    if let Some(nav) = task.steps[..task.cursor]
+                        .iter()
+                        .rposition(|a| url_of(a, cfg).is_some())
+                    {
+                        let replay = &task.steps[nav + 1..task.cursor];
+                        if let Some(i) = replay
+                            .iter()
+                            .position(|a| matches!(a, Action::Click { .. }))
+                        {
+                            anyhow::bail!(
+                                "cannot resume: step {} would repeat a click",
+                                nav + 1 + i
+                            );
+                        }
+                        self.navigate(b, &s, &url_of(&task.steps[nav], cfg).unwrap())
+                            .await?;
+                        for a in replay {
+                            if let Action::Type { secret, .. } = a {
+                                self.action(b, &s, a, cfg).await?;
+                                secret_on_page |= *secret;
+                            }
+                        }
                     }
                 }
                 Ok::<_, anyhow::Error>(s)
@@ -332,8 +350,6 @@ impl Engine {
             let s = result;
             let task = l.get(id)?;
             for (n, a) in task.steps.iter().enumerate().skip(task.cursor) {
-                let start = Instant::now();
-                self.call_time.set(Duration::ZERO);
                 let decision = if gate::decide(cfg.auto_max, a.risk()) == Decision::NeedsApproval {
                     if task.approved_step != Some(n) {
                         let state = State::AwaitingHandoff(Handoff::Approval);
@@ -346,18 +362,29 @@ impl Engine {
                 };
                 let execution = tokio::time::timeout(timeout, async {
                     let (outcome, status, headers) = self.action(b, &s, a, cfg).await?;
+                    match a {
+                        Action::Type { secret: true, .. } => secret_on_page = true,
+                        // Fragment navigation leaves the secret-bearing Document intact.
+                        Action::Navigate { .. } | Action::Search { .. } if status.is_some() => {
+                            secret_on_page = false
+                        }
+                        _ => {}
+                    }
                     let html = self
                         .eval(b, &s, "document.documentElement.outerHTML".into())
                         .await?
                         .as_str()
                         .unwrap_or("")
                         .to_owned();
-                    let after = if a.risk() == Risk::Financial {
+                    let after = if secret_on_page || a.risk() == Risk::Financial {
                         None
                     } else {
                         Some(snapshot::put(c, &html)?.to_hex().to_string())
                     };
-                    l.record_step(id, &StepRecord::new(n, a, decision.into(), after, outcome))?;
+                    l.record_step(
+                        id,
+                        &StepRecord::new(n, a, decision.into(), after, scrub(&outcome, &secrets)),
+                    )?;
                     let challenge = challenge::detect(status, &headers, &html);
                     Ok::<_, anyhow::Error>(match challenge {
                         Some(k) if self.remaining_challenge(b, &s, k).await? => Some(k),
@@ -373,24 +400,9 @@ impl Engine {
                     }
                     Ok(Ok(None)) => {
                         l.set_cursor(id, n + 1)?;
-                        self.overheads
-                            .borrow_mut()
-                            .push(start.elapsed().saturating_sub(self.call_time.get()));
                     }
-                    other => {
-                        let message = match other {
-                            Err(_) => format!("timeout at step {n}"),
-                            Ok(Err(e)) => format!("error: {e}"),
-                            _ => unreachable!(),
-                        };
-                        l.record_step(
-                            id,
-                            &StepRecord::new(n, a, decision.into(), None, message.clone()),
-                        )?;
-                        let state = State::Failed(message);
-                        l.transition(id, state.clone())?;
-                        return Ok(state);
-                    }
+                    Err(e) => return Err(e.into()),
+                    Ok(Err(e)) => return Err(e),
                 }
             }
             l.transition(id, State::Committed)?;
@@ -401,8 +413,7 @@ impl Engine {
             !matches!(
                 tokio::time::timeout(
                     Duration::from_secs(2),
-                    self.call(
-                        b,
+                    b.call(
                         "Target.disposeBrowserContext",
                         json!({"browserContextId":ctx}),
                         None
@@ -422,16 +433,30 @@ impl Engine {
             Ok(state) => Ok(state),
             Err(e) => {
                 let task = l.get(id)?;
-                let message = if e.is::<tokio::time::error::Elapsed>() {
-                    format!("timeout at step {}", task.cursor)
-                } else {
-                    format!("error: {e}")
-                };
+                let message = scrub(
+                    &if e.is::<tokio::time::error::Elapsed>() {
+                        format!("timeout at step {}", task.cursor)
+                    } else {
+                        format!("error: {e}")
+                    },
+                    &secrets,
+                );
                 if task.state == State::Executing {
                     if let Some(a) = task.steps.get(task.cursor) {
                         l.record_step(
                             id,
-                            &StepRecord::new(task.cursor, a, "auto".into(), None, message.clone()),
+                            &StepRecord::new(
+                                task.cursor,
+                                a,
+                                if task.approved_step == Some(task.cursor) {
+                                    "approved"
+                                } else {
+                                    "auto"
+                                }
+                                .into(),
+                                None,
+                                message.clone(),
+                            ),
                         )?;
                     }
                     let state = State::Failed(message);

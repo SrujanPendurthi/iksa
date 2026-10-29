@@ -9,7 +9,11 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let profile = common::temp_profile();
-        let browser = cdp::launch(&common::chromium(), &common::test_args(&profile)).unwrap();
+        let browser = cdp::launch(
+            &common::chromium(),
+            &iksa::engine::launch_args(&profile, true),
+        )
+        .unwrap();
         Self {
             browser: Some(browser),
             profile,

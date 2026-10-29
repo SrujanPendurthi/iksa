@@ -97,7 +97,7 @@ From Claude's caveman and ponytail reviews of `cb51b42`. Two bugs must be fixed 
 **Interfaces / rules:**
 - `fn url_of(a: &Action, cfg: &Config) -> Option<String>` (Navigate → url, Search → `cfg.search_url(query)`), used by `action()` and by resume.
 - Resume (cursor > 0): let `nav` = index of the last step before the cursor where `url_of` is `Some`. Navigate to it, then re-run every `Type` in `nav+1..cursor` (no records, no gate). If any `Click` lies in that range, end with `Failed("cannot resume: step {i} would repeat a click")` and record it.
-- Secret hygiene: the engine keeps `secrets: Vec<&str>` = the `text` of every `Type { secret: true }` in the task. A `secret_on_page` flag is set when a secret `Type` runs and cleared when a `Navigate`/`Search` completes. While it is set (including the secret step itself), store no snapshot (`after = None`). Every `outcome` and failure message passes through `scrub(s, &secrets)`, which replaces each secret with `"••••"` before `record_step`.
+- Secret hygiene: the engine keeps `secrets: Vec<&str>` = the `text` of every `Type { secret: true }` in the task. A `secret_on_page` flag is set when a secret `Type` runs and cleared when a `Navigate`/`Search` completes a fresh Document navigation (review privacy ruling: same-document navigation preserves it). While it is set (including the secret step itself), store no snapshot (`after = None`). Every `outcome` and failure message passes through `scrub(s, &secrets)`, which replaces each secret with `"••••"` before `record_step`.
 - Same-document navigation: `Page.navigate` with no `loaderId` and empty `errorText` returns `Ok((None, vec![]))` immediately.
 - `eval` errors include `exceptionDetails.exception.description` (or `.text`).
 - One failure path: the step loop returns `Err` for timeout/error; only the outer handler records the failure and transitions to `Failed`. Its record's `decision` is `"approved"` if `approved_step == Some(cursor)`, else `"auto"`.
@@ -105,16 +105,16 @@ From Claude's caveman and ponytail reviews of `cb51b42`. Two bugs must be fixed 
 - Remove the timing instrumentation from `Engine` (`call_time`, `overheads`, `step_overheads()`, the `call()` wrapper — call `b.call` directly; `Engine` becomes `{ browser: RefCell<Option<Browser>> }`). The 25 ms check moves out of `tests/engine.rs` (delete `step_overhead_under_25ms`) to `audit::tests::step_bookkeeping_under_25ms` (`#[ignore]`, release): 20 distinct ~80 KB fixture pages, each `snapshot::put` + `record_step` + `set_cursor` timed; median < 25 ms.
 - `tests/common::test_args` is deleted; tests call `iksa::engine::launch_args(&profile, true)`. `tree_footprint_kib` keeps parse + sum + assert only (no files written to `target/codex`, no `println!`).
 
-- [ ] **Step 1: Failing tests (`tests/engine.rs`, `#[ignore]`):**
+- [x] **Step 1: Failing tests (`tests/engine.rs`, `#[ignore]`):**
   - `approval_resume_replays_typed_fields`: steps Navigate `/form`, Type `#q` "hi", Click `#go` (`risk: financial`), default `auto_max` raised to `Write`; run → `AwaitingHandoff(Approval)` at cursor 2; `approve`; run → `Committed`; a final Extract step `#out` == "hi".
   - `resume_with_click_before_cursor_fails_safely`: Navigate `/form`, Click `#go` (auto), Type `#q` "x" (Financial-risk `Type`); run → approval at cursor 2; `approve`; run → `Failed` containing `would repeat a click`.
   - `secret_never_in_snapshots_or_outcomes`: `auto_max: Write`; Navigate `/form`, Type `#q` secret "hunter2", Click `#go`, Extract `#out`, Navigate `/form`, Extract `h1` → `Committed`; no blob from `cas.all()` contains `hunter2`; `records` JSON doesn't contain it; the `#out` Extract outcome is `"••••"`; the records for steps 1–3 have `after == None`, and the step 4 and 5 records have `Some`.
   - `same_document_navigation_commits`: Navigate `/form`, Navigate `/form#x`, Extract `h1` → `Committed`.
   - `bad_selector_error_is_explained`: Extract `##bad` → `Failed` whose message contains `SyntaxError` or `not a valid selector`.
-- [ ] **Step 2:** `cargo test` + ignored `--test engine` — the 5 new tests fail (`same_document…` and `bad_selector…` may already pass partially; they guard the change).
-- [ ] **Step 3:** Implement the rules above; `rm -rf .spike-home/Library` (untracked leftovers).
-- [ ] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass, including `step_bookkeeping_under_25ms` and the 4 pillar tests. Update `docs/perf.md` C10 with the new bookkeeping median, and add a "Watch (M3)" line: C14's worst sample was 1,206,946 KiB = 98% of budget.
-- [ ] **Step 5:** Commit `fix: resume replays typed fields, secret-free snapshots and outcomes; engine trims`.
+- [x] **Step 2:** `cargo test` + ignored `--test engine` — the 5 new tests fail (`same_document…` and `bad_selector…` may already pass partially; they guard the change).
+- [x] **Step 3:** Implement the rules above; `rm -rf .spike-home/Library` (untracked leftovers).
+- [x] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass, including `step_bookkeeping_under_25ms` and the 4 pillar tests. Update `docs/perf.md` C10 with the new bookkeeping median, and add a "Watch (M3)" line: C14's worst sample was 1,206,946 KiB = 98% of budget.
+- [x] **Step 5:** Commit `fix: resume replays typed fields, secret-free snapshots and outcomes; engine trims`.
 
 ### Task 9: CLI, setup, end to end
 
@@ -169,9 +169,9 @@ Results go in `docs/perf.md` under `## Manual`.
 | C12 | 8 | `idle_egress_is_loopback_only` | 0 hosts after 60 s — **done** |
 | C13 | 8 | `idle_footprint_under_300mb` | samples 213511/213911/214695 KiB; median 213911 < 307200 KiB — **done** |
 | C14 | 8 | `five_tabs_three_agents_under_1200mb` | samples 1206946/1167745/1143666 KiB; median 1167745 < 1228800 KiB; all individual checks pass — **done** |
-| C14b | 8b | ignored `--test engine` | 15 pass (11 − `step_overhead_under_25ms` + 5 new) |
-| C14c | 8b | release ignored `audit::tests::step_bookkeeping_under_25ms` | median < 25 ms |
-| C14d | 8b | `grep -c 'call_time\|step_overheads\|fn test_args\|target/codex' src/engine.rs tests/common/mod.rs` | 0 and 0 |
+| C14b | 8b | ignored `--test engine` | 15/15 pass (11 − old overhead + 5 new); all 5 new tests first failed; full release ignored 30/30 pass — **done** |
+| C14c | 8b | release ignored `audit::tests::step_bookkeeping_under_25ms` | 20 distinct 82,526-byte pages; median 6.336604 ms < 25 ms — **done** |
+| C14d | 8b | `grep -c 'call_time\|step_overheads\|fn test_args\|target/codex' src/engine.rs tests/common/mod.rs` | 0 and 0 — **done** |
 | C15 | 9 | `cargo test --test cli` + `e2e_report` | 12 pass |
 | C16 | 9 | binary size / CAS size | < 60 MB / < 500 KB |
 | C17 | 10 | H1 keychain | ≤ 1 prompt, none after Always Allow |

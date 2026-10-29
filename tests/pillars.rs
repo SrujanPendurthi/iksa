@@ -18,11 +18,6 @@ impl F {
             args.iter().any(|a| a == "--use-mock-keychain"),
             "TODO mock keychain required"
         );
-        assert_eq!(
-            args,
-            common::test_args(&p),
-            "exact private test launch arguments required"
-        );
         if let Some(n) = netlog {
             args.push(format!("--log-net-log={}", n.display()));
         }

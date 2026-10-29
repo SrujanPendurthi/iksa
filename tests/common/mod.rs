@@ -22,28 +22,6 @@ pub fn temp_profile() -> PathBuf {
     p
 }
 
-pub fn test_args(profile: &Path) -> Vec<String> {
-    let mut a = vec![format!("--user-data-dir={}", profile.display())];
-    a.extend(
-        [
-            "--disable-background-networking",
-            "--disable-component-update",
-            "--disable-sync",
-            "--no-pings",
-            "--disable-domain-reliability",
-            "--disable-field-trial-config",
-            "--disable-breakpad",
-            "--metrics-recording-only",
-            "--no-default-browser-check",
-            "--no-first-run",
-            "--safebrowsing-disable-auto-update",
-            "--disable-features=PreloadTopChromeWebUI,WebUIOmniboxPopup,WebUIOmniboxAimPopup",
-            "--use-mock-keychain",
-        ]
-        .map(String::from),
-    );
-    a
-}
 #[derive(Clone)]
 pub struct Response {
     pub status: u16,
@@ -103,8 +81,6 @@ pub fn descendants(pid: u32) -> Vec<u32> {
         .output()
         .unwrap();
     assert!(output.status.success());
-    std::fs::create_dir_all("target/codex").unwrap();
-    std::fs::write(format!("target/codex/ps-tree-{pid}.log"), &output.stdout).unwrap();
     let pairs: Vec<(u32, u32)> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
@@ -131,21 +107,10 @@ pub fn descendants(pid: u32) -> Vec<u32> {
     tree.remove(0);
     tree
 }
-/// All-or-nothing process tree phys_footprint, with raw evidence retained.
+/// All-or-nothing process tree phys_footprint.
 pub fn tree_footprint_kib(pid: u32) -> u64 {
-    let dir = std::env::current_dir().unwrap().join("target/codex");
-    std::fs::create_dir_all(&dir).unwrap();
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
     let mut pids = vec![pid];
     pids.extend(descendants(pid));
-    std::fs::write(
-        dir.join(format!("footprint-{stamp}-pids.json")),
-        serde_json::to_vec(&pids).unwrap(),
-    )
-    .unwrap();
     let mut bytes = 0u64;
     let mut errors = vec![];
     for child in pids {
@@ -159,7 +124,6 @@ pub fn tree_footprint_kib(pid: u32) -> u64 {
                     String::from_utf8_lossy(&o.stdout),
                     String::from_utf8_lossy(&o.stderr)
                 );
-                std::fs::write(dir.join(format!("footprint-{stamp}-{child}.log")), &raw).unwrap();
                 let value = raw.lines().find_map(|line| {
                     line.trim()
                         .strip_prefix("phys_footprint:")
@@ -181,10 +145,6 @@ pub fn tree_footprint_kib(pid: u32) -> u64 {
         errors.is_empty(),
         "BLOCKED footprint: {}; no partial sum",
         errors.join("; ")
-    );
-    println!(
-        "footprint root={pid} raw stamp={stamp} total={bytes} bytes, {} KiB",
-        bytes / 1024
     );
     bytes / 1024
 }
@@ -258,11 +218,7 @@ pub fn netlog_hosts(path: &Path) -> Vec<String> {
 }
 #[test]
 fn netlog_parser_covers_all_events_and_network_forms() {
-    let path = std::env::current_dir().unwrap().join(format!(
-        "target/codex/netlog-parser-{}.json",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let path = temp_profile().join("netlog-parser.json");
     std::fs::write(&path,r#"{"events":[{"params":{"url":"https://Example.COM:443/a","host":"localhost:80","address":"[::1]:443"}},{"params":{"url":"chrome://newtab/","nested":{"host":"remote.test:443","address":"[2001:db8::1]:443"}}},{"params":{"address":"0.0.0.0:9","host":"127.0.0.2:80"}}]}"#).unwrap();
     assert_eq!(
         netlog_hosts(&path),

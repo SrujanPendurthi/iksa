@@ -35,14 +35,6 @@ impl F {
         let recap = "<h1>Widget</h1><script src=\"https://www.google.com/recaptcha/api.js?render=k\" async></script><textarea name=g-recaptcha-response></textarea><script>setTimeout(()=>document.querySelector('textarea').value='tok',1000)</script>";
         let port = common::serve(&[
             ("/form", r(form)),
-            // Every read changes the DOM so each measured snapshot writes new
-            // CAS blobs through the production fsync path instead of deduplicating.
-            (
-                "/overhead",
-                r(
-                    "<h1>Form</h1><script>const h=document.querySelector('h1');const native=Object.getOwnPropertyDescriptor(HTMLElement.prototype,'innerText').get;let n=0;Object.defineProperty(h,'innerText',{get(){document.body.dataset.step=String(++n);return native.call(h)}})</script>",
-                ),
-            ),
             ("/search?q=a%20b", r("<h1>a b</h1>")),
             ("/turnstile", r(widget)),
             ("/turnstile-auto", r(&auto)),
@@ -277,31 +269,190 @@ async fn contexts_are_isolated() {
 }
 #[tokio::test]
 #[ignore]
-async fn step_overhead_under_25ms() {
+async fn approval_resume_replays_typed_fields() {
     let f = F::new();
-    let mut steps = vec![f.nav("/overhead")];
-    steps.extend((0..20).map(|_| extract("h1")));
-    let (id, s) = f.run(&steps, &Config::default()).await;
-    let records = f.l.records(id).unwrap();
+    let cfg = Config {
+        auto_max: Risk::Write,
+        ..Config::default()
+    };
+    let (id, s) = f
+        .run(
+            &[
+                f.nav("/form"),
+                typed(),
+                Action::Click {
+                    selector: "#go".into(),
+                    risk: Risk::Financial,
+                },
+                extract("#out"),
+            ],
+            &cfg,
+        )
+        .await;
+    assert_eq!(s, State::AwaitingHandoff(Handoff::Approval));
+    assert_eq!(f.l.get(id).unwrap().cursor, 2);
+    f.l.approve(id).unwrap();
     assert_eq!(
-        records
-            .iter()
-            .map(|r| r.after.clone().unwrap())
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-        21,
-        "all measured snapshots must be distinct so CAS writes and fsync occur"
+        f.e.run(&f.l, &f.c, &cfg, id).await.unwrap(),
+        State::Committed
     );
-    assert!(f.c.all().unwrap().len() >= 42);
+    assert_eq!(f.outcome(id), "hi");
+}
+#[tokio::test]
+#[ignore]
+async fn resume_with_click_before_cursor_fails_safely() {
+    let f = F::new();
+    let cfg = Config {
+        auto_max: Risk::Write,
+        ..Config::default()
+    };
+    let (id, s) = f
+        .run(
+            &[
+                f.nav("/form"),
+                Action::Click {
+                    selector: "#go".into(),
+                    risk: Risk::Write,
+                },
+                Action::Type {
+                    selector: "#q".into(),
+                    text: "x".into(),
+                    secret: false,
+                    risk: Risk::Financial,
+                },
+            ],
+            &cfg,
+        )
+        .await;
+    assert_eq!(s, State::AwaitingHandoff(Handoff::Approval));
+    assert_eq!(f.l.get(id).unwrap().cursor, 2);
+    f.l.approve(id).unwrap();
+    let s = f.e.run(&f.l, &f.c, &cfg, id).await.unwrap();
+    assert!(matches!(s,State::Failed(ref m) if m.contains("would repeat a click")));
+    let r = f.l.records(id).unwrap();
+    assert_eq!(r.last().unwrap().decision, "approved");
+}
+#[tokio::test]
+#[ignore]
+async fn secret_never_in_snapshots_or_outcomes() {
+    let f = F::new();
+    let cfg = Config {
+        auto_max: Risk::Write,
+        ..Config::default()
+    };
+    let (id, s) = f
+        .run(
+            &[
+                f.nav("/form"),
+                Action::Type {
+                    selector: "#q".into(),
+                    text: "hunter2".into(),
+                    secret: true,
+                    risk: Risk::Write,
+                },
+                Action::Click {
+                    selector: "#go".into(),
+                    risk: Risk::Write,
+                },
+                extract("#out"),
+                f.nav("/form"),
+                extract("h1"),
+            ],
+            &cfg,
+        )
+        .await;
     assert_eq!(s, State::Committed);
-    let mut times = f.e.step_overheads();
-    assert_eq!(times.len(), 21);
-    times.remove(0);
-    times.sort();
-    let median = (times[9] + times[10]) / 2;
-    println!(
-        "engine overhead samples {times:?}; median {median:?}; upper median {:?}",
-        times[10]
+    for hash in f.c.all().unwrap() {
+        assert!(!String::from_utf8_lossy(&f.c.get(&hash).unwrap()).contains("hunter2"));
+    }
+    let r = f.l.records(id).unwrap();
+    assert!(!serde_json::to_string(&r).unwrap().contains("hunter2"));
+    assert_eq!(r[3].outcome, "••••");
+    assert!(r[1..4].iter().all(|r| r.after.is_none()));
+    assert!(r[4..6].iter().all(|r| r.after.is_some()));
+
+    // Fragment navigation keeps the same document and its mirrored secret.
+    let secret = Action::Type {
+        selector: "#q".into(),
+        text: "hunter2".into(),
+        secret: true,
+        risk: Risk::Write,
+    };
+    let (fragment_id, state) = f
+        .run(
+            &[
+                f.nav("/form"),
+                secret.clone(),
+                f.nav("/form#x"),
+                extract("#live"),
+                f.nav("/form"),
+                extract("h1"),
+            ],
+            &cfg,
+        )
+        .await;
+    assert_eq!(state, State::Committed);
+    let records = f.l.records(fragment_id).unwrap();
+    assert_eq!(records[3].outcome, "••••");
+    assert!(
+        records[1..4].iter().all(|r| r.after.is_none()),
+        "same-document navigation must preserve secret snapshot suppression"
     );
-    assert!(times[10] < Duration::from_millis(25));
+    assert!(records[4..6].iter().all(|r| r.after.is_some()));
+
+    // A resumed secret Type restores the page flag before the approved click.
+    let (resume_id, state) = f
+        .run(
+            &[
+                f.nav("/form"),
+                secret,
+                Action::Click {
+                    selector: "#go".into(),
+                    risk: Risk::Financial,
+                },
+                extract("#out"),
+            ],
+            &cfg,
+        )
+        .await;
+    assert_eq!(state, State::AwaitingHandoff(Handoff::Approval));
+    f.l.approve(resume_id).unwrap();
+    assert_eq!(
+        f.e.run(&f.l, &f.c, &cfg, resume_id).await.unwrap(),
+        State::Committed
+    );
+    let records = f.l.records(resume_id).unwrap();
+    assert_eq!(records[3].outcome, "••••");
+    assert!(records[1..4].iter().all(|r| r.after.is_none()));
+    for id in [fragment_id, resume_id] {
+        assert!(
+            !serde_json::to_string(&f.l.records(id).unwrap())
+                .unwrap()
+                .contains("hunter2")
+        );
+    }
+    for hash in f.c.all().unwrap() {
+        assert!(!String::from_utf8_lossy(&f.c.get(&hash).unwrap()).contains("hunter2"));
+    }
+}
+#[tokio::test]
+#[ignore]
+async fn same_document_navigation_commits() {
+    let f = F::new();
+    let (_, s) = f
+        .run(
+            &[f.nav("/form"), f.nav("/form#x"), extract("h1")],
+            &Config::default(),
+        )
+        .await;
+    assert_eq!(s, State::Committed);
+}
+#[tokio::test]
+#[ignore]
+async fn bad_selector_error_is_explained() {
+    let f = F::new();
+    let (_, s) = f.run(&[extract("##bad")], &Config::default()).await;
+    assert!(
+        matches!(s,State::Failed(ref m) if m.contains("SyntaxError")||m.contains("not a valid selector"))
+    );
 }

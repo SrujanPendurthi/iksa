@@ -40,7 +40,7 @@
 - **Typo in a task's `risk` field** (e.g. `"rsik":"financial"`): task is rejected, never silently downgraded to `write` and auto-run. Test `action_unknown_field_rejected` (Task 5b).
 - **Chromium crashes mid-call**: pending calls fail fast with `browser closed`, no hang. Test `browser_exit_fails_pending` (Task 1).
 - **Process killed mid-task**: next `iksa run` requeues it at its saved cursor. Test `recover_requeues_executing` (Task 6).
-- **Secret typed into a form**: never in record JSON, report, or DB. Test `secret_never_rendered` (Task 7).
+- **Secret typed into a form**: never in record JSON or report; erased from `ledger.db` and `ledger.db-wal` bytes once the task is `Committed` or `Failed`. Tests `secret_never_rendered`, `secret_erased_on_failed` (Task 7b).
 - **Selector never appears / page hangs**: step times out, task `Failed("timeout at step N")`, report still renders. Test `hung_page_fails_with_timeout` (Task 8).
 - **Turnstile that auto-passes**: agent continues instead of pausing. Test `turnstile_auto_pass_continues` (Task 8).
 
@@ -76,48 +76,36 @@ Notes for Codex runs (from Tasks 0–2):
 | 5b Review fixes | `8bd8d86` | `Action` `deny_unknown_fields`; `Config::load` creates home 0700, rejects `retention_days: 0`, `with_context` errors; tighter hCaptcha + case-insensitive headers; `src/testutil.rs` (`temp_dir(label) -> TempDir`) | C7b, C7c |
 | 5c reCAPTCHA match | `1c04723` | rule 4 matches `/recaptcha/api.js`, `/recaptcha/enterprise.js`, `class="g-recaptcha"` | C7d |
 | 6 SQLite task ledger | `5f45616` | `src/ledger.rs`: `Handoff`, `State`, `Task`, `LedgerError`, `Ledger::{open, add, get, list, set_cursor, next_queued, transition, approve, resume, recover}`; WAL + `synchronous=NORMAL` | C8 |
+| 6b Ledger hardening | `0067be2` | conditional `UPDATE … AND state=?` in `transition`/`approve`, `fallible_uint` conversions, SQL `unixepoch`, `const SELECT`. (rusqlite 0.41 already sets a 5 s busy timeout; the explicit call stays.) | C8b, C8c |
+| 7 Audit (partial) | `6ac1079` | `src/audit.rs`: `StepRecord { step, action, decision: String /* "auto"|"approved" */, after: Option<String> /* tree hex */, outcome, at_ms }`, `StepRecord::new(step, &Action, decision, after, outcome)` (redacts; no snapshot for Financial), `render(&Task, &[StepRecord], &Cas) -> io::Result<String>`, `gc(&Ledger, &Cas, retention_days, now_ms) -> anyhow::Result<(usize, usize)>`; `Ledger::{record_step, records, delete_task}`. C9 BLOCKED on secret in `tasks.steps` → Task 7b | C9 (5/6) |
 
 New modules go in `src/lib.rs`; `main.rs` is the CLI only. Integration tests `use iksa::…`.
 
-### Task 6b: Ledger hardening (before Task 7)
+### Task 7b: Erase secrets on finish, append-only audit, resilient GC/report
 
-From Claude's caveman and ponytail reviews of `5f45616`. Two `iksa` processes on one `ledger.db` (e.g. `iksa approve 3` while `iksa run` is writing) must not fail or corrupt state; plus native conversions.
+From Claude's caveman and ponytail reviews of `0067be2`/`6ac1079` and Codex's C9 BLOCKED report. The engine needs the secret to type it, so "never in the DB" cannot hold while a task waits; the contract becomes **never in records or reports, and erased from the database files once the task finishes**.
 
-**Files:** `Cargo.toml`, `src/ledger.rs`.
-
-**Interfaces (unchanged public API):**
-- `Cargo.toml`: rusqlite features `["bundled", "fallible_uint"]` — enables rusqlite's checked `FromSql`/`ToSql` for `usize`/`u64` (they're behind that feature in 0.41; that's why Task 6's first attempt failed to compile).
-- `Ledger::open`: `conn.busy_timeout(Duration::from_secs(5))?` before the pragmas.
-- One `const SELECT: &str = "SELECT id,title,steps,cursor,state,approved_step,finished_ms FROM tasks";` used by `get`, `list`, `next_queued`.
-- `Ledger::task(row)`: `cursor: row.get(3)?`, `approved_step: row.get(5)?`, `finished_ms: row.get(6)?` (no hand-written `try_from`). `set_cursor` passes `cursor` straight into `params!`.
-- `transition`: single conditional statement `UPDATE tasks SET state=?2, finished_ms=CASE WHEN ?3 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) END WHERE id=?1 AND state=?4` (`?3` = `to` is `Committed`/`Failed`, `?4` = JSON of the `from` just read). 0 rows changed -> re-read and return `Illegal { from: <current>, to }`. No `SystemTime` code.
-- `approve`: same pattern — `UPDATE … SET state=?2, approved_step=cursor, finished_ms=NULL WHERE id=?1 AND state=?3` with `?3` = JSON of `AwaitingHandoff(Approval)`; 0 rows -> `NotFound` if the id is gone, else `Illegal`.
-
-- [x] **Step 1: Failing tests (`src/ledger.rs`):**
-  - `concurrent_writer_waits`: open two `Ledger`s on the same file; on the first, `conn.execute_batch("BEGIN IMMEDIATE")`, spawn a thread that sleeps 200 ms then `COMMIT`s; meanwhile the second calls `add("x", &[])` — must return `Ok` (without `busy_timeout` it fails with `database is locked`).
-  - `stale_handle_transition_rejected`: two `Ledger`s on one file; handle A moves task Queued -> Executing; handle B then tries Queued -> Executing -> `Illegal { from: Executing, .. }`; state stays `Executing`.
-  - `finished_ms_is_epoch_ms`: after `Committed`, `finished_ms` is within 5,000 ms of `SystemTime::now()` in ms (guards the `unixepoch` SQL).
-- [x] **Step 2:** `cargo test --lib -- ledger::` — all 9 tests actually passed before production changes: rusqlite 0.41.1 already installs a 5,000 ms busy timeout (`src/inner_connection.rs:90`). The planned failure assumption was false; no timeout was disabled to force a failure.
-- [x] **Step 3:** Implement the Interfaces.
-- [x] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass. `grep -c 'try_from\|SystemTime' src/ledger.rs` outside `#[cfg(test)]` = 0.
-- [x] **Step 5:** Commit `fix: ledger busy timeout, conditional transitions, native int conversions`.
-
-### Task 7: Audit records, report, retention GC
-
-**Files:** `src/audit.rs`; modify `src/ledger.rs` (`steps(task_id, step, json)` table; reuse Task 6b's conversion and `const SELECT` style, no `try_from`).
+**Files:** `src/ledger.rs`, `src/audit.rs`, `src/snapshot.rs` (visibility only).
 
 **Interfaces:**
-- `struct StepRecord { step: usize, action: Action, decision: String /* "auto"|"approved" */, after: Option<String> /* tree hex */, outcome: String, at_ms: u64 }`. A step's "before" is the previous record's `after`.
-- `StepRecord::new(step, &Action, decision, after, outcome)` stores `action.redacted()` and forces `after = None` for `Financial` risk.
-- `Ledger::record_step(id, &StepRecord)`, `Ledger::records(id) -> Vec<StepRecord>`, `Ledger::delete_task(id)`.
-- `audit::render(&Task, &[StepRecord], &Cas) -> io::Result<String>`: `# Task {id}: {title}`, state line, per step `## Step N — {op}`, action JSON, decision, outcome (≤ 2,000 chars), `DOM: {changed}/{total} chunks changed` vs previous snapshot, or `DOM: not stored`.
-- `audit::gc(&Ledger, &Cas, retention_days, now_ms) -> anyhow::Result<(usize, usize)>`: drop finished tasks older than retention, then mark-and-sweep unreachable blobs. Also removes `tmp-*` files in the CAS root older than 1 hour (left by crashes). Must not run while any task is `Executing` (M1 only calls it before tasks start).
+- `Ledger::open`: also `PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;`. Table `steps` becomes `seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, step INTEGER NOT NULL, json TEXT NOT NULL` (no migration: no M1 databases exist outside tests).
+- `Ledger::transition` to `Committed`/`Failed`: the same conditional `UPDATE` also sets `steps = ?` to the JSON of every action's `redacted()`; afterwards run `PRAGMA wal_checkpoint(TRUNCATE)` so old page images leave `ledger.db-wal`. `secure_delete` zeroes the freed pages in `ledger.db`.
+- `Ledger::record_step`: plain `INSERT` (no `OR REPLACE`, no `get` pre-check; an unknown task id fails on the foreign key). `Ledger::records`: `query_map`, `ORDER BY seq`. `Ledger::delete_task`: one `DELETE FROM tasks WHERE id=?1` (cascade), `NotFound` if 0 rows.
+- `audit::now_ms() -> u64` (epoch ms), used by `StepRecord::new`, the tests, and later Task 9's `gc` call. `snapshot::invalid_data` becomes `pub(crate)` and `audit.rs` drops its copy.
+- `audit::render`: no second `redacted()`. If a record's tree can't be read, write `DOM: unavailable ({error})` and continue.
+- `audit::gc`: if `chunk_hashes` fails for a record's tree, skip that tree and keep sweeping (a damaged blob was already deleted by `Cas::get`).
 
-- [x] **Step 1: Failing tests** (temp dirs via `crate::testutil::temp_dir`): `report_lists_every_step`, `secret_never_rendered`, `financial_step_stores_no_snapshot`, `records_roundtrip`, `dom_change_summary`, `gc_removes_old_tasks_and_orphan_blobs` (shared blobs kept, running task untouched).
-- [x] **Step 2:** `cargo test audit`: 0 passed, 6 runtime failures against TODO stubs; evidence in `target/codex/v2-task7-red.log`.
-- [x] **Step 3:** Implement audit records, report, and retention GC.
-- [ ] **Step 4:** BLOCKED: strict no-secret-in-DB requirement conflicts with queued raw actions in existing `tasks.steps`; see `target/codex/v2-task7-report.md`. Actual results: audit 5 passed / 1 failed; full normal 50 passed / 1 failed / 1 ignored; full pinned release ignored 10 passed. Exact failing assertion: `BLOCKED: queued tasks.steps persists secret typed text`. Queued actions are preserved for future execution; no secret vault or encryption design added.
-- [x] **Step 5:** Commit `feat: audit records, report, retention GC`.
+- [ ] **Step 1: Tests first** (temp dirs via `crate::testutil::temp_dir`).
+  - Rewrite `audit::tests::secret_never_rendered`: add a task with `Type { text: "hunter2", secret: true }`, record a step, `transition` to `Executing` then `Committed`, drop the `Ledger`. Then the raw bytes of `ledger.db` and of `ledger.db-wal` (if it exists) don't contain `hunter2`; `records` JSON and `render` output never contain it; `get(id).steps` shows `"••••"`.
+  - `audit::tests::secret_erased_on_failed`: same, ending in `Failed("x")`.
+  - `audit::tests::rerun_step_keeps_both_records`: `record_step` twice with `step: 0` (outcomes `"challenge"`, `"ok"`) → `records` has 2 entries in that order; `render` contains `## Step 0` twice.
+  - `audit::tests::gc_survives_missing_tree`: two committed old tasks with snapshots; delete one task's tree blob file directly; `gc` returns `Ok` and removes both tasks' blobs.
+  - `audit::tests::render_survives_missing_tree`: record with an `after` tree whose blob is missing → `render` is `Ok` and contains `DOM: unavailable`.
+  - `ledger::tests::delete_task_cascades`: after `record_step` + `delete_task`, `SELECT count(*) FROM steps` = 0.
+- [ ] **Step 2:** `cargo test --lib -- audit:: ledger::` — the 6 tests above fail (the cascade test may pass if delete still runs both statements; it guards the rewrite).
+- [ ] **Step 3:** Implement the Interfaces.
+- [ ] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass.
+- [ ] **Step 5:** Commit `fix: erase secrets on finish, append-only audit, resilient gc/report`.
 
 ### Task 8: Engine on `cdp::Browser` + pillar tests
 
@@ -164,7 +152,7 @@ Fixture routes (`common::serve`): `/form` (`<h1>Form</h1>` + the Task 1 form), `
 - `setup::PIN` = the spike pin (arm64 only). `setup::chromium_path(home) -> Option<PathBuf>` (`$CHROMIUM` if set, else the installed binary). `setup::install(home) -> anyhow::Result<PathBuf>`: `curl -fL`, `shasum -a 256` (mismatch -> delete file, `Err`), `hdiutil attach -nobrowse` + `cp -R` + detach, `xattr -dr com.apple.quarantine`. Idempotent: does nothing if the installed version matches `PIN`, reinstalls if not (no separate `update` command).
 - Commands (`std::env::args` match): `setup`, `add <task.json>` (`{"title","steps"}`; prints id), `run` (`recover()`, `gc`, then each queued task), `list`, `approve <id>`, `resume <id>`, `report <id>`, `gc`. Bad usage: usage text on stderr, exit 2. Error: `eprintln!("error: {e:#}")` (alternate format, so `with_context` errors keep their cause), exit 1. Before anything else `main` creates `IKSA_HOME` with mode 0700 and, if it already exists, `set_permissions` it to 0700. Tests set `IKSA_MOCK_KEYCHAIN=1` -> `mock_keychain = true`; never set by default.
 
-- [ ] **Step 1: Failing tests** (`env!("CARGO_BIN_EXE_iksa")`, temp `IKSA_HOME`): `add_and_list`; `bad_task_json_exits_nonzero` (`{"op":"fly"}` -> exit 1, `error:`, ledger unchanged); `bad_config_exits_nonzero` (template without `{q}` -> exit 1, stderr names the provider and contains `{q}`); `unknown_config_field_shows_reason` (config with `"bogus": 1` -> exit 1, stderr contains both `config.json` and `bogus`); `existing_home_tightened_to_0700` (pre-create `IKSA_HOME` at 0755, run `list`, mode is 0700); `chromium_launch_failure_keeps_task_queued` (`CHROMIUM=/nonexistent` -> exit 1, still `Queued`); `run_without_setup_says_run_setup` (stderr contains `iksa setup`); `checksum_mismatch_aborts_install` (unit in `setup.rs`); `e2e_report` (`#[ignore]`, network: add `examples/hn.json`, `run`, `report` contains `## Step 2` and `Committed`).
+- [ ] **Step 1: Failing tests** (`env!("CARGO_BIN_EXE_iksa")`, temp `IKSA_HOME`): `add_and_list`; `bad_task_json_exits_nonzero` (`{"op":"fly"}` -> exit 1, `error:`, ledger unchanged); `bad_config_exits_nonzero` (template without `{q}` -> exit 1, stderr names the provider and contains `{q}`); `unknown_config_field_shows_reason` (config with `"bogus": 1` -> exit 1, stderr contains both `config.json` and `bogus`); `existing_home_tightened_to_0700` (pre-create `IKSA_HOME` at 0755, run `list`, mode is 0700); `run_after_crash_recovers_then_gcs` (leave a task `Executing` in the ledger, then `run` with `CHROMIUM=/nonexistent` → `list` shows it `Queued`, and GC did not refuse); `chromium_launch_failure_keeps_task_queued` (`CHROMIUM=/nonexistent` -> exit 1, still `Queued`); `run_without_setup_says_run_setup` (stderr contains `iksa setup`); `checksum_mismatch_aborts_install` (unit in `setup.rs`); `e2e_report` (`#[ignore]`, network: add `examples/hn.json`, `run`, `report` contains `## Step 2` and `Committed`).
 - [ ] **Step 2:** FAIL. **Step 3:** implement.
 - [ ] **Step 4:** `cargo test` + full ignored command — all pass.
 - [ ] **Step 5:** Pillar check into `docs/perf.md`: `ls -l target/release/iksa` (< 60 MB), `du -sk $IKSA_HOME/cas` after `e2e_report` (< 500), pillar test numbers from Task 8.
@@ -199,15 +187,16 @@ Results go in `docs/perf.md` under `## Manual`.
 | C7c | 5b | `grep -rn 'struct Temp(\|struct Home\|target/codex' src/` | no matches — **done** |
 | C7d | 5c | `cargo test --lib -- challenge::` | 3 new pass (`recaptcha_about_link_is_not_challenge`, `recaptcha_net_script`, `recaptcha_enterprise_script`) — **done** |
 | C8 | 6 | `cargo test ledger` | 6 pass — **done** |
-| C8b | 6b | `cargo test --lib -- ledger::` | 9 pass incl. `concurrent_writer_waits`, `stale_handle_transition_rejected`, `finished_ms_is_epoch_ms` |
-| C8c | 6b | `grep -c 'try_from\|SystemTime'` in `src/ledger.rs` non-test code | 0 |
-| C9 | 7 | `cargo test audit` | 6 pass |
+| C8b | 6b | `cargo test --lib -- ledger::` | 9 pass incl. `concurrent_writer_waits`, `stale_handle_transition_rejected`, `finished_ms_is_epoch_ms` — **done** |
+| C8c | 6b | `grep -c 'try_from\|SystemTime'` in `src/ledger.rs` non-test code | 0 — **done** |
+| C9 | 7 | `cargo test audit` | 6 pass — 5/6, `secret_never_rendered` BLOCKED (spec), moved to 7b |
+| C9b | 7b | `cargo test --lib -- audit:: ledger::` | all pass incl. `secret_never_rendered`, `secret_erased_on_failed`, `rerun_step_keeps_both_records`, `gc_survives_missing_tree`, `render_survives_missing_tree`, `delete_task_cascades` |
 | C10 | 8 | ignored `--test engine` | 11 pass |
 | C11 | 8 | `netlog_sees_real_navigation` | `example.com` found |
 | C12 | 8 | `idle_egress_is_loopback_only` | 0 hosts |
 | C13 | 8 | `idle_footprint_under_300mb` | median < 300 MB (spike: 223) |
 | C14 | 8 | `five_tabs_three_agents_under_1200mb` | < 1.2 GB |
-| C15 | 9 | `cargo test --test cli` + `e2e_report` | 9 pass |
+| C15 | 9 | `cargo test --test cli` + `e2e_report` | 10 pass |
 | C16 | 9 | binary size / CAS size | < 60 MB / < 500 KB |
 | C17 | 10 | H1 keychain | ≤ 1 prompt, none after Always Allow |
 | C18 | 10 | H2 address bar | dropdown works; bubble noted |

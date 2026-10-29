@@ -30,7 +30,10 @@ pub fn detect(
         Some(ChallengeKind::Turnstile)
     } else if html.contains("hcaptcha.com/1/api.js") || html.contains("class=\"h-captcha\"") {
         Some(ChallengeKind::HCaptcha)
-    } else if html.contains("google.com/recaptcha") || html.contains("class=\"g-recaptcha\"") {
+    } else if html.contains("/recaptcha/api.js")
+        || html.contains("/recaptcha/enterprise.js")
+        || html.contains("class=\"g-recaptcha\"")
+    {
         Some(ChallengeKind::ReCaptcha)
     } else {
         None
@@ -140,6 +143,42 @@ mod tests {
         assert_eq!(
             detect(None, &[], "class=\"g-recaptcha\" class=\"h-captcha\""),
             Some(ChallengeKind::HCaptcha)
+        );
+    }
+
+    #[test]
+    fn recaptcha_about_link_is_not_challenge() {
+        assert_eq!(
+            detect(
+                None,
+                &[],
+                r#"<a href="https://www.google.com/recaptcha/about/">"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn recaptcha_net_script() {
+        assert_eq!(
+            detect(
+                None,
+                &[],
+                r#"<script src="https://www.recaptcha.net/recaptcha/api.js"></script>"#
+            ),
+            Some(ChallengeKind::ReCaptcha)
+        );
+    }
+
+    #[test]
+    fn recaptcha_enterprise_script() {
+        assert_eq!(
+            detect(
+                None,
+                &[],
+                r#"<script src="https://www.google.com/recaptcha/enterprise.js"></script>"#
+            ),
+            Some(ChallengeKind::ReCaptcha)
         );
     }
 

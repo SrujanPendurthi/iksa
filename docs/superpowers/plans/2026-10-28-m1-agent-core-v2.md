@@ -83,11 +83,11 @@ From Claude's caveman review of `8bd8d86`. The rule `google.com/recaptcha` match
 
 **Files:** `src/challenge.rs`.
 
-- [ ] **Step 1: Failing tests:** `recaptcha_about_link_is_not_challenge` (`<a href="https://www.google.com/recaptcha/about/">` -> `None`); `recaptcha_net_script` (`<script src="https://www.recaptcha.net/recaptcha/api.js"></script>` -> `Some(ReCaptcha)`); `recaptcha_enterprise_script` (`<script src="https://www.google.com/recaptcha/enterprise.js"></script>` -> `Some(ReCaptcha)`).
-- [ ] **Step 2:** `cargo test --lib -- challenge::` — `recaptcha_about_link_is_not_challenge` fails (returns `ReCaptcha`) and `recaptcha_net_script` fails (returns `None`); `recaptcha_enterprise_script` already passes and guards the new rule.
-- [ ] **Step 3:** Rule 4 becomes: html contains `/recaptcha/api.js` or `/recaptcha/enterprise.js` or `class="g-recaptcha"` -> `ReCaptcha`. Keep the existing `recaptcha_script` test passing (adjust its fixture only if it used a bare link, and say so in the commit).
-- [ ] **Step 4:** `cargo test` — all pass.
-- [ ] **Step 5:** Commit `fix: match reCAPTCHA scripts, not links`.
+- [x] **Step 1: Failing tests:** `recaptcha_about_link_is_not_challenge` (`<a href="https://www.google.com/recaptcha/about/">` -> `None`); `recaptcha_net_script` (`<script src="https://www.recaptcha.net/recaptcha/api.js"></script>` -> `Some(ReCaptcha)`); `recaptcha_enterprise_script` (`<script src="https://www.google.com/recaptcha/enterprise.js"></script>` -> `Some(ReCaptcha)`).
+- [x] **Step 2:** `cargo test --lib -- challenge::` — `recaptcha_about_link_is_not_challenge` fails (returns `ReCaptcha`) and `recaptcha_net_script` fails (returns `None`); `recaptcha_enterprise_script` already passes and guards the new rule.
+- [x] **Step 3:** Rule 4 becomes: html contains `/recaptcha/api.js` or `/recaptcha/enterprise.js` or `class="g-recaptcha"` -> `ReCaptcha`. Keep the existing `recaptcha_script` test passing (adjust its fixture only if it used a bare link, and say so in the commit).
+- [x] **Step 4:** `cargo test` — all pass.
+- [x] **Step 5:** Commit `fix: match reCAPTCHA scripts, not links`.
 
 ### Task 6: Ledger (SQLite)
 

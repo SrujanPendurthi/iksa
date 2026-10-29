@@ -93,14 +93,14 @@ From Claude's caveman and ponytail reviews of `5f45616`. Two `iksa` processes on
 - `transition`: single conditional statement `UPDATE tasks SET state=?2, finished_ms=CASE WHEN ?3 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) END WHERE id=?1 AND state=?4` (`?3` = `to` is `Committed`/`Failed`, `?4` = JSON of the `from` just read). 0 rows changed -> re-read and return `Illegal { from: <current>, to }`. No `SystemTime` code.
 - `approve`: same pattern — `UPDATE … SET state=?2, approved_step=cursor, finished_ms=NULL WHERE id=?1 AND state=?3` with `?3` = JSON of `AwaitingHandoff(Approval)`; 0 rows -> `NotFound` if the id is gone, else `Illegal`.
 
-- [ ] **Step 1: Failing tests (`src/ledger.rs`):**
+- [x] **Step 1: Failing tests (`src/ledger.rs`):**
   - `concurrent_writer_waits`: open two `Ledger`s on the same file; on the first, `conn.execute_batch("BEGIN IMMEDIATE")`, spawn a thread that sleeps 200 ms then `COMMIT`s; meanwhile the second calls `add("x", &[])` — must return `Ok` (without `busy_timeout` it fails with `database is locked`).
   - `stale_handle_transition_rejected`: two `Ledger`s on one file; handle A moves task Queued -> Executing; handle B then tries Queued -> Executing -> `Illegal { from: Executing, .. }`; state stays `Executing`.
   - `finished_ms_is_epoch_ms`: after `Committed`, `finished_ms` is within 5,000 ms of `SystemTime::now()` in ms (guards the `unixepoch` SQL).
-- [ ] **Step 2:** `cargo test --lib -- ledger::` — `concurrent_writer_waits` fails; the other two may already pass (they guard the rewrite).
-- [ ] **Step 3:** Implement the Interfaces.
-- [ ] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass. `grep -c 'try_from\|SystemTime' src/ledger.rs` outside `#[cfg(test)]` = 0.
-- [ ] **Step 5:** Commit `fix: ledger busy timeout, conditional transitions, native int conversions`.
+- [x] **Step 2:** `cargo test --lib -- ledger::` — all 9 tests actually passed before production changes: rusqlite 0.41.1 already installs a 5,000 ms busy timeout (`src/inner_connection.rs:90`). The planned failure assumption was false; no timeout was disabled to force a failure.
+- [x] **Step 3:** Implement the Interfaces.
+- [x] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass. `grep -c 'try_from\|SystemTime' src/ledger.rs` outside `#[cfg(test)]` = 0.
+- [x] **Step 5:** Commit `fix: ledger busy timeout, conditional transitions, native int conversions`.
 
 ### Task 7: Audit records, report, retention GC
 

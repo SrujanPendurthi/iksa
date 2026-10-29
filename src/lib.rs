@@ -11,3 +11,5 @@ pub mod audit;
 pub mod engine;
 #[cfg(test)]
 pub(crate) mod testutil;
+
+pub mod setup;

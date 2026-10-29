@@ -29,22 +29,48 @@ impl PillarBrowser {
             .unwrap()
             .clone()
     }
+    /// Converge on exactly one stable about:blank page: Chromium may still
+    /// be opening its startup tab (or reopen one after the last closes).
     async fn normalize(&self) {
-        let ts = self.targets().await;
-        for t in ts.iter().filter(|t| t["type"] == "page") {
-            self.b()
-                .call(
-                    "Target.closeTarget",
-                    json!({"targetId":t["targetId"]}),
-                    None,
-                )
+        let mut stable = 0;
+        for _ in 0..100 {
+            let pages: Vec<Value> = self
+                .targets()
                 .await
-                .unwrap();
+                .into_iter()
+                .filter(|t| t["type"] == "page")
+                .collect();
+            if pages.len() == 1 && pages[0]["url"] == "about:blank" {
+                stable += 1;
+                if stable >= 5 {
+                    return;
+                }
+            } else {
+                stable = 0;
+                let keep = pages.iter().position(|t| t["url"] == "about:blank");
+                for (i, t) in pages.iter().enumerate() {
+                    if Some(i) == keep {
+                        continue;
+                    }
+                    let _ = self
+                        .b()
+                        .call(
+                            "Target.closeTarget",
+                            json!({"targetId":t["targetId"]}),
+                            None,
+                        )
+                        .await;
+                }
+                if keep.is_none() {
+                    let _ = self
+                        .b()
+                        .call("Target.createTarget", json!({"url":"about:blank"}), None)
+                        .await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        self.b()
-            .call("Target.createTarget", json!({"url":"about:blank"}), None)
-            .await
-            .unwrap();
+        panic!("normalize: never reached one stable about:blank page");
     }
     async fn target(&self, hidden: bool) -> String {
         let mut params = json!({"url":"about:blank"});

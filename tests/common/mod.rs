@@ -225,3 +225,41 @@ fn netlog_parser_covers_all_events_and_network_forms() {
         vec!["0.0.0.0", "2001:db8::1", "example.com", "remote.test"]
     );
 }
+
+/// A fresh browser whose process exits before its profile is removed.
+pub struct Chrome {
+    pub b: Option<iksa::cdp::Browser>,
+    pub profile: PathBuf,
+}
+impl Chrome {
+    pub fn new(extra_args: &[String]) -> Self {
+        let profile = temp_profile();
+        let mut args = iksa::engine::launch_args(&profile, true);
+        args.extend_from_slice(extra_args);
+        let b = iksa::cdp::launch(&chromium(), &args).unwrap();
+        Self {
+            b: Some(b),
+            profile,
+        }
+    }
+    pub fn b(&self) -> &iksa::cdp::Browser {
+        self.b.as_ref().unwrap()
+    }
+}
+impl Drop for Chrome {
+    fn drop(&mut self) {
+        drop(self.b.take());
+        let _ = std::fs::remove_dir_all(&self.profile);
+    }
+}
+pub struct TempDir(pub PathBuf);
+impl TempDir {
+    pub fn new() -> Self {
+        Self(temp_profile())
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}

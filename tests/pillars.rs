@@ -1,33 +1,24 @@
 mod common;
-use iksa::{cdp, engine};
+use iksa::cdp;
 use serde_json::{Value, json};
 use std::{path::PathBuf, time::Duration};
-struct F {
-    b: Option<cdp::Browser>,
-    p: PathBuf,
+struct PillarBrowser {
+    chrome: common::Chrome,
 }
-impl F {
+impl PillarBrowser {
     async fn new(netlog: Option<&std::path::Path>) -> Self {
-        let p = common::temp_profile();
-        let mut args = engine::launch_args(&p, true);
-        assert!(
-            args.iter().any(|a| a.starts_with("--user-data-dir=")),
-            "TODO launch args: isolated profile required"
-        );
-        assert!(
-            args.iter().any(|a| a == "--use-mock-keychain"),
-            "TODO mock keychain required"
-        );
-        if let Some(n) = netlog {
-            args.push(format!("--log-net-log={}", n.display()));
-        }
-        let b = cdp::launch(&common::chromium(), &args).unwrap();
-        let f = Self { b: Some(b), p };
+        let args: Vec<String> = netlog
+            .into_iter()
+            .map(|n| format!("--log-net-log={}", n.display()))
+            .collect();
+        let f = Self {
+            chrome: common::Chrome::new(&args),
+        };
         f.normalize().await;
         f
     }
     fn b(&self) -> &cdp::Browser {
-        self.b.as_ref().unwrap()
+        self.chrome.b()
     }
     async fn targets(&self) -> Vec<Value> {
         self.b()
@@ -151,66 +142,36 @@ impl F {
         text.into()
     }
     fn close(mut self) {
-        drop(self.b.take());
+        drop(self.chrome.b.take());
     }
 }
-impl Drop for F {
-    fn drop(&mut self) {
-        drop(self.b.take());
-        let _ = std::fs::remove_dir_all(&self.p);
-    }
+fn artifact(dir: &common::TempDir, name: &str) -> PathBuf {
+    dir.0.join(format!("{name}.json"))
 }
-fn artifact(name: &str) -> PathBuf {
-    let p = std::env::current_dir().unwrap().join("target/codex");
-    std::fs::create_dir_all(&p).unwrap();
-    p.join(format!("{name}-{}.json", std::process::id()))
-}
-#[tokio::test]
-#[ignore]
-async fn netlog_sees_real_navigation() {
-    let _ = std::fs::remove_file("target/codex/v2-task8-positive-control");
-    let path = artifact("positive-netlog");
-    let f = F::new(Some(&path)).await;
+async fn positive_control(dir: &common::TempDir) {
+    let path = artifact(dir, "positive-netlog");
+    let f = PillarBrowser::new(Some(&path)).await;
     let s = f.target(true).await;
     let text = f.navigate(&s, "https://example.com").await;
     assert!(text.contains("Example Domain"));
     f.close();
     let hosts = common::netlog_hosts(&path);
-    println!("C11 hosts {hosts:?}; raw {}", path.display());
+    println!("C11 hosts {hosts:?}");
     assert!(hosts.contains(&"example.com".into()));
-    std::fs::write(
-        "target/codex/v2-task8-positive-control",
-        path.display().to_string(),
-    )
-    .unwrap();
+}
+#[tokio::test]
+#[ignore]
+async fn netlog_sees_real_navigation() {
+    let dir = common::TempDir::new();
+    positive_control(&dir).await;
 }
 #[tokio::test]
 #[ignore]
 async fn idle_egress_is_loopback_only() {
-    assert!(
-        std::path::Path::new("target/codex/v2-task8-positive-control").exists(),
-        "BLOCKED C11 positive control must pass first"
-    );
-    let marker = std::fs::read_to_string("target/codex/v2-task8-positive-control").unwrap();
-    let metadata = std::fs::metadata(&marker).unwrap();
-    assert!(
-        metadata.modified().unwrap()
-            >= std::fs::metadata(std::env::current_exe().unwrap())
-                .unwrap()
-                .modified()
-                .unwrap(),
-        "BLOCKED stale positive control from older test build"
-    );
-    assert!(
-        metadata.modified().unwrap().elapsed().unwrap() < Duration::from_secs(3600),
-        "BLOCKED stale positive control"
-    );
-    assert!(
-        common::netlog_hosts(std::path::Path::new(&marker)).contains(&"example.com".to_owned()),
-        "BLOCKED positive raw netlog lacks example.com"
-    );
-    let path = artifact("idle-netlog");
-    let f = F::new(Some(&path)).await;
+    let dir = common::TempDir::new();
+    positive_control(&dir).await;
+    let path = artifact(&dir, "idle-netlog");
+    let f = PillarBrowser::new(Some(&path)).await;
     let ts = f.targets().await;
     assert_eq!(ts.iter().filter(|t| t["type"] == "page").count(), 1);
     tokio::time::sleep(Duration::from_secs(60)).await;
@@ -222,15 +183,16 @@ async fn idle_egress_is_loopback_only() {
 #[tokio::test]
 #[ignore]
 async fn idle_footprint_under_300mb() {
+    let dir = common::TempDir::new();
     let mut samples = vec![];
     for i in 0..3 {
-        let f = F::new(None).await;
+        let f = PillarBrowser::new(None).await;
         tokio::time::sleep(Duration::from_secs(10)).await;
         let ts = f.targets().await;
         assert_eq!(ts.iter().filter(|t| t["type"] == "page").count(), 1);
         println!("idle sample {i} target inventory {ts:?}");
         std::fs::write(
-            artifact(&format!("idle-targets-{i}")),
+            artifact(&dir, &format!("idle-targets-{i}")),
             serde_json::to_vec_pretty(&ts).unwrap(),
         )
         .unwrap();
@@ -244,7 +206,8 @@ async fn idle_footprint_under_300mb() {
 #[tokio::test]
 #[ignore]
 async fn five_tabs_three_agents_under_1200mb() {
-    let f = F::new(None).await;
+    let dir = common::TempDir::new();
+    let f = PillarBrowser::new(None).await;
     let initial = f
         .targets()
         .await
@@ -295,7 +258,7 @@ async fn five_tabs_three_agents_under_1200mb() {
     let ts = f.targets().await;
     println!("loaded target inventory {ts:?}");
     std::fs::write(
-        artifact("loaded-targets"),
+        artifact(&dir, "loaded-targets"),
         serde_json::to_vec_pretty(&ts).unwrap(),
     )
     .unwrap();

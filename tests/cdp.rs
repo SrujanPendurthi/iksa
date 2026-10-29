@@ -2,33 +2,6 @@ use iksa::cdp;
 mod common;
 use serde_json::json;
 use std::time::Duration;
-struct Fixture {
-    browser: Option<cdp::Browser>,
-    profile: std::path::PathBuf,
-}
-impl Fixture {
-    fn new() -> Self {
-        let profile = common::temp_profile();
-        let browser = cdp::launch(
-            &common::chromium(),
-            &iksa::engine::launch_args(&profile, true),
-        )
-        .unwrap();
-        Self {
-            browser: Some(browser),
-            profile,
-        }
-    }
-    fn b(&self) -> &cdp::Browser {
-        self.browser.as_ref().unwrap()
-    }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        drop(self.browser.take());
-        let _ = std::fs::remove_dir_all(&self.profile);
-    }
-}
 async fn session(b: &cdp::Browser) -> String {
     let c = b
         .call("Target.createBrowserContext", json!({}), None)
@@ -66,7 +39,7 @@ async fn session(b: &cdp::Browser) -> String {
 #[tokio::test]
 #[ignore]
 async fn version_over_pipe() {
-    let f = Fixture::new();
+    let f = common::Chrome::new(&[]);
     assert!(
         f.b()
             .call("Browser.getVersion", json!({}), None)
@@ -80,7 +53,7 @@ async fn version_over_pipe() {
 #[tokio::test]
 #[ignore]
 async fn no_tcp_listener() {
-    let f = Fixture::new();
+    let f = common::Chrome::new(&[]);
     f.b()
         .call("Browser.getVersion", json!({}), None)
         .await
@@ -103,7 +76,7 @@ async fn no_tcp_listener() {
 #[tokio::test]
 #[ignore]
 async fn hidden_target_navigate_eval_type() {
-    let f = Fixture::new();
+    let f = common::Chrome::new(&[]);
     let b = f.b();
     let s = session(b).await;
     b.call("Page.enable", json!({}), Some(&s)).await.unwrap();
@@ -143,7 +116,7 @@ async fn hidden_target_navigate_eval_type() {
 #[tokio::test]
 #[ignore]
 async fn large_eval_roundtrip() {
-    let f = Fixture::new();
+    let f = common::Chrome::new(&[]);
     let s = session(f.b()).await;
     let v = f
         .b()
@@ -159,7 +132,7 @@ async fn large_eval_roundtrip() {
 #[tokio::test]
 #[ignore]
 async fn cdp_error_is_err() {
-    let f = Fixture::new();
+    let f = common::Chrome::new(&[]);
     let e = f
         .b()
         .call("Nope.nope", json!({}), None)
@@ -172,7 +145,7 @@ async fn cdp_error_is_err() {
 #[tokio::test]
 #[ignore]
 async fn browser_exit_fails_pending() {
-    let f = Fixture::new();
+    let f = common::Chrome::new(&[]);
     let b = f.b();
     let s = session(b).await;
     let pending = b.call(
@@ -201,13 +174,13 @@ async fn browser_exit_fails_pending() {
 #[tokio::test]
 #[ignore]
 async fn drop_kills_browser() {
-    let mut f = Fixture::new();
+    let mut f = common::Chrome::new(&[]);
     f.b()
         .call("Browser.getVersion", json!({}), None)
         .await
         .unwrap();
     let pid = f.b().pid();
-    drop(f.browser.take());
+    drop(f.b.take());
     tokio::time::timeout(Duration::from_secs(2), async {
         while unsafe { libc::kill(pid as i32, 0) } == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -220,9 +193,9 @@ async fn drop_kills_browser() {
 #[tokio::test]
 #[ignore]
 async fn drop_closes_gracefully() {
-    let mut f = Fixture::new();
+    let mut f = common::Chrome::new(&[]);
     let _ = session(f.b()).await;
-    drop(f.browser.take());
+    drop(f.b.take());
     let prefs = std::fs::read(f.profile.join("Default/Preferences")).unwrap();
     let prefs: serde_json::Value = serde_json::from_slice(&prefs).unwrap();
     assert_eq!(prefs["profile"]["exit_type"], "Normal");
@@ -231,11 +204,11 @@ async fn drop_closes_gracefully() {
 #[tokio::test]
 #[ignore]
 async fn drop_leaves_no_helpers() {
-    let mut f = Fixture::new();
+    let mut f = common::Chrome::new(&[]);
     let _ = session(f.b()).await;
     let helpers = common::descendants(f.b().pid());
     assert!(!helpers.is_empty(), "browser must have helpers before drop");
-    drop(f.browser.take());
+    drop(f.b.take());
     tokio::time::timeout(Duration::from_secs(5), async {
         while helpers
             .iter()

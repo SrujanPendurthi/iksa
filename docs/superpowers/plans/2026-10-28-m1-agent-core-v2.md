@@ -102,11 +102,11 @@ From Claude's caveman and ponytail reviews of `96f1e8b`. Task 9 adds `tests/cli.
   - `navigate`: for URLs whose scheme isn't `http`/`https`, wait only for `Page.loadEventFired` and return `(None, vec![])`.
 - Rule for all tests from now on: never write under `target/codex`; Codex scratch stays out of the test code.
 
-- [ ] **Step 1: Failing test** `tests/engine.rs::about_blank_navigation_commits` (`#[ignore]`): Navigate `/form`, Navigate `about:blank`, Navigate `data:text/html,<h1>d</h1>`, Extract `h1` == `"d"` → `Committed` within 10 s (today it hangs until the 30 s step timeout).
-- [ ] **Step 2:** ignored `--test engine -- about_blank_navigation_commits` — FAIL (timeout).
-- [ ] **Step 3:** Implement the Interfaces; `rmdir .spike-home/Library 2>/dev/null` (empty, untracked).
-- [ ] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass (engine now 16).
-- [ ] **Step 5:** Commit `refactor: shared Chrome test fixture, non-HTTP navigation, engine trims`.
+- [x] **Step 1: Failing test** `tests/engine.rs::about_blank_navigation_commits` (`#[ignore]`): Navigate `/form`, Navigate `about:blank`, Navigate `data:text/html,<h1>d</h1>`, Extract `h1` == `"d"` → `Committed` within 10 s (today it hangs until the 30 s step timeout).
+- [x] **Step 2:** ignored `--test engine -- about_blank_navigation_commits` — FAIL (timeout).
+- [x] **Step 3:** Implement the Interfaces; `rmdir .spike-home/Library 2>/dev/null` (empty, untracked).
+- [x] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass (engine now 16).
+- [x] **Step 5:** Commit `refactor: shared Chrome test fixture, non-HTTP navigation, engine trims`.
 
 ### Task 9: CLI, setup, end to end
 
@@ -164,8 +164,8 @@ Results go in `docs/perf.md` under `## Manual`.
 | C14b | 8b | ignored `--test engine` | 15/15 pass (11 − old overhead + 5 new); all 5 new tests first failed; full release ignored 30/30 pass — **done** |
 | C14c | 8b | release ignored `audit::tests::step_bookkeeping_under_25ms` | 20 distinct 82,526-byte pages; median 6.336604 ms < 25 ms — **done** |
 | C14d | 8b | `grep -c 'call_time\|step_overheads\|fn test_args\|target/codex' src/engine.rs tests/common/mod.rs` | 0 and 0 — **done** |
-| C14e | 9a | ignored `--test engine` | 16 pass incl. `about_blank_navigation_commits` |
-| C14f | 9a | `grep -rn 'struct F \|struct Fixture\|target/codex\|TODO launch' tests/` | no matches |
+| C14e | 9a | ignored `--test engine` | **done** — 16/16 incl. `about_blank_navigation_commits`; final full release ignored 31/31 pass |
+| C14f | 9a | `grep -rn 'struct F \|struct Fixture\|target/codex\|TODO launch' tests/` | **done** — no matches |
 | C15 | 9 | `cargo test --test cli` + `e2e_report` | 12 pass |
 | C16 | 9 | binary size / CAS size | < 60 MB / < 500 KB |
 | C17 | 10 | H1 keychain | ≤ 1 prompt, none after Always Allow |

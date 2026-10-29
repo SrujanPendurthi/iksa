@@ -12,6 +12,7 @@ use crate::{
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
+    collections::HashMap,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::Path,
     time::{Duration, Instant},
@@ -60,18 +61,21 @@ pub struct Engine {
     browser: RefCell<Option<Browser>>,
 }
 impl Engine {
+    pub fn new(browser: Browser) -> Self {
+        Self {
+            browser: RefCell::new(Some(browser)),
+        }
+    }
     pub fn launch(chromium: &Path, profile: &Path, mock_keychain: bool) -> anyhow::Result<Self> {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(profile)?;
         std::fs::set_permissions(profile, std::fs::Permissions::from_mode(0o700))?;
-        Ok(Self {
-            browser: RefCell::new(Some(cdp::launch(
-                chromium,
-                &launch_args(profile, mock_keychain),
-            )?)),
-        })
+        Ok(Self::new(cdp::launch(
+            chromium,
+            &launch_args(profile, mock_keychain),
+        )?))
     }
     async fn eval(&self, b: &Browser, s: &str, expr: String) -> anyhow::Result<Value> {
         let r = b
@@ -106,9 +110,12 @@ impl Engine {
         let Some(loader) = nav["loaderId"].as_str() else {
             return Ok((None, vec![]));
         };
+        let http = url.split_once(':').is_some_and(|(scheme, _)| {
+            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+        });
         let mut response = None;
         let mut loaded = false;
-        while response.is_none() || !loaded {
+        while (http && response.is_none()) || !loaded {
             let e = match events.recv().await {
                 Ok(e) => e,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -127,19 +134,22 @@ impl Engine {
                 && e.params["loaderId"] == loader
             {
                 let r = &e.params["response"];
-                let headers = serde_json::from_value::<std::collections::HashMap<String, String>>(
-                    r["headers"].clone(),
-                )
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
+                let headers =
+                    serde_json::from_value::<HashMap<String, String>>(r["headers"].clone())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
                 response = Some((r["status"].as_f64().map(|n| n as u16), headers));
             }
             if e.method == "Page.loadEventFired" {
                 loaded = true;
             }
         }
-        Ok(response.unwrap())
+        Ok(if http {
+            response.unwrap()
+        } else {
+            (None, vec![])
+        })
     }
     async fn locate(&self, b: &Browser, s: &str, selector: &str) -> anyhow::Result<Value> {
         let selector = serde_json::to_string(selector)?;
@@ -158,19 +168,10 @@ impl Engine {
         a: &Action,
         cfg: &Config,
     ) -> anyhow::Result<(String, Option<u16>, Vec<(String, String)>)> {
-        match a {
+        let (status, headers) = match a {
             Action::Navigate { .. } | Action::Search { .. } => {
                 let (st, h) = self.navigate(b, s, &url_of(a, cfg).unwrap()).await?;
-                Ok((
-                    if matches!(a, Action::Search { .. }) {
-                        "searched"
-                    } else {
-                        "navigated"
-                    }
-                    .into(),
-                    st,
-                    h,
-                ))
+                (st, h)
             }
             Action::Click { selector, .. } | Action::Type { selector, .. } => {
                 let xy = self.locate(b, s, selector).await?;
@@ -194,30 +195,30 @@ impl Engine {
                     b.call("Input.insertText", json!({"text":text}), Some(s))
                         .await?;
                 }
-                Ok((
-                    if matches!(a, Action::Type { .. }) {
-                        "typed"
-                    } else {
-                        "clicked"
-                    }
-                    .into(),
-                    None,
-                    vec![],
-                ))
+                (None, vec![])
             }
+            Action::Extract { .. } => (None, vec![]),
+        };
+        let outcome = match a {
+            Action::Navigate { .. } => "navigated".into(),
+            Action::Search { .. } => "searched".into(),
+            Action::Click { .. } => "clicked".into(),
+            Action::Type { .. } => "typed".into(),
             Action::Extract { selector } => {
                 self.locate(b, s, selector).await?;
                 let selector = serde_json::to_string(selector)?;
-                let text = self
-                    .eval(
-                        b,
-                        s,
-                        format!("document.querySelector({selector}).innerText"),
-                    )
-                    .await?;
-                Ok((text.as_str().unwrap_or("").into(), None, vec![]))
+                self.eval(
+                    b,
+                    s,
+                    format!("document.querySelector({selector}).innerText"),
+                )
+                .await?
+                .as_str()
+                .unwrap_or("")
+                .into()
             }
-        }
+        };
+        Ok((outcome, status, headers))
     }
     async fn remaining_challenge(
         &self,
@@ -361,11 +362,21 @@ impl Engine {
                     "auto"
                 };
                 let execution = tokio::time::timeout(timeout, async {
+                    let before_document = if secret_on_page && url_of(a, cfg).is_some() {
+                        Some(b.call("Page.getFrameTree", json!({}), Some(&s)).await?["frameTree"]["frame"]["loaderId"].clone())
+                    } else {
+                        None
+                    };
                     let (outcome, status, headers) = self.action(b, &s, a, cfg).await?;
+                    let new_document = if let Some(before) = before_document {
+                        before != b.call("Page.getFrameTree", json!({}), Some(&s)).await?["frameTree"]["frame"]["loaderId"]
+                    } else {
+                        false
+                    };
                     match a {
                         Action::Type { secret: true, .. } => secret_on_page = true,
                         // Fragment navigation leaves the secret-bearing Document intact.
-                        Action::Navigate { .. } | Action::Search { .. } if status.is_some() => {
+                        Action::Navigate { .. } | Action::Search { .. } if new_document => {
                             secret_on_page = false
                         }
                         _ => {}
@@ -392,18 +403,12 @@ impl Engine {
                     })
                 })
                 .await;
-                match execution {
-                    Ok(Ok(Some(k))) => {
-                        let state = State::AwaitingHandoff(Handoff::Challenge(k));
-                        l.transition(id, state.clone())?;
-                        return Ok(state);
-                    }
-                    Ok(Ok(None)) => {
-                        l.set_cursor(id, n + 1)?;
-                    }
-                    Err(e) => return Err(e.into()),
-                    Ok(Err(e)) => return Err(e),
+                if let Some(k) = execution?? {
+                    let state = State::AwaitingHandoff(Handoff::Challenge(k));
+                    l.transition(id, state.clone())?;
+                    return Ok(state);
                 }
+                l.set_cursor(id, n + 1)?;
             }
             l.transition(id, State::Committed)?;
             Ok(State::Committed)

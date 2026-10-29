@@ -10,16 +10,17 @@ use iksa::{
     ledger::{Handoff, Ledger, State},
 };
 use std::time::Duration;
-struct F {
+struct EngineFixture {
     e: Engine,
     l: Ledger,
     c: Cas,
-    p: std::path::PathBuf,
+    _chrome: common::Chrome,
     port: u16,
 }
-impl F {
+impl EngineFixture {
     fn new() -> Self {
-        let p = common::temp_profile();
+        let mut chrome = common::Chrome::new(&[]);
+        let p = &chrome.profile;
         let r = |body: &str| common::Response {
             status: 200,
             headers: vec![],
@@ -77,10 +78,16 @@ impl F {
                 ),
             ),
         ]);
-        let e = Engine::launch(&common::chromium(), &p.join("profile"), true).unwrap();
+        let e = Engine::new(chrome.b.take().unwrap());
         let l = Ledger::open(p.join("ledger.db")).unwrap();
         let c = Cas::open(p.join("cas")).unwrap();
-        Self { e, l, c, p, port }
+        Self {
+            e,
+            l,
+            c,
+            _chrome: chrome,
+            port,
+        }
     }
     fn nav(&self, path: &str) -> Action {
         Action::Navigate {
@@ -93,11 +100,6 @@ impl F {
     }
     fn outcome(&self, id: i64) -> String {
         self.l.records(id).unwrap().last().unwrap().outcome.clone()
-    }
-}
-impl Drop for F {
-    fn drop(&mut self) {
-        let _ = &self.p;
     }
 }
 fn extract(s: &str) -> Action {
@@ -114,7 +116,7 @@ fn typed() -> Action {
 #[tokio::test]
 #[ignore]
 async fn runs_read_task_to_committed() {
-    let f = F::new();
+    let f = EngineFixture::new();
     let (id, s) = f
         .run(&[f.nav("/form"), extract("h1")], &Config::default())
         .await;
@@ -125,7 +127,7 @@ async fn runs_read_task_to_committed() {
 #[tokio::test]
 #[ignore]
 async fn search_uses_configured_provider() {
-    let f = F::new();
+    let f = EngineFixture::new();
     let cfg = Config {
         search: "Local".into(),
         providers: vec![SearchProvider {
@@ -151,7 +153,7 @@ async fn search_uses_configured_provider() {
 #[tokio::test]
 #[ignore]
 async fn write_step_waits_for_approval() {
-    let f = F::new();
+    let f = EngineFixture::new();
     let cfg = Config::default();
     let (id, s) = f
         .run(&[f.nav("/form"), typed(), extract("#live")], &cfg)
@@ -170,7 +172,7 @@ async fn write_step_waits_for_approval() {
 #[tokio::test]
 #[ignore]
 async fn click_uses_real_input() {
-    let f = F::new();
+    let f = EngineFixture::new();
     let (id, s) = f
         .run(
             &[
@@ -192,7 +194,7 @@ async fn click_uses_real_input() {
     assert_eq!(f.outcome(id), "hi");
 }
 async fn challenge(path: &str, k: ChallengeKind) {
-    let f = F::new();
+    let f = EngineFixture::new();
     let (id, s) = f.run(&[f.nav(path)], &Config::default()).await;
     assert_eq!(s, State::AwaitingHandoff(Handoff::Challenge(k)));
     assert_eq!(f.l.get(id).unwrap().cursor, 0);
@@ -209,7 +211,7 @@ async fn turnstile_blocks_without_token() {
     challenge("/turnstile", ChallengeKind::Turnstile).await;
 }
 async fn auto(path: &str) {
-    let f = F::new();
+    let f = EngineFixture::new();
     let (id, s) = f
         .run(&[f.nav(path), extract("h1")], &Config::default())
         .await;
@@ -229,7 +231,7 @@ async fn recaptcha_v3_auto_pass_continues() {
 #[tokio::test]
 #[ignore]
 async fn hung_page_fails_with_timeout() {
-    let f = F::new();
+    let f = EngineFixture::new();
     for steps in [
         vec![f.nav("/slow")],
         vec![f.nav("/form"), extract("#absent")],
@@ -252,7 +254,7 @@ async fn hung_page_fails_with_timeout() {
 #[tokio::test]
 #[ignore]
 async fn contexts_are_isolated() {
-    let f = F::new();
+    let f = EngineFixture::new();
     let (a, s) = f
         .run(
             &[f.nav("/cookie"), f.nav("/cookies"), extract("h1")],
@@ -270,7 +272,7 @@ async fn contexts_are_isolated() {
 #[tokio::test]
 #[ignore]
 async fn approval_resume_replays_typed_fields() {
-    let f = F::new();
+    let f = EngineFixture::new();
     let cfg = Config {
         auto_max: Risk::Write,
         ..Config::default()
@@ -301,7 +303,7 @@ async fn approval_resume_replays_typed_fields() {
 #[tokio::test]
 #[ignore]
 async fn resume_with_click_before_cursor_fails_safely() {
-    let f = F::new();
+    let f = EngineFixture::new();
     let cfg = Config {
         auto_max: Risk::Write,
         ..Config::default()
@@ -335,7 +337,7 @@ async fn resume_with_click_before_cursor_fails_safely() {
 #[tokio::test]
 #[ignore]
 async fn secret_never_in_snapshots_or_outcomes() {
-    let f = F::new();
+    let f = EngineFixture::new();
     let cfg = Config {
         auto_max: Risk::Write,
         ..Config::default()
@@ -400,6 +402,26 @@ async fn secret_never_in_snapshots_or_outcomes() {
     );
     assert!(records[4..6].iter().all(|r| r.after.is_some()));
 
+    // A fresh non-HTTP document clears suppression despite having no HTTP status.
+    let (data_id, state) = f
+        .run(
+            &[
+                f.nav("/form"),
+                secret.clone(),
+                Action::Navigate {
+                    url: "data:text/html,<h1>d</h1>".into(),
+                },
+                extract("h1"),
+            ],
+            &cfg,
+        )
+        .await;
+    assert_eq!(state, State::Committed);
+    let records = f.l.records(data_id).unwrap();
+    assert!(records[1].after.is_none());
+    assert!(records[2..].iter().all(|r| r.after.is_some()));
+    assert_eq!(records[3].outcome, "d");
+
     // A resumed secret Type restores the page flag before the approved click.
     let (resume_id, state) = f
         .run(
@@ -438,7 +460,7 @@ async fn secret_never_in_snapshots_or_outcomes() {
 #[tokio::test]
 #[ignore]
 async fn same_document_navigation_commits() {
-    let f = F::new();
+    let f = EngineFixture::new();
     let (_, s) = f
         .run(
             &[f.nav("/form"), f.nav("/form#x"), extract("h1")],
@@ -450,9 +472,35 @@ async fn same_document_navigation_commits() {
 #[tokio::test]
 #[ignore]
 async fn bad_selector_error_is_explained() {
-    let f = F::new();
+    let f = EngineFixture::new();
     let (_, s) = f.run(&[extract("##bad")], &Config::default()).await;
     assert!(
         matches!(s,State::Failed(ref m) if m.contains("SyntaxError")||m.contains("not a valid selector"))
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn about_blank_navigation_commits() {
+    let f = EngineFixture::new();
+    let (id, state) = tokio::time::timeout(
+        Duration::from_secs(10),
+        f.run(
+            &[
+                f.nav("/form"),
+                Action::Navigate {
+                    url: "about:blank".into(),
+                },
+                Action::Navigate {
+                    url: "data:text/html,<h1>d</h1>".into(),
+                },
+                extract("h1"),
+            ],
+            &Config::default(),
+        ),
+    )
+    .await
+    .expect("non-HTTP navigation must commit within 10 seconds");
+    assert_eq!(state, State::Committed);
+    assert_eq!(f.outcome(id), "d");
 }

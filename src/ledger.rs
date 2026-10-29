@@ -54,6 +54,7 @@ impl Ledger {
             );
             CREATE TABLE IF NOT EXISTS steps (seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, step INTEGER NOT NULL, json TEXT NOT NULL);",
         )?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         Ok(Self { conn })
     }
     pub fn record_step(
@@ -135,7 +136,8 @@ impl Ledger {
         rows.next()?.map(Self::task).transpose()
     }
     pub fn transition(&self, id: i64, to: State) -> Result<(), LedgerError> {
-        let from = self.get(id)?.state;
+        let task = self.get(id)?;
+        let from = task.state;
         if !matches!(
             (&from, &to),
             (State::Queued, State::Executing)
@@ -147,22 +149,22 @@ impl Ledger {
         ) {
             return Err(LedgerError::Illegal { from, to });
         }
-        self.transition_from(id, from, to)
+        let steps = matches!(to, State::Committed | State::Failed(_)).then_some(task.steps);
+        self.transition_from(id, from, to, steps)
     }
-    fn transition_from(&self, id: i64, from: State, to: State) -> Result<(), LedgerError> {
+    fn transition_from(
+        &self,
+        id: i64,
+        from: State,
+        to: State,
+        steps: Option<Vec<Action>>,
+    ) -> Result<(), LedgerError> {
         let terminal = matches!(to, State::Committed | State::Failed(_));
-        let redacted = if terminal {
-            Some(serde_json::to_string(
-                &self
-                    .get(id)?
-                    .steps
-                    .iter()
-                    .map(Action::redacted)
-                    .collect::<Vec<_>>(),
-            )?)
-        } else {
-            None
-        };
+        let redacted = steps
+            .map(|steps| {
+                serde_json::to_string(&steps.iter().map(Action::redacted).collect::<Vec<_>>())
+            })
+            .transpose()?;
         if self.conn.execute(
             "UPDATE tasks SET state=?2, finished_ms=CASE WHEN ?3 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) END, steps=COALESCE(?5, steps) WHERE id=?1 AND state=?4",
             rusqlite::params![id, serde_json::to_string(&to)?, terminal, serde_json::to_string(&from)?, redacted],
@@ -170,16 +172,12 @@ impl Ledger {
             return Err(LedgerError::Illegal { from: self.get(id)?.state, to });
         }
         if terminal {
-            let busy: i64 = self
-                .conn
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
-            if busy != 0 {
-                return Err(rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                    Some("terminal secret erasure WAL checkpoint busy".into()),
-                )
-                .into());
-            }
+            // The state update has committed. A busy reader may defer secret erasure
+            // in the WAL until the next checkpoint; it must not fail the transition.
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
         }
         Ok(())
     }
@@ -207,7 +205,7 @@ impl Ledger {
                 to: State::Queued,
             });
         }
-        self.transition_from(id, task.state, State::Queued)
+        self.transition_from(id, task.state, State::Queued, None)
     }
     pub fn recover(&self) -> Result<usize, LedgerError> {
         Ok(self.conn.execute(
@@ -220,10 +218,77 @@ impl Ledger {
     }
 }
 
+impl Drop for Ledger {
+    fn drop(&mut self) {
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::temp_dir;
+    #[test]
+    fn terminal_transition_ok_while_reader_open() {
+        let dir = temp_dir("ledger-reader");
+        let path = dir.0.join("ledger.db");
+        let ledger = Ledger::open(&path).unwrap();
+        let id = ledger
+            .add(
+                "secret",
+                &[Action::Type {
+                    selector: "#password".into(),
+                    text: "hunter2".into(),
+                    secret: true,
+                    risk: crate::gate::Risk::Write,
+                }],
+            )
+            .unwrap();
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT count(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        ledger.transition(id, State::Executing).unwrap();
+        let started = std::time::Instant::now();
+        let result = ledger.transition(id, State::Committed);
+        println!(
+            "terminal transition while reader held: {:?}; {result:?}",
+            started.elapsed()
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(ledger.get(id).unwrap().state, State::Committed);
+        // A held reader may defer WAL erasure until a clean checkpoint.
+        reader.execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        drop(ledger);
+        drop(Ledger::open(&path).unwrap());
+        for file in [&path, &dir.0.join("ledger.db-wal")] {
+            match std::fs::read(file) {
+                Ok(bytes) => {
+                    assert!(
+                        !bytes
+                            .windows(b"hunter2".len())
+                            .any(|window| window == b"hunter2"),
+                        "secret in {}",
+                        file.display()
+                    );
+                    println!(
+                        "{}: {} bytes, no secret",
+                        file.file_name().unwrap().to_string_lossy(),
+                        bytes.len()
+                    );
+                }
+                Err(error) if file != &path && error.kind() == std::io::ErrorKind::NotFound => {
+                    println!("ledger.db-wal absent")
+                }
+                Err(error) => panic!("{}: {error}", file.display()),
+            }
+        }
+    }
     #[test]
     fn delete_task_cascades() {
         let dir = temp_dir("ledger-cascade");

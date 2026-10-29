@@ -97,11 +97,11 @@ From Claude's caveman and ponytail reviews of `b933cd9`.
 - `Cas::path` becomes `pub(crate)`; tests use it instead of building `root/ab/cdef…` by hand.
 - `audit.rs` tests share `fn setup(label: &str) -> (TempDir, Ledger, Cas)`.
 
-- [ ] **Step 1: Failing test** `ledger::tests::terminal_transition_ok_while_reader_open`: a task with a secret `Type` (`hunter2`); a second `rusqlite::Connection` on the same file runs `BEGIN; SELECT count(*) FROM tasks;` and keeps the transaction open; the first `Ledger` transitions to `Executing` then `Committed` → `Ok` (it may take up to the 5 s busy timeout), and `get(id).state == Committed`. Then roll back and drop the reader, drop the `Ledger`, reopen and drop it once more: neither `ledger.db` nor `ledger.db-wal` (if present) contains `hunter2`.
-- [ ] **Step 2:** `cargo test --lib -- ledger::terminal_transition_ok_while_reader_open` — FAIL (`transition` returns the busy error).
-- [ ] **Step 3:** Implement the Interfaces.
-- [ ] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass.
-- [ ] **Step 5:** Commit `fix: non-fatal WAL checkpoint, checkpoint on open/drop; test trims`.
+- [x] **Step 1: Failing test** `ledger::tests::terminal_transition_ok_while_reader_open`: a task with a secret `Type` (`hunter2`); a second `rusqlite::Connection` on the same file runs `BEGIN; SELECT count(*) FROM tasks;` and keeps the transaction open; the first `Ledger` transitions to `Executing` then `Committed` → `Ok` (it may take up to the 5 s busy timeout), and `get(id).state == Committed`. Then roll back and drop the reader, drop the `Ledger`, reopen and drop it once more: neither `ledger.db` nor `ledger.db-wal` (if present) contains `hunter2`.
+- [x] **Step 2:** `cargo test --lib -- ledger::terminal_transition_ok_while_reader_open` selected 0 tests (filter typo). Effective filter `ledger::tests::terminal_transition_ok_while_reader_open` genuinely failed with the busy error before the fix and passed afterward.
+- [x] **Step 3:** Implement the Interfaces.
+- [x] **Step 4:** `cargo test` + `CHROMIUM=… cargo test --release -- --ignored --test-threads=1` — all pass.
+- [x] **Step 5:** Commit `fix: non-fatal WAL checkpoint, checkpoint on open/drop; test trims`.
 
 ### Task 8: Engine on `cdp::Browser` + pillar tests
 

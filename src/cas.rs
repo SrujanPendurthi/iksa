@@ -43,7 +43,7 @@ impl Cas {
             root: root.as_ref().to_path_buf(),
         })
     }
-    fn path(&self, hash: &blake3::Hash) -> PathBuf {
+    pub(crate) fn path(&self, hash: &blake3::Hash) -> PathBuf {
         let hex = hash.to_hex();
         self.root.join(&hex[..2]).join(&hex[2..])
     }
@@ -120,10 +120,6 @@ mod tests {
     use crate::testutil::temp_dir;
     use std::{fs, os::unix::fs::PermissionsExt};
 
-    fn blob(root: &Path, hash: &blake3::Hash) -> PathBuf {
-        let hex = hash.to_hex();
-        root.join(&hex[..2]).join(&hex[2..])
-    }
     #[test]
     fn put_get_roundtrip() {
         let temp = temp_dir("cas");
@@ -131,7 +127,7 @@ mod tests {
         let hash = cas.put(b"hello").unwrap();
         assert_eq!(hash, blake3::hash(b"hello"));
         assert_eq!(cas.get(&hash).unwrap(), b"hello");
-        let path = blob(&temp.0.join("cas"), &hash);
+        let path = cas.path(&hash);
         assert_eq!(
             zstd::decode_all(fs::File::open(&path).unwrap()).unwrap(),
             b"hello"
@@ -188,7 +184,7 @@ mod tests {
         let temp = temp_dir("cas");
         let cas = Cas::open(temp.0.join("cas")).unwrap();
         let hash = cas.put(b"hello").unwrap();
-        let path = blob(&temp.0.join("cas"), &hash);
+        let path = cas.path(&hash);
         fs::write(&path, b"not zstd").unwrap();
         assert_eq!(
             cas.get(&hash).unwrap_err().kind(),

@@ -152,11 +152,22 @@ pub fn gc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{gate::Risk, ledger::State, snapshot, testutil::temp_dir};
+    use crate::{
+        gate::Risk,
+        ledger::State,
+        snapshot,
+        testutil::{TempDir, temp_dir},
+    };
     use std::{
         fs,
         time::{Duration, UNIX_EPOCH},
     };
+    fn setup(label: &str) -> (TempDir, Ledger, Cas) {
+        let dir = temp_dir(label);
+        let ledger = Ledger::open(dir.0.join("ledger.db")).unwrap();
+        let cas = Cas::open(dir.0.join("cas")).unwrap();
+        (dir, ledger, cas)
+    }
     fn action() -> Action {
         Action::Extract {
             selector: "h1".into(),
@@ -167,9 +178,7 @@ mod tests {
     }
     #[test]
     fn report_lists_every_step() {
-        let dir = temp_dir("audit-report");
-        let cas = Cas::open(dir.0.join("cas")).unwrap();
-        let ledger = Ledger::open(dir.0.join("db")).unwrap();
+        let (_dir, ledger, cas) = setup("audit-report");
         let id = ledger.add("example", &[action(), action()]).unwrap();
         let mut second = record(1, None);
         second.outcome = "😀".repeat(2001);
@@ -192,10 +201,8 @@ mod tests {
         );
     }
     fn assert_secret_erased(terminal: State) {
-        let dir = temp_dir("audit-secret");
+        let (dir, ledger, cas) = setup("audit-secret");
         let path = dir.0.join("ledger.db");
-        let cas = Cas::open(dir.0.join("cas")).unwrap();
-        let ledger = Ledger::open(&path).unwrap();
         let typed = Action::Type {
             selector: "#password".into(),
             text: "hunter2".into(),
@@ -253,9 +260,7 @@ mod tests {
     }
     #[test]
     fn rerun_step_keeps_both_records() {
-        let dir = temp_dir("audit-rerun");
-        let ledger = Ledger::open(dir.0.join("db")).unwrap();
-        let cas = Cas::open(dir.0.join("cas")).unwrap();
+        let (_dir, ledger, cas) = setup("audit-rerun");
         let id = ledger.add("rerun", &[action()]).unwrap();
         for outcome in ["challenge", "ok"] {
             let mut rec = record(0, None);
@@ -280,17 +285,10 @@ mod tests {
     }
     #[test]
     fn render_survives_missing_tree() {
-        let dir = temp_dir("audit-missing-render");
-        let ledger = Ledger::open(dir.0.join("db")).unwrap();
-        let cas = Cas::open(dir.0.join("cas")).unwrap();
+        let (_dir, ledger, cas) = setup("audit-missing-render");
         let id = ledger.add("missing", &[]).unwrap();
         let tree = snapshot::put(&cas, "<p>missing</p>").unwrap();
-        fs::remove_file(
-            cas.root()
-                .join(&tree.to_hex()[..2])
-                .join(&tree.to_hex()[2..]),
-        )
-        .unwrap();
+        fs::remove_file(cas.path(&tree)).unwrap();
         let text = render(
             &ledger.get(id).unwrap(),
             &[record(0, Some(tree.to_hex().to_string())), record(1, None)],
@@ -302,10 +300,8 @@ mod tests {
     }
     #[test]
     fn gc_survives_missing_tree() {
-        let dir = temp_dir("audit-missing-gc");
-        let path = dir.0.join("db");
-        let ledger = Ledger::open(&path).unwrap();
-        let cas = Cas::open(dir.0.join("cas")).unwrap();
+        let (dir, ledger, cas) = setup("audit-missing-gc");
+        let path = dir.0.join("ledger.db");
         let mut trees = Vec::new();
         for html in ["<p>first</p>", "<p>second</p>"] {
             let tree = snapshot::put(&cas, html).unwrap();
@@ -317,12 +313,7 @@ mod tests {
             ledger.transition(id, State::Executing).unwrap();
             ledger.transition(id, State::Committed).unwrap();
         }
-        fs::remove_file(
-            cas.root()
-                .join(&trees[0].to_hex()[..2])
-                .join(&trees[0].to_hex()[2..]),
-        )
-        .unwrap();
+        fs::remove_file(cas.path(&trees[0])).unwrap();
         // A retained record references the missing tree, exercising the mark phase too.
         let retained = ledger.add("retained", &[]).unwrap();
         ledger
@@ -341,8 +332,7 @@ mod tests {
     }
     #[test]
     fn financial_step_stores_no_snapshot() {
-        let dir = temp_dir("audit-financial");
-        let ledger = Ledger::open(dir.0.join("db")).unwrap();
+        let (_dir, ledger, _cas) = setup("audit-financial");
         let id = ledger.add("financial", &[]).unwrap();
         let rec = StepRecord::new(
             0,
@@ -360,9 +350,8 @@ mod tests {
     }
     #[test]
     fn records_roundtrip() {
-        let dir = temp_dir("audit-roundtrip");
-        let path = dir.0.join("db");
-        let ledger = Ledger::open(&path).unwrap();
+        let (dir, ledger, _cas) = setup("audit-roundtrip");
+        let path = dir.0.join("ledger.db");
         let id = ledger.add("records", &[]).unwrap();
         let other = ledger.add("keep", &[]).unwrap();
         let first = record(0, None);
@@ -390,9 +379,7 @@ mod tests {
     }
     #[test]
     fn dom_change_summary() {
-        let dir = temp_dir("audit-dom");
-        let cas = Cas::open(dir.0.join("cas")).unwrap();
-        let ledger = Ledger::open(dir.0.join("db")).unwrap();
+        let (_dir, ledger, cas) = setup("audit-dom");
         let id = ledger.add("dom", &[]).unwrap();
         let mut html: String = (0..2000)
             .map(|i| format!("<div class=\"row\" id=\"r{i}\">item {i}</div>"))
@@ -423,11 +410,9 @@ mod tests {
     }
     #[test]
     fn gc_removes_old_tasks_and_orphan_blobs() {
-        let dir = temp_dir("audit-gc");
+        let (dir, ledger, cas) = setup("audit-gc");
         let root = dir.0.join("cas");
-        let cas = Cas::open(&root).unwrap();
-        let path = dir.0.join("db");
-        let ledger = Ledger::open(&path).unwrap();
+        let path = dir.0.join("ledger.db");
         let old = ledger.add("old", &[]).unwrap();
         let recent = ledger.add("recent", &[]).unwrap();
         let running = ledger.add("running", &[]).unwrap();

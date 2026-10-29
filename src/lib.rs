@@ -9,7 +9,7 @@ pub mod snapshot;
 
 pub mod audit;
 pub mod engine;
-#[cfg(test)]
-pub(crate) mod testutil;
+#[doc(hidden)]
+pub mod testutil;
 
 pub mod setup;

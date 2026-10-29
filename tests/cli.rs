@@ -154,7 +154,8 @@ fn run_without_setup_says_run_setup() {
 fn e2e_report() {
     let h = TempDir::new();
     let id = ok(run(&h, &["add", "examples/hn.json"]));
-    ok(run(&h, &["run"]));
+    let out = ok(run(&h, &["run"]));
+    assert!(out.contains(&format!("{}\tCommitted", id.trim())), "{out}");
     let report = ok(run(&h, &["report", id.trim()]));
     assert!(
         report.contains("## Step 2") && report.contains("Committed"),
@@ -169,4 +170,38 @@ fn e2e_report() {
     let s = String::from_utf8(o.stdout).unwrap();
     eprintln!("e2e CAS du -sk: {s}");
     assert!(s.split_whitespace().next().unwrap().parse::<u64>().unwrap() < 500);
+}
+#[test]
+fn second_run_is_refused() {
+    use std::os::fd::AsRawFd;
+    let h = TempDir::new();
+    let lock = std::fs::File::create(h.0.join("run.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let o = cmd(&h)
+        .arg("run")
+        .env("CHROMIUM", "/nonexistent")
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("another iksa run is active"), "{err}");
+}
+#[test]
+fn home_required() {
+    let o = Command::new(env!("CARGO_BIN_EXE_iksa"))
+        .arg("list")
+        .env_remove("HOME")
+        .env_remove("IKSA_HOME")
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("set HOME or IKSA_HOME"), "{err}");
+}
+#[test]
+fn bad_id_is_usage_error() {
+    let h = TempDir::new();
+    let o = run(&h, &["approve", "x"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("usage:"));
 }

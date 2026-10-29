@@ -40,19 +40,8 @@ pub fn install(home: &Path) -> anyhow::Result<PathBuf> {
     let binary = installed(home);
     let root = home.join("chromium");
     let version = root.join("version");
-    // The marker preserves the packaging revision, which CFBundleShortVersionString omits.
-    let bundle_version = Command::new("plutil")
-        .args(["-extract", "CFBundleShortVersionString", "raw", "-o", "-"])
-        .arg(root.join("Chromium.app/Contents/Info.plist"))
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok());
-    let expected_version = PIN.split_once('-').expect("pin revision").0;
-    if binary.is_file()
-        && std::fs::read_to_string(&version).ok().as_deref() == Some(PIN)
-        && bundle_version.as_deref().map(str::trim) == Some(expected_version)
-    {
+    // Written only after a checksum-verified install completes.
+    if binary.is_file() && std::fs::read_to_string(&version).ok().as_deref() == Some(PIN) {
         return Ok(binary);
     }
     std::fs::create_dir_all(&root)?;
@@ -70,6 +59,11 @@ pub fn install(home: &Path) -> anyhow::Result<PathBuf> {
     verify_checksum(&dmg, SHA256)?;
     let mount = root.join("mount");
     std::fs::create_dir_all(&mount)?;
+    // An interrupted earlier setup can leave the image mounted here.
+    let _ = Command::new("hdiutil")
+        .args(["detach", "-force"])
+        .arg(&mount)
+        .output();
     checked(
         Command::new("hdiutil")
             .args(["attach", "-nobrowse"])

@@ -2,25 +2,14 @@
 use std::{
     io::{Read, Write},
     net::TcpListener,
-    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
 pub fn chromium() -> PathBuf {
     std::env::var_os("CHROMIUM")
         .expect("set CHROMIUM to the pinned Chromium executable")
         .into()
 }
-pub fn temp_profile() -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let p = std::env::temp_dir().join(format!(
-        "iksa-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
-    p
-}
+pub use iksa::testutil::{TempDir, temp_dir};
 
 #[derive(Clone)]
 pub struct Response {
@@ -218,7 +207,8 @@ pub fn netlog_hosts(path: &Path) -> Vec<String> {
 }
 #[test]
 fn netlog_parser_covers_all_events_and_network_forms() {
-    let path = temp_profile().join("netlog-parser.json");
+    let dir = temp_dir("netlog");
+    let path = dir.0.join("netlog-parser.json");
     std::fs::write(&path,r#"{"events":[{"params":{"url":"https://Example.COM:443/a","host":"localhost:80","address":"[::1]:443"}},{"params":{"url":"chrome://newtab/","nested":{"host":"remote.test:443","address":"[2001:db8::1]:443"}}},{"params":{"address":"0.0.0.0:9","host":"127.0.0.2:80"}}]}"#).unwrap();
     assert_eq!(
         netlog_hosts(&path),
@@ -229,12 +219,13 @@ fn netlog_parser_covers_all_events_and_network_forms() {
 /// A fresh browser whose process exits before its profile is removed.
 pub struct Chrome {
     pub b: Option<iksa::cdp::Browser>,
-    pub profile: PathBuf,
+    /// Removed when `Chrome` drops, after the browser has exited.
+    pub profile: TempDir,
 }
 impl Chrome {
     pub fn new(extra_args: &[String]) -> Self {
-        let profile = temp_profile();
-        let mut args = iksa::engine::launch_args(&profile, true);
+        let profile = temp_dir("profile");
+        let mut args = iksa::engine::launch_args(&profile.0, true);
         args.extend_from_slice(extra_args);
         let b = iksa::cdp::launch(&chromium(), &args).unwrap();
         Self {
@@ -249,17 +240,5 @@ impl Chrome {
 impl Drop for Chrome {
     fn drop(&mut self) {
         drop(self.b.take());
-        let _ = std::fs::remove_dir_all(&self.profile);
-    }
-}
-pub struct TempDir(pub PathBuf);
-impl TempDir {
-    pub fn new() -> Self {
-        Self(temp_profile())
-    }
-}
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }

@@ -20,7 +20,7 @@ struct EngineFixture {
 impl EngineFixture {
     fn new() -> Self {
         let mut chrome = common::Chrome::new(&[]);
-        let p = &chrome.profile;
+        let p = &chrome.profile.0;
         let r = |body: &str| common::Response {
             status: 200,
             headers: vec![],

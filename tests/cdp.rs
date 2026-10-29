@@ -196,7 +196,7 @@ async fn drop_closes_gracefully() {
     let mut f = common::Chrome::new(&[]);
     let _ = session(f.b()).await;
     drop(f.b.take());
-    let prefs = std::fs::read(f.profile.join("Default/Preferences")).unwrap();
+    let prefs = std::fs::read(f.profile.0.join("Default/Preferences")).unwrap();
     let prefs: serde_json::Value = serde_json::from_slice(&prefs).unwrap();
     assert_eq!(prefs["profile"]["exit_type"], "Normal");
 }

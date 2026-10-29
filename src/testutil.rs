@@ -5,7 +5,14 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+/// Test-only helper (shared by unit and integration tests).
 pub struct TempDir(pub PathBuf);
+
+impl TempDir {
+    pub fn new() -> Self {
+        temp_dir("test")
+    }
+}
 
 impl Drop for TempDir {
     fn drop(&mut self) {

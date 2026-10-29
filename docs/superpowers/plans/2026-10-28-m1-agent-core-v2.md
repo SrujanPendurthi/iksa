@@ -130,15 +130,15 @@ How `run` maps to CDP (algorithm, since the signatures don't fix it):
 
 Fixture routes (`common::serve`): `/form` (`<h1>Form</h1>` + the Task 1 form), `/cf` (403, `cf-mitigated: challenge`), `/slow` (hang), `/search?q=…` (echoes decoded q in `<h1>`), `/turnstile` (`<div class="cf-turnstile"></div><input name="cf-turnstile-response">`, no token), `/turnstile-auto` (same, plus a script that sets the input's `.value = "tok"` after 1 s), `/recaptcha-v3` (`<script src="https://www.google.com/recaptcha/api.js?render=k"></script><textarea name="g-recaptcha-response"></textarea>` plus a script setting its `.value = "tok"` after 1 s; the external script fails to load offline, which is fine).
 
-- [ ] **Step 1: Failing tests.**
+- [x] **Step 1: Failing tests.**
   - Unit: `launch_args_exact` (contains `--disable-features=PreloadTopChromeWebUI,WebUIOmniboxPopup,WebUIOmniboxAimPopup` and all privacy flags; no `--enable-automation`, no `remote-debugging-port`); `mock_keychain_only_when_asked` (absent when `false`).
   - `tests/engine.rs` (`#[ignore]`): `runs_read_task_to_committed` (Extract `h1` == "Form"); `search_uses_configured_provider` (provider `Local` -> fixture `/search?q={q}`; Search "a b"; Extract `h1` == "a b"); `write_step_waits_for_approval` (Type -> `AwaitingHandoff(Approval)`, cursor 1; `approve`; run -> `Committed`; Extract shows typed value); `click_uses_real_input` (Type "hi" into `#q` + Click `#go` with `auto_max: Write` -> `#out` == "hi"); `challenge_pauses` (`/cf` -> `AwaitingHandoff(Challenge(CloudflareChallenge))`); `turnstile_blocks_without_token` (`/turnstile` -> `AwaitingHandoff(Challenge(Turnstile))`); `turnstile_auto_pass_continues` (`/turnstile-auto` then Extract -> `Committed`); `recaptcha_v3_auto_pass_continues` (`/recaptcha-v3` then Extract -> `Committed`); `hung_page_fails_with_timeout` (`run_with_timeout` 2 s on `/slow` -> `Failed` containing `timeout`; `render` works); `contexts_are_isolated` (cookie from task A invisible to task B); `step_overhead_under_25ms` (median over 20 Extract steps of step wall time minus time spent inside `call`, < 25 ms).
   - `tests/pillars.rs` (`#[ignore]`, need network): `netlog_sees_real_navigation` (launch with `--log-net-log=<tmp>`; hidden tab navigates `https://example.com`; close; `netlog_hosts` contains `example.com`) — **the positive control; if it fails, the next test means nothing**; `idle_egress_is_loopback_only` (same launch, idle 60 s on `about:blank`, `netlog_hosts` empty); `idle_footprint_under_300mb` (median of 3 fresh launches, 10 s settle, `tree_footprint_kib` < 307,200); `five_tabs_three_agents_under_1200mb` (5 visible targets + 3 hidden agent contexts on Wikipedia articles `Rust_(programming_language)`, `Linux`, `Chromium_(web_browser)`, `SQLite`, `Mozilla`, `Python_(programming_language)`, `Tokio_(software)`, `WebKit`; 20 s settle; < 1,228,800).
-- [ ] **Step 2:** `cargo test engine` + ignored `--test engine` and `--test pillars` — FAIL.
-- [ ] **Step 3:** Implement.
-- [ ] **Step 4:** Same commands — all pass. Record the numbers from the pillar tests (footprints, hosts) in `docs/perf.md`.
-- [ ] **Step 5:** `git rm -r spikes/` and `rm -rf .spike-home/profile .spike-home/www .spike-home/ext-id` (the Rust tests replace them; keep `.spike-home/chromium/` and `.spike-home/logs/`); update `CLAUDE.md` module map.
-- [ ] **Step 6:** Commit `feat: CDP engine with gates, snapshots, challenge pause; pillar tests`.
+- [x] **Step 2:** `cargo test engine` + ignored `--test engine` and `--test pillars` — FAIL.
+- [x] **Step 3:** Implement.
+- [x] **Step 4:** Same commands — all pass, including the full 25 ignored tests. Final affected-engine rerun after focus fix: 11/11; normal suite passes. Actual overhead 0.394916 ms; C11 example.com, C12 0 hosts, C13 median 213911 KiB, C14 three-run median 1167745 KiB. Full evidence and intermediate failures in `docs/perf.md` and `target/codex/v2-task8-report.md`.
+- [x] **Step 5:** `git rm -r spikes/` and `rm -rf .spike-home/profile .spike-home/www .spike-home/ext-id` (the Rust tests replace them; keep `.spike-home/chromium/` and `.spike-home/logs/`); update `CLAUDE.md` module map.
+- [x] **Step 6:** Commit `feat: CDP engine with gates, snapshots, challenge pause; pillar tests`.
 
 ### Task 9: CLI, setup, end to end
 
@@ -188,11 +188,11 @@ Results go in `docs/perf.md` under `## Manual`.
 | C9 | 7 | `cargo test audit` | 6 pass — 5/6, `secret_never_rendered` BLOCKED (spec), moved to 7b; **RESOLVED in 7b: 10/10 pass under finish-time erasure contract** — **done** |
 | C9b | 7b | `cargo test --lib -- audit:: ledger::` | 20/20 pass (10 audit + 10 ledger), incl. `secret_never_rendered`, `secret_erased_on_failed`, `rerun_step_keeps_both_records`, `gc_survives_missing_tree`, `render_survives_missing_tree`, `delete_task_cascades` — **done** |
 | C9d | 7c | `cargo test --lib -- ledger::terminal_transition_ok_while_reader_open` + full suite | pass; no regressions |
-| C10 | 8 | ignored `--test engine` | 11 pass |
-| C11 | 8 | `netlog_sees_real_navigation` | `example.com` found |
-| C12 | 8 | `idle_egress_is_loopback_only` | 0 hosts |
-| C13 | 8 | `idle_footprint_under_300mb` | median < 300 MB (spike: 223) |
-| C14 | 8 | `five_tabs_three_agents_under_1200mb` | < 1.2 GB |
+| C10 | 8 | ignored `--test engine` | 11 pass; unique-snapshot fsync overhead median 0.394916 ms — **done** |
+| C11 | 8 | `netlog_sees_real_navigation` | 200 Example Domain, `example.com` found before C12 — **done** |
+| C12 | 8 | `idle_egress_is_loopback_only` | 0 hosts after 60 s — **done** |
+| C13 | 8 | `idle_footprint_under_300mb` | samples 213511/213911/214695 KiB; median 213911 < 307200 KiB — **done** |
+| C14 | 8 | `five_tabs_three_agents_under_1200mb` | samples 1206946/1167745/1143666 KiB; median 1167745 < 1228800 KiB; all individual checks pass — **done** |
 | C15 | 9 | `cargo test --test cli` + `e2e_report` | 12 pass |
 | C16 | 9 | binary size / CAS size | < 60 MB / < 500 KB |
 | C17 | 10 | H1 keychain | ≤ 1 prompt, none after Always Allow |

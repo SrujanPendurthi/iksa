@@ -8,5 +8,6 @@ pub mod ledger;
 pub mod snapshot;
 
 pub mod audit;
+pub mod engine;
 #[cfg(test)]
 pub(crate) mod testutil;

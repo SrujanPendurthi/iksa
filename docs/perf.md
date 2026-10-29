@@ -1,0 +1,26 @@
+# Performance and privacy evidence
+
+Task 8, 2026-10-29. Pinned headful ungoogled-chromium 156.0.8078.47-1.1 arm64, exact Global Constraints privacy flags; `--use-mock-keychain` only in tests. Each browser test ran serially. Runtime HOME/CFFIXED_USER_HOME and TMPDIR were isolated under `.spike-home`; all measurement logs, raw netlogs, process snapshots and footprint outputs are retained in `target/codex/`.
+
+Memory is the sum of actual `footprint -p PID -f bytes` **phys_footprint** for the browser and every transitive descendant from one `ps` snapshot, divided by 1024 (rounded down to KiB). No RSS substitutions or partial process sums. KiB/MiB are binary units; MB below is decimal. The plan's assertions use 307,200 KiB (300 MiB) idle and 1,228,800 KiB (1200 MiB) loaded.
+
+| Check | Actual result | Evidence |
+| --- | --- | --- |
+| C9d, prior Task 7c | Reader/checkpoint regression passed before Task 8; commit `1d443eb` | `target/codex/v2-task7c-report.md` |
+| C10 | All 11 engine tests pass; 20 Extract steps with unique real DOM snapshots: median **0.394916 ms**, upper median 0.401292 ms, both <25 ms | `target/codex/v2-task8-green-engine-focus-fixed.log` |
+| C11 | Actual `https://example.com` navigation returned 200, Example Domain title/body, and `example.com` found in cleanly flushed netlog | `target/codex/v2-task8-green-c11-before-global.log`, `positive-netlog-33013.json` |
+| C12 | **0 nonloopback hosts** after fresh about:blank browser idle for 60s, following C11 positive control | `target/codex/v2-task8-green-all-ignored.log`, `idle-netlog-33401.json` |
+| C13 | Three fresh launches, 10s settle each: **213,511 / 213,911 / 214,695 KiB**; median **213,911 KiB = 208.897 MiB = 219.045 MB**, below 307,200 KiB | `target/codex/v2-task8-green-all-ignored.log` |
+| C14 | Three fresh loaded runs: **1,206,946 / 1,167,745 / 1,143,666 KiB**; median **1,167,745 KiB = 1140.376 MiB = 1195.771 MB**, below 1,228,800 KiB; each individual run passed | `target/codex/v2-task8-green-pillars-final.log`, `v2-task8-green-all-ignored.log`, `v2-task8-green-c14-third.log` |
+
+C10 subtracts measured elapsed time around actual CDP calls from the actual per-step wall time, beginning before the gate and including snapshot/CAS, record and cursor writes. The fixture changes a data attribute on every native innerText read and asserts 21 distinct snapshot trees plus at least 42 CAS blobs, forcing the production fsync path for the 20 measured Extract steps. It uses the real browser, DOM, CAS and SQLite. `Engine::step_overheads()` exposes those durations for this check. Earlier medians of 0.096583/0.054958 ms used dedup hits and are superseded; the intermediate unique-snapshot 0.410043 ms run exposed an approval-input race, subsequently fixed and rerun.
+
+C11 ran standalone before the full pillar suite and again before the full ignored command. Its complete observed host set was `104.20.23.154`, `128.2.1.10`, `172.26.88.79`, `172.66.147.243`, `2606:4700:10::6814:179a`, `2606:4700:10::ac42:93f3`, `example.com`. The parser includes URL/host/address fields across all event params and excludes loopback and internal browser URL schemes. C12 checks the raw positive capture is recent, newer than the current pillar test binary, and contains `example.com`; empty or unflushed netlogs do not count as a pass.
+
+C13 normalized startup targets to exactly one visible about:blank page. C14 used exactly five visible pages and three hidden `other` targets in three distinct agent contexts, with the original visible page reused and hidden viewports set to 1280×800. All eight URLs returned 200 with matching article titles and nonempty article DOM, followed by 20s settle: `Rust_(programming_language)`, `Linux`, `Chromium_(web_browser)`, `SQLite`, `Mozilla`, `Python_(programming_language)`, `Tokio_(software)`, `WebKit` on `en.wikipedia.org/wiki/`.
+
+Raw evidence is retained as `target/codex/footprint-<stamp>-<pid>.log`, `footprint-<stamp>-pids.json`, `ps-tree-<root>.log`, `loaded-targets-<testpid>.json` and `idle-targets-<sample>-<testpid>.json`. Comparable loaded run roots/stamps are `32237/1793293019498736000`, `33402/1793294651408424000`, and `34190/1793294797572099000`. Idle roots/stamps in the final global run are `33657/1793294723002390000`, `33757/1793294733669789000`, `33861/1793294744371455000`.
+
+The full required ignored command passed all **25** tests (snapshot 1, CDP 9, engine 11, pillars 4): `target/codex/v2-task8-green-all-ignored.log`. A later Type focus fix and stronger overhead fixture were covered by a final 11/11 engine run and full normal `cargo test`: `v2-task8-green-engine-focus-fixed.log`, `v2-task8-green-all-normal-final.log`; unchanged expensive pillars were not repeated after that engine-only change.
+
+Execution history is retained in `target/codex/v2-task8-report.md`. It records the initial unsafe red-fixture launch (corrected with exact argument preflight before safe red rerun), the deliberate stale-positive-control rejection, and the approval-input failure/fix. These failed runs are not presented as passes. Task 8 removed the replaced spike kit and only the three specified old runtime paths; cleanup manifest: `target/codex/v2-task8-cleanup-manifest.log`.

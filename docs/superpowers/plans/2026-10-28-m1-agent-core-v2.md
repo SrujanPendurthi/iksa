@@ -101,9 +101,9 @@ From Claude's caveman review of `8bd8d86`. The rule `google.com/recaptcha` match
 - `transition(id, to)`: legal `Queued->Executing`; `Executing->{AwaitingHandoff, Committed, Failed, Queued}`; `AwaitingHandoff->{Queued, Failed}`; else `Illegal`. Sets `finished_ms` on `Committed`/`Failed`.
 - `approve(id)` only from `AwaitingHandoff(Approval)`: `approved_step = Some(cursor)`, `Queued`. `resume(id)` only from `AwaitingHandoff(Challenge(_))`: `Queued`. `recover() -> usize`: all `Executing` -> `Queued`.
 
-- [ ] **Step 1: Failing tests** (temp dirs via `crate::testutil::temp_dir`): `add_then_get`, `happy_path_transitions`, `committed_is_terminal`, `approve_only_from_approval_wait`, `recover_requeues_executing` (cursor kept across reopen), `finished_ms_set_on_commit`.
-- [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** pass.
-- [ ] **Step 5:** Commit `feat: SQLite task ledger`.
+- [x] **Step 1: Failing tests** (temp dirs via `crate::testutil::temp_dir`): `add_then_get`, `happy_path_transitions`, `committed_is_terminal`, `approve_only_from_approval_wait`, `recover_requeues_executing` (cursor kept across reopen), `finished_ms_set_on_commit`.
+- [x] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** pass.
+- [x] **Step 5:** Commit `feat: SQLite task ledger`.
 
 ### Task 7: Audit records, report, retention GC
 

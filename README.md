@@ -10,7 +10,7 @@ An agent-first browser for macOS with a Rust core. You give iksa a goal in plain
   - The only network traffic iksa itself starts is downloading its pinned Chromium build and calling the model provider you configured.
   - Form field values and named secrets never reach the model, and sites on your `never_send` list are never sent at all.
   - Every model request body is kept locally so you can see exactly what was shared.
-- **Light.** One Chromium process tree for everything. Measured idle footprint is about 208 MiB, and 5 tabs plus 3 agents stay under 1.2 GB. The `iksa` binary is about 4.3 MB ([`docs/perf.md`](docs/perf.md)).
+- **Light.** One Chromium process tree for everything. Measured idle footprint is about 208 MiB, and 5 tabs plus 3 agents stay under 1.2 GB. The `iksa` binary is about 7 MB ([`docs/perf.md`](docs/perf.md)).
 - **Gated.** Clicks and typing pause for approval by default. Financial actions always require you, and no setting changes that.
 - **Auditable.** `iksa report <id>` shows the goal, each step, what the model was told and why it acted. DOM snapshots are deduplicated with BLAKE3 + zstd, so a typical task stores well under 500 KB.
 

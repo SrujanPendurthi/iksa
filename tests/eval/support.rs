@@ -16,7 +16,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{BufRead, BufReader, Read, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     os::unix::fs::PermissionsExt,
     path::Path,
     process::Command,
@@ -90,9 +90,6 @@ pub fn fixture_routes() -> anyhow::Result<Vec<(String, common::Response)>> {
             ))
         })
         .collect()
-}
-pub fn case_risk(case: &Case) -> Risk {
-    if case.local { Risk::Write } else { Risk::Read }
 }
 fn normalized(text: &str) -> String {
     text.split_whitespace()
@@ -169,18 +166,8 @@ pub fn measure(reply: &Value) -> Measurement {
     {
         let uncached = usage["input_tokens"].as_u64().unwrap() as f64;
         let writes = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0) as f64;
-        let hour = usage["cache_creation"]["ephemeral_1h_input_tokens"]
-            .as_u64()
-            .unwrap_or(0) as f64;
         let reads = usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as f64;
-        Some(
-            (uncached * 4.0
-                + (writes - hour).max(0.0) * 5.0
-                + hour * 8.0
-                + reads * 0.2
-                + output as f64 * 20.0)
-                / 1_000_000.0,
-        )
+        Some((uncached * 4.0 + writes * 5.0 + reads * 0.2 + output as f64 * 20.0) / 1_000_000.0)
     } else {
         None
     };
@@ -189,9 +176,6 @@ pub fn measure(reply: &Value) -> Measurement {
         output: Some(output),
         usd,
     }
-}
-pub fn estimate() -> String {
-    "Opus 5.5 low: 20 tasks x 8 turns = 160 calls; 6000 input tokens/call = 960000 input tokens. At 400 output tokens/call: USD 4.52 with an assumed 1000-token reusable prefix (one 5m write and 159 cache hits), or USD 5.12 without caching. At 1000 output tokens/call: USD 6.44 cached / 7.04 uncached. 160 calls at the full 4096 output limit: about USD 16.95 uncached; 500 calls (25/task) at the same input estimate: about USD 52.96. Estimates are not caps; prompt size, retries, fallbacks and cache behavior can change cost. Rates verified 2026-11-04: input USD4, output USD20, 5m write USD5, cache read USD0.20 per million tokens.".into()
 }
 #[derive(Clone)]
 pub struct Exchange {
@@ -307,6 +291,7 @@ impl Relay {
     fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
+            let _ = TcpStream::connect(self.endpoint.trim_start_matches("http://"));
             let result = worker.join();
             if !thread::panicking() {
                 result.unwrap();
@@ -315,7 +300,6 @@ impl Relay {
     }
     fn new(mode: Mode) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let events = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -324,15 +308,14 @@ impl Relay {
             while !done.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(v) => v,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
                     Err(_) => {
                         seen.lock().unwrap().push(rejected_exchange());
                         continue;
                     }
                 };
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
                 let (headers, bytes, request) = match read_request(
                     &mut stream,
                     matches!(&mode, Mode::Forward { .. }),
@@ -553,18 +536,19 @@ struct Row {
     usage: Vec<Value>,
     models: Vec<Value>,
 }
-fn aggregate(events: &[Exchange]) -> Measurement {
-    Measurement {
-        input: events
-            .iter()
-            .try_fold(0u64, |a, e| e.measurement.input.map(|v| a + v)),
-        output: events
-            .iter()
-            .try_fold(0u64, |a, e| e.measurement.output.map(|v| a + v)),
-        usd: events
-            .iter()
-            .try_fold(0.0, |a, e| e.measurement.usd.map(|v| a + v)),
-    }
+fn total<'a>(measurements: impl IntoIterator<Item = &'a Measurement>) -> Measurement {
+    measurements.into_iter().fold(
+        Measurement {
+            input: Some(0),
+            output: Some(0),
+            usd: Some(0.0),
+        },
+        |a, b| Measurement {
+            input: a.input.zip(b.input).map(|(a, b)| a + b),
+            output: a.output.zip(b.output).map(|(a, b)| a + b),
+            usd: a.usd.zip(b.usd).map(|(a, b)| a + b),
+        },
+    )
 }
 fn assert_private(ledger: &Ledger, cas: &Cas, id: i64, requests: &[Value], path: &Path) {
     let has = |bytes: &[u8]| {
@@ -733,7 +717,6 @@ pub async fn run_isolated(live: bool) -> anyhow::Result<()> {
             "offline eval requires its dummy API key"
         );
     }
-    println!("{}", estimate());
     let routes = fixture_routes()?;
     let refs: Vec<_> = routes
         .iter()
@@ -770,7 +753,7 @@ pub async fn run_isolated(live: bool) -> anyhow::Result<()> {
     if !live {
         verify_fixture_forms(&engine, &base).await?;
     }
-    let mut rows: Vec<(usize, Row)> = Vec::new();
+    let mut rows: Vec<Option<Row>> = (0..all.len()).map(|_| None).collect();
     let order: Vec<_> = if live {
         RUN_ORDER
             .into_iter()
@@ -794,28 +777,25 @@ pub async fn run_isolated(live: bool) -> anyhow::Result<()> {
     for index in order {
         let case = &all[index];
         if (!live && !case.local) || reference_errors.contains_key(&index) {
-            rows.push((
-                index,
-                Row {
-                    id: case.id.clone(),
-                    title: case.title.clone(),
-                    success: if live { Some(false) } else { None },
-                    steps: 0,
-                    http_calls: 0,
-                    state: None,
-                    note: reference_errors
-                        .get(&index)
-                        .map(|e| format!("reference unavailable: {e}"))
-                        .unwrap_or_else(|| "external page skipped in offline smoke".into()),
-                    measurement: Measurement {
-                        input: Some(0),
-                        output: Some(0),
-                        usd: if live { Some(0.0) } else { None },
-                    },
-                    usage: vec![],
-                    models: vec![],
+            rows[index] = Some(Row {
+                id: case.id.clone(),
+                title: case.title.clone(),
+                success: if live { Some(false) } else { None },
+                steps: 0,
+                http_calls: 0,
+                state: None,
+                note: reference_errors
+                    .get(&index)
+                    .map(|e| format!("reference unavailable: {e}"))
+                    .unwrap_or_else(|| "external page skipped in offline smoke".into()),
+                measurement: Measurement {
+                    input: Some(0),
+                    output: Some(0),
+                    usd: if live { Some(0.0) } else { None },
                 },
-            ));
+                usage: vec![],
+                models: vec![],
+            });
             continue;
         }
         let dir = common::temp_dir("eval-task");
@@ -824,7 +804,7 @@ pub async fn run_isolated(live: bool) -> anyhow::Result<()> {
         let relay = if live { Relay::live() } else { Relay::mock() };
         let mut cfg = Config {
             model: Some(relay.config()),
-            auto_max: case_risk(case),
+            auto_max: if case.local { Risk::Write } else { Risk::Read },
             ..Config::default()
         };
         if case.expect == "blocked" {
@@ -878,7 +858,7 @@ pub async fn run_isolated(live: bool) -> anyhow::Result<()> {
                 .map(|r| r.step)
                 .collect::<std::collections::HashSet<_>>()
                 .len();
-        let mut measurement = aggregate(&events);
+        let mut measurement = total(events.iter().map(|e| &e.measurement));
         if !live {
             measurement.usd = None;
         }
@@ -889,24 +869,20 @@ pub async fn run_isolated(live: bool) -> anyhow::Result<()> {
         } else {
             note
         };
-        rows.push((
-            index,
-            Row {
-                id: case.id.clone(),
-                title: case.title.clone(),
-                success: if live { Some(success) } else { None },
-                steps,
-                http_calls: events.len(),
-                state,
-                note,
-                measurement,
-                usage: events.iter().map(|e| e.usage.clone()).collect(),
-                models: events.iter().map(|e| e.model.clone()).collect(),
-            },
-        ));
+        rows[index] = Some(Row {
+            id: case.id.clone(),
+            title: case.title.clone(),
+            success: if live { Some(success) } else { None },
+            steps,
+            http_calls: events.len(),
+            state,
+            note,
+            measurement,
+            usage: events.iter().map(|e| e.usage.clone()).collect(),
+            models: events.iter().map(|e| e.model.clone()).collect(),
+        });
     }
-    rows.sort_by_key(|(index, _)| *index);
-    let rows: Vec<_> = rows.into_iter().map(|(_, r)| r).collect();
+    let rows: Vec<_> = rows.into_iter().map(Option::unwrap).collect();
     assert_eq!(rows.len(), 20, "eval harness must attempt all 20 tasks");
     println!("Mode: {} (offline rows are not benchmark results)", mode);
     println!(
@@ -938,15 +914,7 @@ pub async fn run_isolated(live: bool) -> anyhow::Result<()> {
                 })
         );
     }
-    let total_input = rows
-        .iter()
-        .try_fold(0u64, |a, r| r.measurement.input.map(|n| a + n));
-    let total_output = rows
-        .iter()
-        .try_fold(0u64, |a, r| r.measurement.output.map(|n| a + n));
-    let total_usd = rows
-        .iter()
-        .try_fold(0.0, |a, r| r.measurement.usd.map(|n| a + n));
+    let totals = total(rows.iter().map(|r| &r.measurement));
     let successes = if live {
         Some(rows.iter().filter(|r| r.success == Some(true)).count())
     } else {
@@ -955,7 +923,7 @@ pub async fn run_isolated(live: bool) -> anyhow::Result<()> {
     println!(
         "EVAL_RESULT {}",
         serde_json::to_string(
-            &json!({"mode":mode,"model":MODEL,"effort":"low","successes":successes,"input_tokens":total_input,"output_tokens":total_output,"usd":total_usd,"secret_leaks":0,"never_send_requests":0,"rows":rows})
+            &json!({"mode":mode,"model":MODEL,"effort":"low","successes":successes,"input_tokens":totals.input,"output_tokens":totals.output,"usd":totals.usd,"secret_leaks":0,"never_send_requests":0,"rows":rows})
         )?
     );
     Ok(())

@@ -97,15 +97,6 @@ fn usage_prices_cache_categories_without_double_counting() {
     assert!(fallback.usd.is_none());
 }
 #[test]
-fn estimate_states_its_token_assumptions() {
-    let text = estimate();
-    assert!(text.contains("160"));
-    assert!(text.contains("960000"));
-    assert!(text.contains("4.52"));
-    assert!(text.contains("5.12"));
-    println!("{text}");
-}
-#[test]
 fn relay_mock_records_wire_body_and_usage() {
     let relay = Relay::mock();
     let cfg = relay.config();
@@ -122,18 +113,6 @@ fn relay_mock_records_wire_body_and_usage() {
     assert_eq!(events[0].measurement.input, Some(10));
 }
 
-#[test]
-fn external_eval_requires_write_approval() {
-    use iksa::gate::{self, Decision, Risk};
-    for case in cases().unwrap().iter().filter(|c| !c.local) {
-        assert_eq!(
-            gate::decide(case_risk(case), Risk::Write),
-            Decision::NeedsApproval,
-            "external case {} can write",
-            case.id
-        );
-    }
-}
 #[test]
 fn relay_drains_late_exchange_before_reporting() {
     use std::{

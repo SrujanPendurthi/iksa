@@ -58,3 +58,7 @@ Pillar fix: `idle_egress_is_loopback_only` once saw 2 page targets because `Pill
 - A Ctrl-C mid-run left a task `Executing`; the next `run` recovered it as designed.
 - **No Keychain prompt** on any run. Expected: agent tasks run in off-the-record browser contexts, so nothing is encrypted to disk. The first real prompt should come with human browsing in iksa's profile (M3).
 - UX found: `add -` waits silently on a terminal; `run` with an empty queue prints nothing and still launches Chromium; timeout messages don't name the selector. Fixed in M2's first commit.
+
+**H2 — address bar with memory flags:** deferred to M3. Not run manually; it only affects human browsing in iksa's own profile, which M3 introduces. M3's plan carries it as an automated or guided check with the bundled extension.
+
+**M1 closed 2026-11-03.**

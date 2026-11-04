@@ -156,6 +156,9 @@ impl Engine {
             browser: RefCell::new(Some(browser)),
         }
     }
+    pub fn is_available(&self) -> bool {
+        self.browser.borrow().is_some()
+    }
     pub fn launch(chromium: &Path, profile: &Path, mock_keychain: bool) -> anyhow::Result<Self> {
         std::fs::DirBuilder::new()
             .recursive(true)

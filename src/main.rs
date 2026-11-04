@@ -4,18 +4,15 @@ use iksa::{
     audit,
     cas::Cas,
     config::Config,
-    engine::Engine,
+    daemon::{self, Opts},
     keychain,
-    ledger::{Handoff, Ledger, State},
+    ledger::{Handoff, Ledger, State, waiting_on},
     schedule, setup,
 };
 use serde::Deserialize;
 use std::{
     io::Read,
-    os::{
-        fd::AsRawFd,
-        unix::fs::{DirBuilderExt, PermissionsExt},
-    },
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::PathBuf,
 };
 #[derive(Deserialize)]
@@ -24,7 +21,7 @@ struct TaskInput {
     title: String,
     steps: Vec<Action>,
 }
-const USAGE: &str = "usage: iksa setup | add <task.json|-> | ask <goal…> | key set | secret set <name> | schedule add [--auto] <spec> <goal…> | schedule list | schedule set <id> auto|suggest | schedule rm <id> | run | list | inbox | accept <id> | dismiss <id> | approve <id> | resume <id> | report <id> | gc";
+const USAGE: &str = "usage: iksa setup | add <task.json|-> | ask <goal…> | key set | secret set <name> | schedule add [--auto] <spec> <goal…> | schedule list | schedule set <id> auto|suggest | schedule rm <id> | daemon | run | list | inbox | accept <id> | dismiss <id> | approve <id> | resume <id> | report <id> | gc";
 fn local_time(ms: u64) -> String {
     let c = schedule::local(ms);
     format!(
@@ -159,13 +156,25 @@ async fn execute() -> anyhow::Result<i32> {
             println!("{id}");
         }
         ["list"] => {
-            for t in open()?.1.list()? {
+            let (_, ledger, _) = open()?;
+            for t in ledger.list()? {
+                let mut waiting = waiting_on(&t);
+                if t.state == State::AwaitingHandoff(Handoff::Approval) {
+                    if let Some(record) = ledger.records(t.id)?.last().filter(|r| {
+                        r.decision == "planner"
+                            && r.outcome.starts_with("blocked: ")
+                            && r.outcome.ends_with(" is on never_send")
+                    }) {
+                        waiting = Some(record.outcome.clone());
+                    }
+                }
                 println!(
-                    "{}\t{}{}\t{:?}",
+                    "{}\t{}{}\t{:?}{}",
                     t.id,
                     if t.goal.is_some() { "[goal] " } else { "" },
                     t.title,
-                    t.state
+                    t.state,
+                    waiting.map(|w| format!("\t{w}")).unwrap_or_default()
                 );
             }
         }
@@ -208,40 +217,16 @@ async fn execute() -> anyhow::Result<i32> {
             let (tasks, blobs) = audit::gc(&ledger, &cas, cfg.retention_days, audit::now_ms())?;
             println!("removed {tasks} tasks and {blobs} blobs");
         }
+        ["daemon"] => daemon::run(&home, Opts::default()).await?,
         ["run"] => {
-            // One runner per data dir: a second Chromium on the same profile would hand off and exit.
-            let lock = std::fs::File::create(home.join("run.lock"))?;
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                anyhow::bail!("another iksa run is active");
-            }
-            let (cfg, ledger, cas) = open()?;
-            ledger.recover()?;
-            audit::gc(&ledger, &cas, cfg.retention_days, audit::now_ms())?;
-            if ledger.next_queued()?.is_none() {
-                println!("no queued tasks");
-                return Ok(0);
-            }
-            let chromium =
-                setup::chromium_path(&home).context("Chromium is not installed; run iksa setup")?;
-            let engine = Engine::launch(
-                &chromium,
-                &home.join("profile"),
-                std::env::var("IKSA_MOCK_KEYCHAIN").as_deref() == Ok("1"),
+            daemon::run(
+                &home,
+                Opts {
+                    drain: true,
+                    ..Opts::default()
+                },
             )
-            .with_context(|| format!("launching Chromium {}", chromium.display()))?;
-            while let Some(t) = ledger.next_queued()? {
-                let state = engine.run(&ledger, &cas, &cfg, t.id).await?;
-                println!("{}\t{state:?}", t.id);
-                match state {
-                    State::AwaitingHandoff(Handoff::Approval) => {
-                        eprintln!("hint: iksa approve {}", t.id)
-                    }
-                    State::AwaitingHandoff(Handoff::Challenge(_)) => {
-                        eprintln!("hint: solve the challenge, then iksa resume {}", t.id)
-                    }
-                    _ => {}
-                }
-            }
+            .await?
         }
         _ => {
             eprintln!("{USAGE}");

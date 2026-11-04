@@ -11,7 +11,9 @@ use std::{
 };
 fn cmd(h: &TempDir) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_iksa"));
-    c.env("IKSA_HOME", &h.0).env("IKSA_MOCK_KEYCHAIN", "1");
+    c.env("IKSA_HOME", &h.0)
+        .env("IKSA_MOCK_KEYCHAIN", "1")
+        .env("IKSA_NOTIFY", "off");
     c
 }
 fn run(h: &TempDir, args: &[&str]) -> Output {
@@ -512,5 +514,193 @@ fn bad_spec_is_usage_error() {
             .schedules()
             .unwrap()
             .is_empty()
+    );
+}
+
+struct DaemonChild(std::process::Child);
+impl Drop for DaemonChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn daemon_wait(mut predicate: impl FnMut() -> bool, seconds: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while !predicate() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon condition timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+fn stop_daemon(child: &mut DaemonChild) {
+    assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) }, 0);
+    daemon_wait(|| child.0.try_wait().unwrap().is_some(), 3);
+    assert_eq!(child.0.try_wait().unwrap().unwrap().code(), Some(0));
+}
+fn start_daemon(h: &TempDir) -> DaemonChild {
+    DaemonChild(
+        cmd(h)
+            .arg("daemon")
+            .env("CHROMIUM", "/nonexistent")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    )
+}
+#[test]
+fn daemon_fires_due_schedule() {
+    let h = TempDir::new();
+    schedule_model(&h);
+    ok(run(&h, &["schedule", "add", "every 5m", "x"]));
+    rusqlite::Connection::open(h.0.join("ledger.db"))
+        .unwrap()
+        .execute("UPDATE schedules SET next_ms=0", [])
+        .unwrap();
+    let mut child = start_daemon(&h);
+    daemon_wait(|| ok(run(&h, &["inbox"])).contains("\tx\n"), 5);
+    stop_daemon(&mut child);
+    let ledger = Ledger::open(h.0.join("ledger.db")).unwrap();
+    assert_eq!(ledger.list().unwrap().len(), 1);
+    assert_eq!(ledger.list().unwrap()[0].state, State::Suggested);
+    // Drain still fires schedules without launching a browser for suggestions.
+    rusqlite::Connection::open(h.0.join("ledger.db"))
+        .unwrap()
+        .execute("UPDATE schedules SET next_ms=0", [])
+        .unwrap();
+    assert_eq!(
+        ok(cmd(&h)
+            .arg("run")
+            .env("CHROMIUM", "/nonexistent")
+            .output()
+            .unwrap()),
+        "no queued tasks\n"
+    );
+    assert_eq!(ledger.list().unwrap().len(), 1);
+}
+#[test]
+fn daemon_holds_run_lock() {
+    let h = TempDir::new();
+    let mut child = start_daemon(&h);
+    daemon_wait(|| iksa::daemon::lock(&h.0).is_err(), 5);
+    for command in ["run", "daemon"] {
+        let out = run(&h, &[command]);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("another iksa run is active"));
+        assert!(child.0.try_wait().unwrap().is_none());
+    }
+    stop_daemon(&mut child);
+}
+#[test]
+fn daemon_launch_failure_keeps_polling() {
+    let h = TempDir::new();
+    let first = add(&h);
+    let ledger = Ledger::open(h.0.join("ledger.db")).unwrap();
+    let mut child = start_daemon(&h);
+    daemon_wait(
+        || matches!(ledger.get(first).unwrap().state, State::Failed(_)),
+        5,
+    );
+    assert!(
+        matches!(ledger.get(first).unwrap().state, State::Failed(ref message) if message.starts_with("launching Chromium"))
+    );
+    let second = add(&h);
+    daemon_wait(
+        || matches!(ledger.get(second).unwrap().state, State::Failed(_)),
+        5,
+    );
+    assert!(child.0.try_wait().unwrap().is_none());
+    stop_daemon(&mut child);
+}
+#[test]
+fn list_explains_blocked_wait() {
+    let h = TempDir::new();
+    let ledger = Ledger::open(h.0.join("ledger.db")).unwrap();
+    let id = ledger.add_goal("private", "private").unwrap();
+    ledger.transition(id, State::Executing).unwrap();
+    ledger
+        .record_step(
+            id,
+            &iksa::audit::StepRecord::new(
+                0,
+                &iksa::action::Action::Extract {
+                    selector: "html".into(),
+                },
+                "planner".into(),
+                None,
+                "blocked: private.example is on never_send".into(),
+            ),
+        )
+        .unwrap();
+    ledger
+        .transition(id, State::AwaitingHandoff(iksa::ledger::Handoff::Approval))
+        .unwrap();
+    let output = ok(run(&h, &["list"]));
+    assert!(
+        output
+            .trim_end()
+            .ends_with("\tblocked: private.example is on never_send"),
+        "{output}"
+    );
+}
+#[test]
+fn drain_removes_never_firing_schedule() {
+    let h = TempDir::new();
+    schedule_model(&h);
+    let ledger = Ledger::open(h.0.join("ledger.db")).unwrap();
+    let id = ledger
+        .add_schedule("0 0 30 2 *", "must not run", true, 0)
+        .unwrap();
+    let out = cmd(&h)
+        .arg("run")
+        .env("CHROMIUM", "/nonexistent")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains(&format!("schedule {id} will never fire again; removed"))
+    );
+    assert_eq!(ok(out), "no queued tasks\n");
+    assert!(ledger.schedules().unwrap().is_empty());
+    assert!(ledger.list().unwrap().is_empty());
+}
+
+#[test]
+fn daemon_stops_between_launch_failures() {
+    let h = TempDir::new();
+    let ledger = Ledger::open(h.0.join("ledger.db")).unwrap();
+    let conn = rusqlite::Connection::open(h.0.join("ledger.db")).unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    for _ in 0..4000 {
+        conn.execute(
+            r#"INSERT INTO tasks(title,steps,state) VALUES('queued failure','[]','"Queued"')"#,
+            [],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    let mut child = DaemonChild(
+        cmd(&h)
+            .arg("daemon")
+            .env("CHROMIUM", "/nonexistent")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    daemon_wait(
+        || matches!(ledger.get(1).unwrap().state, State::Failed(_)),
+        5,
+    );
+    stop_daemon(&mut child);
+    assert!(
+        ledger
+            .list()
+            .unwrap()
+            .iter()
+            .any(|t| t.state == State::Queued),
+        "daemon kept starting tasks after SIGTERM"
     );
 }

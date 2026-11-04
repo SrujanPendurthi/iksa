@@ -39,6 +39,31 @@ pub struct Task {
     pub approved_step: Option<usize>,
     pub finished_ms: Option<u64>,
 }
+pub fn waiting_on(task: &Task) -> Option<String> {
+    match &task.state {
+        State::AwaitingHandoff(Handoff::Approval) => Some(match task.steps.get(task.cursor) {
+            Some(action) => {
+                let op = match action {
+                    Action::Navigate { .. } => "navigate",
+                    Action::Search { .. } => "search",
+                    Action::Click { .. } => "click",
+                    Action::Type { .. } => "type",
+                    Action::Extract { .. } => "extract",
+                };
+                format!(
+                    "approve step {}: {op} ({})",
+                    task.cursor.saturating_add(1),
+                    format!("{:?}", action.risk()).to_ascii_lowercase()
+                )
+            }
+            None => "approval required".into(),
+        }),
+        State::AwaitingHandoff(Handoff::Challenge(kind)) => {
+            Some(format!("solve {kind:?} challenge"))
+        }
+        _ => None,
+    }
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct Schedule {
     pub id: i64,
@@ -253,17 +278,31 @@ impl Ledger {
         now_ms: u64,
         next: impl Fn(&str, u64) -> u64,
     ) -> anyhow::Result<Vec<i64>> {
+        Ok(self
+            .fire_due_with_expiry(now_ms, |spec, now| Some(next(spec, now)))?
+            .0)
+    }
+    pub fn fire_due_with_expiry(
+        &self,
+        now_ms: u64,
+        next: impl Fn(&str, u64) -> Option<u64>,
+    ) -> anyhow::Result<(Vec<i64>, Vec<i64>)> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
         )?;
         let mut ids = Vec::new();
+        let mut removed = Vec::new();
         for schedule in self
             .schedules()?
             .into_iter()
             .filter(|s| s.next_ms <= now_ms)
         {
-            let next_ms = next(&schedule.spec, now_ms);
+            let Some(next_ms) = next(&schedule.spec, now_ms) else {
+                tx.execute("DELETE FROM schedules WHERE id=?1", [schedule.id])?;
+                removed.push(schedule.id);
+                continue;
+            };
             anyhow::ensure!(
                 next_ms > now_ms,
                 "schedule {}: next fire must be after now",
@@ -303,7 +342,7 @@ impl Ledger {
             }
         }
         tx.commit()?;
-        Ok(ids)
+        Ok((ids, removed))
     }
     pub fn get(&self, id: i64) -> anyhow::Result<Task> {
         let mut stmt = self.conn.prepare(&format!("{SELECT} WHERE id=?1"))?;
@@ -1334,5 +1373,84 @@ mod tests {
         assert_eq!(ledger.get(1).unwrap().goal.as_deref(), Some("legacy"));
         assert_eq!(ledger.get(id).unwrap().schedule_id, Some(sid));
         assert_eq!(ledger.schedules().unwrap()[0].accepted, 1);
+    }
+    #[test]
+    fn waiting_on_text() {
+        let dir = temp_dir("waiting-on");
+        let ledger = Ledger::open(dir.0.join("ledger.db")).unwrap();
+        let id = ledger
+            .add(
+                "private goal",
+                &[
+                    Action::Navigate {
+                        url: "about:blank".into(),
+                    },
+                    Action::Extract {
+                        selector: "body".into(),
+                    },
+                    Action::Click {
+                        selector: "#go".into(),
+                        risk: crate::gate::Risk::Write,
+                    },
+                ],
+            )
+            .unwrap();
+        ledger.set_cursor(id, 2).unwrap();
+        ledger.transition(id, State::Executing).unwrap();
+        ledger
+            .transition(id, State::AwaitingHandoff(Handoff::Approval))
+            .unwrap();
+        assert_eq!(
+            waiting_on(&ledger.get(id).unwrap()).as_deref(),
+            Some("approve step 3: click (write)")
+        );
+        ledger.approve(id).unwrap();
+        ledger.transition(id, State::Executing).unwrap();
+        ledger
+            .transition(
+                id,
+                State::AwaitingHandoff(Handoff::Challenge(ChallengeKind::Turnstile)),
+            )
+            .unwrap();
+        assert_eq!(
+            waiting_on(&ledger.get(id).unwrap()).as_deref(),
+            Some("solve Turnstile challenge")
+        );
+        ledger.resume(id).unwrap();
+        ledger.transition(id, State::Executing).unwrap();
+        ledger.transition(id, State::Committed).unwrap();
+        assert_eq!(waiting_on(&ledger.get(id).unwrap()), None);
+    }
+    #[test]
+    fn expired_schedule_removal_is_atomic() {
+        let dir = temp_dir("expired-schedule");
+        let ledger = Ledger::open(dir.0.join("ledger.db")).unwrap();
+        let expired = ledger
+            .add_schedule("expired", "must not run", true, 0)
+            .unwrap();
+        let valid = ledger.add_schedule("every 5m", "valid", false, 0).unwrap();
+        assert!(
+            ledger
+                .fire_due_with_expiry(1000, |spec, n| if spec == "expired" {
+                    None
+                } else {
+                    Some(n)
+                })
+                .is_err()
+        );
+        assert_eq!(ledger.schedules().unwrap().len(), 2);
+        assert!(ledger.list().unwrap().is_empty());
+        let (ids, removed) = ledger
+            .fire_due_with_expiry(1000, |spec, n| {
+                if spec == "expired" {
+                    None
+                } else {
+                    Some(n + 300_000)
+                }
+            })
+            .unwrap();
+        assert_eq!(removed, vec![expired]);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ledger.get(ids[0]).unwrap().schedule_id, Some(valid));
     }
 }

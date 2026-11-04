@@ -1,7 +1,7 @@
 use crate::config::ModelConfig;
 use anyhow::Context;
 use serde_json::{Value, json};
-use std::{process::Command, time::Duration};
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct Reply {
@@ -164,22 +164,7 @@ pub fn api_key() -> anyhow::Result<String> {
         anyhow::ensure!(!key.trim().is_empty(), "run iksa key set");
         return Ok(key);
     }
-    let output = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "iksa",
-            "-a",
-            "anthropic",
-            "-w",
-        ])
-        .output()
-        .context("run iksa key set")?;
-    anyhow::ensure!(output.status.success(), "run iksa key set");
-    let key = String::from_utf8(output.stdout)
-        .context("run iksa key set")?
-        .trim_end()
-        .to_owned();
+    let key = crate::keychain::get("iksa", "anthropic").context("run iksa key set")?;
     anyhow::ensure!(!key.is_empty(), "run iksa key set");
     Ok(key)
 }

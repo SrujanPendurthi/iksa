@@ -40,14 +40,16 @@ impl Action {
         }
     }
 
-    /// Copy safe to store or show: secret typed text becomes "••••".
+    /// Copy safe to store or show: literal secrets become "••••"; references stay intact.
     pub fn redacted(&self) -> Action {
         let mut action = self.clone();
         if let Action::Type {
             text, secret: true, ..
         } = &mut action
         {
-            *text = "••••".into();
+            if crate::keychain::secret_name(text).is_none() {
+                *text = "••••".into();
+            }
         }
         action
     }
@@ -131,5 +133,15 @@ mod tests {
             risk: Risk::Write,
         };
         assert_eq!(plain.redacted(), plain);
+    }
+    #[test]
+    fn redacted_preserves_secret_placeholder() {
+        let action = Action::Type {
+            selector: "#q".into(),
+            text: "{{secret:pw}}".into(),
+            secret: true,
+            risk: Risk::Write,
+        };
+        assert_eq!(action.redacted(), action);
     }
 }

@@ -231,3 +231,42 @@ fn run_with_empty_queue() {
         .unwrap();
     assert_eq!(ok(o).trim(), "no queued tasks");
 }
+
+#[test]
+fn key_and_secret_set_use_fake_keychain() {
+    let h = TempDir::new();
+    let fake = TempDir::new();
+    for (args, path, value) in [
+        (vec!["key", "set"], "iksa/anthropic", "fake-api-key"),
+        (vec!["secret", "set", "pw"], "iksa-secret/pw", "S3cr3t-xyz"),
+    ] {
+        let mut child = cmd(&h)
+            .args(args)
+            .env("IKSA_KEYCHAIN_FAKE", &fake.0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("{value}\n").as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(value));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(value));
+        let path = fake.0.join(path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), value);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}

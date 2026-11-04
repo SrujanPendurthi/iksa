@@ -27,7 +27,7 @@ impl EngineFixture {
             body: body.into(),
             hang: false,
         };
-        let form = "<h1>Form</h1><input id=q oninput=\"document.querySelector('#live').innerText=this.value\"><button id=go onclick=\"document.querySelector('#out').innerText=document.querySelector('#q').value\">Go</button><div id=out></div><div id=live></div>";
+        let form = "<h1>Form</h1><input id=q oninput=\"document.querySelector('#live').innerText=this.value\"><button id=go onclick=\"document.querySelector('#out').innerText=document.querySelector('#q').value;document.querySelector('#length').innerText=document.querySelector('#q').value.length\">Go</button><div id=out></div><div id=live></div><div id=length></div>";
         let widget =
             "<h1>Widget</h1><div class=\"cf-turnstile\"></div><input name=cf-turnstile-response>";
         let auto = format!(
@@ -36,6 +36,16 @@ impl EngineFixture {
         let recap = "<h1>Widget</h1><script src=\"https://www.google.com/recaptcha/api.js?render=k\" async></script><textarea name=g-recaptcha-response></textarea><script>setTimeout(()=>document.querySelector('textarea').value='tok',1000)</script>";
         let port = common::serve(&[
             ("/form", r(form)),
+            (
+                "/secret-carry",
+                r("<input id=q oninput=\"sessionStorage.setItem('typed',this.value)\">"),
+            ),
+            (
+                "/secret-echo",
+                r(
+                    "<h1 id=echo></h1><script>document.querySelector('#echo').textContent=sessionStorage.getItem('typed')</script>",
+                ),
+            ),
             ("/search?q=a%20b", r("<h1>a b</h1>")),
             ("/turnstile", r(widget)),
             ("/turnstile-auto", r(&auto)),
@@ -718,4 +728,172 @@ async fn observe_selectors_unique_without_ids() {
         o.elements[0].selector
     );
     assert_observed_selectors(chrome.b(), &s, &o).await;
+}
+
+// A subprocess isolates fake-Keychain environment variables from parallel tests.
+fn secret_test_child(name: &str) -> bool {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+    if std::env::var("IKSA_SECRET_TEST_CHILD").as_deref() == Ok(name) {
+        return false;
+    }
+    let fake = common::temp_dir("engine-keychain");
+    std::fs::create_dir(fake.0.join("iksa-secret")).unwrap();
+    let path = fake.0.join("iksa-secret/pw");
+    std::fs::write(&path, "S3cr3t-xyz").unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--ignored", "--nocapture"])
+        .env("IKSA_SECRET_TEST_CHILD", name)
+        .env("IKSA_MOCK_KEYCHAIN", "1")
+        .env("IKSA_KEYCHAIN_FAKE", &fake.0)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    true
+}
+fn placeholder(secret: bool) -> Action {
+    Action::Type {
+        selector: "#q".into(),
+        text: "{{secret:pw}}".into(),
+        secret,
+        risk: Risk::Write,
+    }
+}
+fn assert_no_resolved_secret(f: &EngineFixture, id: i64) {
+    let secret = b"S3cr3t-xyz";
+    let has_secret = |bytes: &[u8]| bytes.windows(secret.len()).any(|w| w == secret);
+    for hash in f.c.all().unwrap() {
+        assert!(!has_secret(&f.c.get(&hash).unwrap()), "secret in CAS blob");
+    }
+    assert!(!has_secret(
+        serde_json::to_string(&f.l.records(id).unwrap())
+            .unwrap()
+            .as_bytes()
+    ));
+    assert!(!has_secret(
+        audit::render(&f.l.get(id).unwrap(), &f.l.records(id).unwrap(), &f.c)
+            .unwrap()
+            .as_bytes()
+    ));
+    for name in ["ledger.db", "ledger.db-wal", "ledger.db-shm"] {
+        let path = f._chrome.profile.0.join(name);
+        if path.exists() {
+            assert!(
+                !has_secret(&std::fs::read(&path).unwrap()),
+                "secret in {name}"
+            );
+        }
+    }
+}
+#[tokio::test]
+#[ignore]
+async fn secret_placeholder_typed_and_scrubbed() {
+    if secret_test_child("secret_placeholder_typed_and_scrubbed") {
+        return;
+    }
+    let f = EngineFixture::new();
+    let cfg = Config {
+        auto_max: Risk::Write,
+        ..Config::default()
+    };
+    let (id, state) = f
+        .run(
+            &[
+                f.nav("/form"),
+                placeholder(true),
+                Action::Click {
+                    selector: "#go".into(),
+                    risk: Risk::Write,
+                },
+                extract("#out"),
+                extract("#length"),
+            ],
+            &cfg,
+        )
+        .await;
+    assert_eq!(state, State::Committed);
+    let records = f.l.records(id).unwrap();
+    assert_eq!(records[3].outcome, "••••");
+    assert_eq!(
+        records[4].outcome, "10",
+        "the resolved value must actually be typed"
+    );
+    assert_eq!(f.l.get(id).unwrap().steps[1], placeholder(true));
+    assert_eq!(records[1].action, placeholder(true));
+    assert!(records[1..].iter().all(|r| r.after.is_none()));
+    assert_no_resolved_secret(&f, id);
+
+    // Resume must resolve the placeholder again and scrub the replayed value.
+    let (id, state) = f
+        .run(
+            &[
+                f.nav("/form"),
+                placeholder(true),
+                Action::Click {
+                    selector: "#go".into(),
+                    risk: Risk::Financial,
+                },
+                extract("#out"),
+                extract("#length"),
+            ],
+            &cfg,
+        )
+        .await;
+    assert_eq!(state, State::AwaitingHandoff(Handoff::Approval));
+    assert_no_resolved_secret(&f, id);
+    f.l.approve(id).unwrap();
+    assert_eq!(
+        f.e.run(&f.l, &f.c, &cfg, id).await.unwrap(),
+        State::Committed
+    );
+    let records = f.l.records(id).unwrap();
+    assert_eq!(records[3].outcome, "••••");
+    assert_eq!(records[4].outcome, "10");
+    assert_eq!(f.l.get(id).unwrap().steps[1], placeholder(true));
+    assert_no_resolved_secret(&f, id);
+
+    // A new document may restore the typed value from same-origin storage.
+    let (id, state) = f
+        .run(
+            &[
+                f.nav("/secret-carry"),
+                placeholder(true),
+                f.nav("/secret-echo"),
+                extract("#echo"),
+            ],
+            &cfg,
+        )
+        .await;
+    assert_eq!(state, State::Committed);
+    let records = f.l.records(id).unwrap();
+    assert_eq!(records[3].outcome, "••••");
+    assert!(
+        records[2].after.is_some(),
+        "new-document snapshots stay available after redaction"
+    );
+    assert_no_resolved_secret(&f, id);
+}
+#[tokio::test]
+#[ignore]
+async fn placeholder_without_secret_flag_fails() {
+    if secret_test_child("placeholder_without_secret_flag_fails") {
+        return;
+    }
+    let f = EngineFixture::new();
+    let cfg = Config {
+        auto_max: Risk::Write,
+        ..Config::default()
+    };
+    let (id, state) = f.run(&[f.nav("/form"), placeholder(false)], &cfg).await;
+    assert!(
+        matches!(state, State::Failed(ref m) if m.contains("secret placeholder requires \"secret\": true")),
+        "{state:?}"
+    );
+    assert_eq!(f.l.get(id).unwrap().cursor, 1);
+    assert_no_resolved_secret(&f, id);
 }

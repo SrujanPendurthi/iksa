@@ -5,6 +5,7 @@ use iksa::{
     cas::Cas,
     config::Config,
     engine::Engine,
+    keychain,
     ledger::{Handoff, Ledger, State},
     setup,
 };
@@ -23,7 +24,7 @@ struct TaskInput {
     title: String,
     steps: Vec<Action>,
 }
-const USAGE: &str = "usage: iksa setup | add <task.json|-> | run | list | approve <id> | resume <id> | report <id> | gc";
+const USAGE: &str = "usage: iksa setup | add <task.json|-> | key set | secret set <name> | run | list | approve <id> | resume <id> | report <id> | gc";
 #[tokio::main]
 async fn main() {
     let result = execute().await;
@@ -60,6 +61,14 @@ async fn execute() -> anyhow::Result<i32> {
     };
     let id = |s: &str| s.parse::<i64>().ok();
     match args[..] {
+        ["key", "set"] => keychain::set_interactive("iksa", "anthropic")?,
+        ["secret", "set", name] => {
+            anyhow::ensure!(
+                keychain::valid_name(name),
+                "invalid secret name: use letters, digits, _ or -"
+            );
+            keychain::set_interactive("iksa-secret", name)?;
+        }
         ["setup"] => println!("{}", setup::install(&home)?.display()),
         ["add", path] => {
             let (_, ledger, _) = open()?;

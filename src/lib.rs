@@ -17,3 +17,5 @@ pub mod setup;
 pub mod observe;
 
 pub mod llm;
+
+pub mod keychain;

@@ -6,6 +6,7 @@ use crate::{
     challenge::{self, ChallengeKind},
     config::Config,
     gate::{self, Decision, Risk},
+    keychain,
     ledger::{Handoff, Ledger, State},
     snapshot,
 };
@@ -50,11 +51,28 @@ fn url_of(a: &Action, cfg: &Config) -> Option<String> {
         _ => None,
     }
 }
-fn scrub(s: &str, secrets: &[&str]) -> String {
+fn scrub(s: &str, secrets: &[String]) -> String {
     secrets
         .iter()
         .filter(|s| !s.is_empty())
         .fold(s.to_owned(), |s, secret| s.replace(secret, "••••"))
+}
+fn scrub_snapshot(html: &str, secrets: &[String]) -> String {
+    // outerHTML escapes text and attributes differently. Redact both serialized forms.
+    let mut variants = Vec::new();
+    for secret in secrets {
+        let amp = secret.replace('&', "&amp;");
+        let text = amp.replace('<', "&lt;").replace('>', "&gt;");
+        variants.extend([
+            secret.clone(),
+            text.clone(),
+            text.replace('"', "&quot;"),
+            amp.replace('"', "&quot;"),
+        ]);
+    }
+    variants.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    variants.dedup();
+    scrub(html, &variants)
 }
 /// Sequential execution on the caller's future; the ledger is deliberately not Sync.
 pub struct Engine {
@@ -189,7 +207,19 @@ impl Engine {
         cfg: &Config,
         deadline: Instant,
         timeout: Duration,
+        secrets: &mut Vec<String>,
     ) -> anyhow::Result<(String, Option<u16>, Vec<(String, String)>)> {
+        if let Action::Type {
+            text,
+            secret: false,
+            ..
+        } = a
+        {
+            anyhow::ensure!(
+                !text.contains("{{secret:"),
+                "secret placeholder requires \"secret\": true"
+            );
+        }
         let (status, headers) = match a {
             Action::Navigate { .. } | Action::Search { .. } => {
                 let (st, h) = self.navigate(b, s, &url_of(a, cfg).unwrap()).await?;
@@ -214,7 +244,23 @@ impl Engine {
                     if focused != true {
                         anyhow::bail!("typed element could not receive focus");
                     }
-                    b.call("Input.insertText", json!({"text":text}), Some(s))
+                    let resolved = if let Action::Type { secret: true, .. } = a {
+                        if let Some(name) = keychain::secret_name(text) {
+                            let name = name.to_owned();
+                            tokio::task::spawn_blocking(move || keychain::get("iksa-secret", &name))
+                                .await??
+                        } else {
+                            text.clone()
+                        }
+                    } else {
+                        text.clone()
+                    };
+                    if matches!(a, Action::Type { secret: true, .. })
+                        && !secrets.contains(&resolved)
+                    {
+                        secrets.push(resolved.clone());
+                    }
+                    b.call("Input.insertText", json!({"text":resolved}), Some(s))
                         .await?;
                 }
                 (None, vec![])
@@ -289,13 +335,13 @@ impl Engine {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("browser unavailable after cleanup timeout"))?;
         let task = l.get(id)?;
-        let secrets: Vec<&str> = task
+        let mut secrets: Vec<String> = task
             .steps
             .iter()
             .filter_map(|a| match a {
                 Action::Type {
                     text, secret: true, ..
-                } => Some(text.as_str()),
+                } if keychain::secret_name(text).is_none() => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -361,7 +407,7 @@ impl Engine {
                             .await?;
                         for a in replay {
                             if let Action::Type { secret, .. } = a {
-                                self.action(b, &s, a, cfg, Instant::now() + timeout, timeout).await?;
+                                self.action(b, &s, a, cfg, Instant::now() + timeout, timeout, &mut secrets).await?;
                                 secret_on_page |= *secret;
                             }
                         }
@@ -390,7 +436,7 @@ impl Engine {
                     } else {
                         None
                     };
-                    let (outcome, status, headers) = self.action(b, &s, a, cfg, deadline, timeout).await?;
+                    let (outcome, status, headers) = self.action(b, &s, a, cfg, deadline, timeout, &mut secrets).await?;
                     let new_document = if let Some(before) = before_document {
                         before != b.call("Page.getFrameTree", json!({}), Some(&s)).await?["frameTree"]["frame"]["loaderId"]
                     } else {
@@ -413,7 +459,7 @@ impl Engine {
                     let after = if secret_on_page || a.risk() == Risk::Financial {
                         None
                     } else {
-                        Some(snapshot::put(c, &html)?.to_hex().to_string())
+                        Some(snapshot::put(c, &scrub_snapshot(&html, &secrets))?.to_hex().to_string())
                     };
                     l.record_step(
                         id,
@@ -543,6 +589,17 @@ mod tests {
             !launch_args(p, false)
                 .iter()
                 .any(|s| s.contains("mock-keychain"))
+        );
+    }
+    #[test]
+    fn snapshot_scrubs_html_escaped_secrets() {
+        let secrets = vec!["a<&\"b".to_owned()];
+        assert_eq!(
+            scrub_snapshot(
+                r#"<p>a&lt;&amp;"b</p><input value="a&lt;&amp;&quot;b"><span>a<&"b</span>"#,
+                &secrets
+            ),
+            "<p>••••</p><input value=\"••••\"><span>••••</span>"
         );
     }
 }

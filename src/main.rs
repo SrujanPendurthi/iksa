@@ -24,7 +24,7 @@ struct TaskInput {
     title: String,
     steps: Vec<Action>,
 }
-const USAGE: &str = "usage: iksa setup | add <task.json|-> | ask <goal…> | key set | secret set <name> | run | list | approve <id> | resume <id> | report <id> | gc";
+const USAGE: &str = "usage: iksa setup | add <task.json|-> | ask <goal…> | key set | secret set <name> | run | list | inbox | accept <id> | dismiss <id> | approve <id> | resume <id> | report <id> | gc";
 #[tokio::main]
 async fn main() {
     let result = execute().await;
@@ -113,6 +113,30 @@ async fn execute() -> anyhow::Result<i32> {
                 );
             }
         }
+        ["inbox"] => {
+            let suggestions: Vec<_> = open()?
+                .1
+                .list()?
+                .into_iter()
+                .filter(|task| task.state == State::Suggested)
+                .collect();
+            if suggestions.is_empty() {
+                println!("inbox empty");
+            }
+            for task in suggestions {
+                println!(
+                    "{}\t{}",
+                    task.id,
+                    task.goal.as_deref().unwrap_or(&task.title)
+                );
+            }
+        }
+        ["accept", n] if id(n).is_some() => {
+            let (cfg, ledger, _) = open()?;
+            anyhow::ensure!(cfg.model.is_some(), "configure \"model\" in config.json");
+            ledger.accept(id(n).unwrap())?;
+        }
+        ["dismiss", n] if id(n).is_some() => open()?.1.dismiss(id(n).unwrap())?,
         ["approve", n] if id(n).is_some() => open()?.1.approve(id(n).unwrap())?,
         ["resume", n] if id(n).is_some() => open()?.1.resume(id(n).unwrap())?,
         ["report", n] if id(n).is_some() => {

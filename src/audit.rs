@@ -130,8 +130,10 @@ pub fn gc(
     let cutoff = now_ms.saturating_sub(u64::from(retention_days).saturating_mul(86_400_000));
     let mut removed_tasks = 0;
     for task in tasks {
-        if matches!(task.state, State::Committed | State::Failed(_))
-            && task.finished_ms.is_some_and(|finished| finished < cutoff)
+        if matches!(
+            task.state,
+            State::Committed | State::Failed(_) | State::Dismissed
+        ) && task.finished_ms.is_some_and(|finished| finished < cutoff)
         {
             ledger.delete_task(task.id)?;
             removed_tasks += 1;
@@ -623,6 +625,33 @@ mod tests {
         assert!(cas.get(&orphan).is_err());
         ledger.delete_task(live).unwrap();
         assert_eq!(gc(&ledger, &cas, 1, 3 * 86_400_000).unwrap(), (0, 1));
+        assert!(cas.all().unwrap().is_empty());
+    }
+    #[test]
+    fn dismissed_is_gc_eligible() {
+        let (dir, ledger, cas) = setup("audit-dismissed-gc");
+        let old = ledger.suggest("old dismissed").unwrap().unwrap();
+        let fresh = ledger.suggest("fresh dismissed").unwrap().unwrap();
+        let pending = ledger.suggest("keep suggested").unwrap().unwrap();
+        ledger.dismiss(old).unwrap();
+        ledger.dismiss(fresh).unwrap();
+        let blob = cas.put(b"old model request").unwrap();
+        let mut rec = record(0, None);
+        rec.model_request = Some(blob.to_hex().to_string());
+        ledger.record_step(old, &rec).unwrap();
+        rusqlite::Connection::open(dir.0.join("ledger.db"))
+            .unwrap()
+            .execute("UPDATE tasks SET finished_ms=0 WHERE id=?1", [old])
+            .unwrap();
+        let now = now_ms();
+        assert_eq!(gc(&ledger, &cas, 1, now).unwrap(), (1, 1));
+        assert_eq!(
+            ledger.get(old).unwrap_err().to_string(),
+            format!("task {old} not found")
+        );
+        assert!(ledger.records(old).unwrap().is_empty());
+        assert_eq!(ledger.get(fresh).unwrap().state, State::Dismissed);
+        assert_eq!(ledger.get(pending).unwrap().state, State::Suggested);
         assert!(cas.all().unwrap().is_empty());
     }
 }

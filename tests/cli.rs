@@ -348,3 +348,69 @@ fn ask_queues_goal_task() {
     }
     assert_eq!(ledger.list().unwrap().len(), 2);
 }
+
+#[test]
+fn inbox_accept_dismiss() {
+    let h = TempDir::new();
+    assert_eq!(ok(run(&h, &["inbox"])), "inbox empty\n");
+    let ledger = Ledger::open(h.0.join("ledger.db")).unwrap();
+    let first = ledger.suggest("read news").unwrap().unwrap();
+    let second = ledger.suggest("check weather").unwrap().unwrap();
+    let first_id = first.to_string();
+    let second_id = second.to_string();
+    assert_eq!(
+        ok(run(&h, &["inbox"])),
+        format!("{first}\tread news\n{second}\tcheck weather\n")
+    );
+    assert_eq!(
+        ok(cmd(&h)
+            .arg("run")
+            .env("CHROMIUM", "/nonexistent")
+            .output()
+            .unwrap()),
+        "no queued tasks\n"
+    );
+    let out = run(&h, &["accept", &first_id]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "error: configure \"model\" in config.json\n"
+    );
+    assert_eq!(ledger.get(first).unwrap().state, State::Suggested);
+    let mut cfg = Config::default();
+    cfg.model = Some(serde_json::from_value(serde_json::json!({"provider":"anthropic","endpoint":"http://127.0.0.1:1","name":"test-model"})).unwrap());
+    std::fs::write(h.0.join("config.json"), serde_json::to_vec(&cfg).unwrap()).unwrap();
+    ok(run(&h, &["accept", &first_id]));
+    assert_eq!(ledger.get(first).unwrap().state, State::Queued);
+    let list = ok(run(&h, &["list"]));
+    assert!(
+        list.lines()
+            .any(|line| line == format!("{first}\t[goal] read news\tQueued")),
+        "{list}"
+    );
+    assert_eq!(
+        ok(run(&h, &["inbox"])),
+        format!("{second}\tcheck weather\n")
+    );
+    std::fs::write(
+        h.0.join("config.json"),
+        serde_json::to_vec(&Config::default()).unwrap(),
+    )
+    .unwrap();
+    ok(run(&h, &["dismiss", &second_id]));
+    assert_eq!(ledger.get(second).unwrap().state, State::Dismissed);
+    assert_eq!(ok(run(&h, &["inbox"])), "inbox empty\n");
+    for args in [["accept", "abc"], ["dismiss", "abc"]] {
+        let out = run(&h, &args);
+        assert_eq!(out.status.code(), Some(2));
+        let usage = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            usage.contains("inbox")
+                && usage.contains("accept <id>")
+                && usage.contains("dismiss <id>"),
+            "{usage}"
+        );
+    }
+    assert_eq!(run(&h, &["dismiss", &first_id]).status.code(), Some(1));
+    assert_eq!(ledger.get(first).unwrap().state, State::Queued);
+}

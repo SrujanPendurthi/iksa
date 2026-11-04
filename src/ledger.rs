@@ -11,11 +11,19 @@ pub enum Handoff {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum State {
+    Suggested,
     Queued,
     Executing,
     AwaitingHandoff(Handoff),
     Committed,
     Failed(String),
+    Dismissed,
+}
+pub fn is_open(state: &State) -> bool {
+    matches!(
+        state,
+        State::Suggested | State::Queued | State::Executing | State::AwaitingHandoff(_)
+    )
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Task {
@@ -100,6 +108,39 @@ impl Ledger {
         )?;
         Ok(self.conn.last_insert_rowid())
     }
+    pub fn suggest(&self, goal: &str) -> anyhow::Result<Option<i64>> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        {
+            let mut stmt = tx.prepare("SELECT state FROM tasks WHERE goal=?1")?;
+            let rows = stmt.query_map([goal], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                if is_open(&serde_json::from_str(&row?)?) {
+                    return Ok(None);
+                }
+            }
+        }
+        tx.execute(
+            "INSERT INTO tasks (title, goal, steps, state) VALUES (?1, ?1, '[]', ?2)",
+            rusqlite::params![goal, serde_json::to_string(&State::Suggested)?],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(Some(id))
+    }
+    pub fn accept(&self, id: i64) -> anyhow::Result<()> {
+        self.transition_from(id, State::Suggested, State::Queued, None)
+    }
+    pub fn dismiss(&self, id: i64) -> anyhow::Result<()> {
+        self.transition_from(
+            id,
+            State::Suggested,
+            State::Dismissed,
+            Some(self.get(id)?.steps),
+        )
+    }
     pub fn push_step(&self, id: i64, action: &Action) -> anyhow::Result<usize> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.conn,
@@ -166,7 +207,8 @@ impl Ledger {
         let from = task.state;
         if !matches!(
             (&from, &to),
-            (State::Queued, State::Executing)
+            (State::Suggested, State::Queued | State::Dismissed)
+                | (State::Queued, State::Executing)
                 | (
                     State::Executing,
                     State::AwaitingHandoff(_) | State::Committed | State::Failed(_) | State::Queued
@@ -175,7 +217,8 @@ impl Ledger {
         ) {
             anyhow::bail!("illegal transition from {from:?} to {to:?}");
         }
-        let steps = matches!(to, State::Committed | State::Failed(_)).then_some(task.steps);
+        let steps = matches!(to, State::Committed | State::Failed(_) | State::Dismissed)
+            .then_some(task.steps);
         self.transition_from(id, from, to, steps)
     }
     fn transition_from(
@@ -185,7 +228,7 @@ impl Ledger {
         to: State,
         steps: Option<Vec<Action>>,
     ) -> anyhow::Result<()> {
-        let terminal = matches!(to, State::Committed | State::Failed(_));
+        let terminal = matches!(to, State::Committed | State::Failed(_) | State::Dismissed);
         let redacted = steps
             .map(|steps| {
                 serde_json::to_string(&steps.iter().map(Action::redacted).collect::<Vec<_>>())
@@ -402,6 +445,8 @@ mod tests {
             State::AwaitingHandoff(Handoff::Challenge(ChallengeKind::Turnstile)),
             State::Committed,
             State::Failed("failure".into()),
+            State::Suggested,
+            State::Dismissed,
         ]
     }
     #[test]
@@ -472,19 +517,32 @@ mod tests {
     fn happy_path_transitions() {
         let dir = temp_dir("ledger-transitions");
         let ledger = Ledger::open(dir.0.join("ledger.db")).unwrap();
-        // Rows and columns: Queued, Executing, approval wait, challenge wait, Committed, Failed.
+        // Queued, Executing, approval wait, challenge wait, Committed, Failed, Suggested, Dismissed.
         let expected = [
-            [false, true, false, false, false, false],
-            [true, false, true, true, true, true],
-            [true, false, false, false, false, true],
-            [true, false, false, false, false, true],
-            [false; 6],
-            [false; 6],
+            [false, true, false, false, false, false, false, false],
+            [true, false, true, true, true, true, false, false],
+            [true, false, false, false, false, true, false, false],
+            [true, false, false, false, false, true, false, false],
+            [false; 8],
+            [false; 8],
+            [true, false, false, false, false, false, false, true],
+            [false; 8],
         ];
         for (from_index, from) in states().into_iter().enumerate() {
             for (to_index, to) in states().into_iter().enumerate() {
-                let id = ledger.add("matrix", &[]).unwrap();
-                if from != State::Queued {
+                let id = if matches!(from, State::Suggested | State::Dismissed) {
+                    let id = ledger
+                        .suggest(&format!("matrix {from_index} {to_index}"))
+                        .unwrap()
+                        .unwrap();
+                    if from == State::Dismissed {
+                        ledger.dismiss(id).unwrap();
+                    }
+                    id
+                } else {
+                    ledger.add("matrix", &[]).unwrap()
+                };
+                if !matches!(from, State::Queued | State::Suggested | State::Dismissed) {
                     ledger.transition(id, State::Executing).unwrap();
                     if from != State::Executing {
                         ledger.transition(id, from.clone()).unwrap();
@@ -737,5 +795,120 @@ mod tests {
         let reopened = Ledger::open(path).unwrap();
         assert_eq!(reopened.get(id).unwrap().goal.as_deref(), Some("Read more"));
         assert_eq!(reopened.records(1).unwrap(), records);
+    }
+    #[test]
+    fn suggest_accept_dismiss() {
+        let dir = temp_dir("ledger-inbox");
+        let path = dir.0.join("ledger.db");
+        let ledger = Ledger::open(&path).unwrap();
+        let id = ledger.suggest("read the news").unwrap().unwrap();
+        let task = ledger.get(id).unwrap();
+        assert_eq!(task.state, State::Suggested);
+        assert_eq!(task.title, "read the news");
+        assert_eq!(task.goal.as_deref(), Some("read the news"));
+        assert!(task.steps.is_empty());
+        assert_eq!(task.cursor, 0);
+        assert_eq!(task.finished_ms, None);
+        assert!(ledger.next_queued().unwrap().is_none());
+        ledger.accept(id).unwrap();
+        assert_eq!(ledger.get(id).unwrap().state, State::Queued);
+        assert_eq!(ledger.next_queued().unwrap().unwrap().id, id);
+        assert_eq!(
+            ledger.accept(id).unwrap_err().to_string(),
+            "illegal transition from Queued to Queued"
+        );
+        let dismissed = ledger.suggest("check the weather").unwrap().unwrap();
+        ledger.dismiss(dismissed).unwrap();
+        let before = ledger.get(dismissed).unwrap();
+        assert_eq!(before.state, State::Dismissed);
+        assert!(before.finished_ms.unwrap().abs_diff(crate::audit::now_ms()) < 5_000);
+        assert_eq!(
+            ledger.accept(dismissed).unwrap_err().to_string(),
+            "illegal transition from Dismissed to Queued"
+        );
+        assert_eq!(
+            ledger.dismiss(id).unwrap_err().to_string(),
+            "illegal transition from Queued to Dismissed"
+        );
+        for to in states() {
+            assert_eq!(
+                ledger
+                    .transition(dismissed, to.clone())
+                    .unwrap_err()
+                    .to_string(),
+                format!("illegal transition from Dismissed to {to:?}")
+            );
+        }
+        assert_eq!(ledger.get(dismissed).unwrap(), before);
+        ledger.transition(id, State::Executing).unwrap();
+        assert_eq!(
+            ledger.accept(id).unwrap_err().to_string(),
+            "illegal transition from Executing to Queued"
+        );
+        assert_eq!(ledger.get(id).unwrap().state, State::Executing);
+        for error in [
+            ledger.accept(-1).unwrap_err(),
+            ledger.dismiss(-1).unwrap_err(),
+        ] {
+            assert_eq!(error.to_string(), "task -1 not found");
+        }
+        drop(ledger);
+        let ledger = Ledger::open(path).unwrap();
+        assert_eq!(ledger.get(dismissed).unwrap(), before);
+    }
+    #[test]
+    fn suggest_dedupes_open_goal() {
+        let dir = temp_dir("ledger-suggest-dedupe");
+        let ledger = Ledger::open(dir.0.join("ledger.db")).unwrap();
+        let id = ledger.suggest("x").unwrap().unwrap();
+        assert_eq!(ledger.suggest("x").unwrap(), None);
+        ledger.dismiss(id).unwrap();
+        let replacement = ledger.suggest("x").unwrap().unwrap();
+        assert_ne!(replacement, id);
+        ledger.dismiss(replacement).unwrap();
+        let queued = ledger.add_goal("x", "x").unwrap();
+        assert_eq!(ledger.suggest("x").unwrap(), None);
+        ledger.transition(queued, State::Executing).unwrap();
+        assert_eq!(ledger.suggest("x").unwrap(), None);
+        ledger
+            .transition(queued, State::AwaitingHandoff(Handoff::Approval))
+            .unwrap();
+        assert_eq!(ledger.suggest("x").unwrap(), None);
+        ledger
+            .transition(queued, State::Failed("not available".into()))
+            .unwrap();
+        let next = ledger.suggest("x").unwrap().unwrap();
+        ledger.accept(next).unwrap();
+        ledger.transition(next, State::Executing).unwrap();
+        ledger.transition(next, State::Committed).unwrap();
+        assert!(ledger.suggest("x").unwrap().is_some());
+        for state in states() {
+            assert_eq!(
+                is_open(&state),
+                matches!(
+                    state,
+                    State::Suggested | State::Queued | State::Executing | State::AwaitingHandoff(_)
+                ),
+                "{state:?}"
+            );
+        }
+    }
+    #[test]
+    fn concurrent_suggestions_dedupe() {
+        let dir = temp_dir("ledger-suggest-concurrent");
+        let path = dir.0.join("ledger.db");
+        let first = Ledger::open(&path).unwrap();
+        let second = Ledger::open(&path).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let peer = barrier.clone();
+        let writer = std::thread::spawn(move || {
+            peer.wait();
+            first.suggest("same goal").unwrap()
+        });
+        barrier.wait();
+        let results = [second.suggest("same goal").unwrap(), writer.join().unwrap()];
+        assert_eq!(results.iter().filter(|r| r.is_some()).count(), 1);
+        assert_eq!(second.list().unwrap().len(), 1);
+        assert_eq!(second.list().unwrap()[0].state, State::Suggested);
     }
 }

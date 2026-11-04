@@ -11,6 +11,8 @@ use std::{
     fs, io,
     time::{SystemTime, UNIX_EPOCH},
 };
+pub(crate) const MAX_THOUGHT_CHARS: usize = 500;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StepRecord {
     pub step: usize,
@@ -19,6 +21,11 @@ pub struct StepRecord {
     pub after: Option<String>,
     pub outcome: String,
     pub at_ms: u64,
+    /// The caller scrubs resolved secrets before assigning. Persistence caps this at 500 chars.
+    #[serde(default)]
+    pub thought: Option<String>,
+    #[serde(default)]
+    pub model_request: Option<String>,
 }
 impl StepRecord {
     pub fn new(
@@ -39,6 +46,8 @@ impl StepRecord {
             },
             outcome,
             at_ms: now_ms(),
+            thought: None,
+            model_request: None,
         }
     }
 }
@@ -52,10 +61,11 @@ fn tree_hash(hex: &str) -> io::Result<blake3::Hash> {
     blake3::Hash::from_hex(hex).map_err(invalid_data)
 }
 pub fn render(task: &Task, records: &[StepRecord], cas: &Cas) -> io::Result<String> {
-    let mut text = format!(
-        "# Task {}: {}\nState: {:?}\n",
-        task.id, task.title, task.state
-    );
+    let mut text = format!("# Task {}: {}\n", task.id, task.title);
+    if let Some(goal) = &task.goal {
+        text.push_str(&format!("Goal: {goal}\n"));
+    }
+    text.push_str(&format!("State: {:?}\n", task.state));
     let mut previous = HashSet::new();
     for record in records {
         let action = serde_json::to_value(&record.action).map_err(invalid_data)?;
@@ -70,6 +80,18 @@ pub fn render(task: &Task, records: &[StepRecord], cas: &Cas) -> io::Result<Stri
             record.decision,
             record.outcome.chars().take(2000).collect::<String>()
         ));
+        if let Some(thought) = &record.thought {
+            text.push_str(&format!(
+                "Thought: {}\n",
+                thought.chars().take(MAX_THOUGHT_CHARS).collect::<String>()
+            ));
+        }
+        if let Some(request) = &record.model_request {
+            text.push_str(&format!(
+                "Model request: {}\n",
+                request.chars().take(8).collect::<String>()
+            ));
+        }
         if let Some(after) = &record.after {
             let tree = tree_hash(after)?;
             let chunks = match snapshot::chunk_hashes(cas, &tree) {
@@ -118,6 +140,9 @@ pub fn gc(
     let mut reachable = HashSet::new();
     for task in ledger.list()? {
         for record in ledger.records(task.id)? {
+            if let Some(request) = record.model_request {
+                reachable.insert(tree_hash(&request)?);
+            }
             if let Some(after) = record.after {
                 let tree = tree_hash(&after)?;
                 if let Ok(chunks) = snapshot::chunk_hashes(cas, &tree) {
@@ -527,5 +552,77 @@ mod tests {
         println!(
             "GC removed {tasks} tasks, {blobs} blobs, 2 stale tmp (including just over one hour); fresh tmp and unrelated retained"
         );
+    }
+    #[test]
+    fn report_shows_goal_and_thought() {
+        let (_dir, ledger, cas) = setup("audit-model-report");
+        let id = ledger.add_goal("hours", "Find opening hours").unwrap();
+        let request = cas
+            .put(br#"{"messages":[{"role":"user","content":"goal"}]}"#)
+            .unwrap();
+        let mut rec = record(0, None);
+        rec.thought = Some("Check the opening-hours heading".into());
+        rec.model_request = Some(request.to_hex().to_string());
+        ledger.record_step(id, &rec).unwrap();
+        let records = ledger.records(id).unwrap();
+        assert_eq!(records[0].thought, rec.thought);
+        assert_eq!(records[0].model_request, rec.model_request);
+        let report = render(&ledger.get(id).unwrap(), &records, &cas).unwrap();
+        assert!(
+            report.starts_with(&format!("# Task {id}: hours\nGoal: Find opening hours\n")),
+            "{report}"
+        );
+        assert!(
+            report.contains("Thought: Check the opening-hours heading\n"),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("Model request: {}\n", &request.to_hex()[..8])),
+            "{report}"
+        );
+        assert!(!report.contains(&request.to_hex().to_string()));
+        let mut long = record(1, None);
+        long.thought = Some("界".repeat(501));
+        ledger.record_step(id, &long).unwrap();
+        let saved = ledger.records(id).unwrap();
+        assert_eq!(saved[1].thought.as_ref().unwrap().chars().count(), 500);
+        let report = render(&ledger.get(id).unwrap(), &[long], &cas).unwrap();
+        assert_eq!(report.matches('界').count(), 500);
+        let scripted = ledger.add("scripted", &[]).unwrap();
+        let report = render(&ledger.get(scripted).unwrap(), &[record(0, None)], &cas).unwrap();
+        assert!(!report.contains("Goal:"));
+        assert!(!report.contains("Thought:"));
+        assert!(!report.contains("Model request:"));
+    }
+    #[test]
+    fn gc_keeps_model_request_blobs() {
+        let (dir, ledger, cas) = setup("audit-model-gc");
+        let live = ledger.add_goal("live", "Keep request").unwrap();
+        let old = ledger.add_goal("old", "Expire request").unwrap();
+        let request = cas.put(br#"{"messages":[],"system":[]}"#).unwrap();
+        let old_request = cas.put(br#"{"messages":[],"model":"old"}"#).unwrap();
+        let orphan = cas.put(b"orphan").unwrap();
+        for (id, hash) in [(live, request), (old, request), (old, old_request)] {
+            let mut rec = record(0, None);
+            rec.model_request = Some(hash.to_hex().to_string());
+            ledger.record_step(id, &rec).unwrap();
+        }
+        ledger.transition(old, State::Executing).unwrap();
+        ledger.transition(old, State::Committed).unwrap();
+        rusqlite::Connection::open(dir.0.join("ledger.db"))
+            .unwrap()
+            .execute("UPDATE tasks SET finished_ms=0 WHERE id=?1", [old])
+            .unwrap();
+        let (tasks, blobs) = gc(&ledger, &cas, 1, 3 * 86_400_000).unwrap();
+        assert_eq!((tasks, blobs), (1, 2));
+        assert_eq!(
+            cas.get(&request).unwrap(),
+            br#"{"messages":[],"system":[]}"#
+        );
+        assert!(cas.get(&old_request).is_err());
+        assert!(cas.get(&orphan).is_err());
+        ledger.delete_task(live).unwrap();
+        assert_eq!(gc(&ledger, &cas, 1, 3 * 86_400_000).unwrap(), (0, 1));
+        assert!(cas.all().unwrap().is_empty());
     }
 }

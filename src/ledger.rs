@@ -2,7 +2,7 @@ use crate::{action::Action, challenge::ChallengeKind};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 
-const SELECT: &str = "SELECT id,title,steps,cursor,state,approved_step,finished_ms FROM tasks";
+const SELECT: &str = "SELECT id,title,steps,cursor,state,approved_step,finished_ms,goal FROM tasks";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Handoff {
@@ -21,6 +21,7 @@ pub enum State {
 pub struct Task {
     pub id: i64,
     pub title: String,
+    pub goal: Option<String>,
     pub steps: Vec<Action>,
     pub cursor: usize,
     pub state: State,
@@ -48,12 +49,23 @@ impl Ledger {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY, title TEXT NOT NULL, steps TEXT NOT NULL,
+                id INTEGER PRIMARY KEY, title TEXT NOT NULL, goal TEXT, steps TEXT NOT NULL,
                 cursor INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL,
                 approved_step INTEGER, finished_ms INTEGER
             );
             CREATE TABLE IF NOT EXISTS steps (seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, step INTEGER NOT NULL, json TEXT NOT NULL);",
         )?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let has_goal: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name='goal')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_goal {
+            tx.execute("ALTER TABLE tasks ADD COLUMN goal TEXT", [])?;
+        }
+        tx.commit()?;
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         Ok(Self { conn })
     }
@@ -62,9 +74,13 @@ impl Ledger {
         id: i64,
         record: &crate::audit::StepRecord,
     ) -> Result<(), LedgerError> {
+        let mut record = record.clone();
+        record.thought = record
+            .thought
+            .map(|s| s.chars().take(crate::audit::MAX_THOUGHT_CHARS).collect());
         self.conn.execute(
             "INSERT INTO steps (task_id, step, json) VALUES (?1, ?2, ?3)",
-            rusqlite::params![id, record.step, serde_json::to_string(record)?],
+            rusqlite::params![id, record.step, serde_json::to_string(&record)?],
         )?;
         Ok(())
     }
@@ -92,6 +108,28 @@ impl Ledger {
         )?;
         Ok(self.conn.last_insert_rowid())
     }
+    pub fn add_goal(&self, title: &str, goal: &str) -> Result<i64, LedgerError> {
+        self.conn.execute(
+            "INSERT INTO tasks (title, goal, steps, state) VALUES (?1, ?2, '[]', ?3)",
+            rusqlite::params![title, goal, serde_json::to_string(&State::Queued)?],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+    pub fn push_step(&self, id: i64, action: &Action) -> Result<usize, LedgerError> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let mut task = self.get(id)?;
+        let index = task.steps.len();
+        task.steps.push(action.clone());
+        tx.execute(
+            "UPDATE tasks SET steps=?2 WHERE id=?1",
+            rusqlite::params![id, serde_json::to_string(&task.steps)?],
+        )?;
+        tx.commit()?;
+        Ok(index)
+    }
     pub fn get(&self, id: i64) -> Result<Task, LedgerError> {
         let mut stmt = self.conn.prepare(&format!("{SELECT} WHERE id=?1"))?;
         let mut rows = stmt.query([id])?;
@@ -102,6 +140,7 @@ impl Ledger {
         Ok(Task {
             id: row.get(0)?,
             title: row.get(1)?,
+            goal: row.get(7)?,
             steps: serde_json::from_str(&row.get::<_, String>(2)?)?,
             cursor: row.get(3)?,
             state: serde_json::from_str(&row.get::<_, String>(4)?)?,
@@ -398,6 +437,7 @@ mod tests {
             Task {
                 id,
                 title: "first".into(),
+                goal: None,
                 steps,
                 cursor: 0,
                 state: State::Queued,
@@ -581,5 +621,123 @@ mod tests {
             Ledger::open(path).unwrap().get(id).unwrap().finished_ms,
             Some(finished)
         );
+    }
+    #[test]
+    fn goal_task_roundtrip() {
+        let dir = temp_dir("ledger-goal");
+        let path = dir.0.join("ledger.db");
+        let ledger = Ledger::open(&path).unwrap();
+        let goal = "Find the opening hours";
+        let id = ledger.add_goal("hours", goal).unwrap();
+        let task = ledger.get(id).unwrap();
+        assert_eq!(task.title, "hours");
+        assert_eq!(task.goal.as_deref(), Some(goal));
+        assert!(task.steps.is_empty());
+        assert_eq!(task.state, State::Queued);
+        assert_eq!(task.cursor, 0);
+        assert_eq!(ledger.next_queued().unwrap().unwrap(), task);
+        assert_eq!(ledger.list().unwrap(), vec![task.clone()]);
+        let scripted = ledger.add("scripted", &[]).unwrap();
+        assert!(ledger.get(scripted).unwrap().goal.is_none());
+        drop(ledger);
+        let ledger = Ledger::open(path).unwrap();
+        assert_eq!(ledger.get(id).unwrap(), task);
+    }
+    #[test]
+    fn push_step_appends() {
+        let dir = temp_dir("ledger-append");
+        let path = dir.0.join("ledger.db");
+        let ledger = Ledger::open(&path).unwrap();
+        let id = ledger.add_goal("append", "Read a heading").unwrap();
+        let nav = Action::Navigate {
+            url: "https://example.com".into(),
+        };
+        let extract = Action::Extract {
+            selector: "h1".into(),
+        };
+        assert_eq!(ledger.push_step(id, &nav).unwrap(), 0);
+        assert_eq!(ledger.push_step(id, &extract).unwrap(), 1);
+        assert_eq!(
+            ledger.get(id).unwrap().steps,
+            vec![nav.clone(), extract.clone()]
+        );
+        assert_eq!(ledger.get(id).unwrap().cursor, 0);
+        assert_eq!(
+            ledger.get(id).unwrap().goal.as_deref(),
+            Some("Read a heading")
+        );
+        assert!(matches!(
+            ledger.push_step(-1, &nav),
+            Err(LedgerError::NotFound(-1))
+        ));
+        let scripted = ledger.add("scripted", &[nav]).unwrap();
+        assert_eq!(ledger.push_step(scripted, &extract).unwrap(), 1);
+        drop(ledger);
+        let first = Ledger::open(&path).unwrap();
+        let second = Ledger::open(&path).unwrap();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let peer_gate = gate.clone();
+        let writer = std::thread::spawn(move || {
+            peer_gate.wait();
+            (0..10)
+                .map(|n| {
+                    let action = Action::Extract {
+                        selector: format!("#a{n}"),
+                    };
+                    (first.push_step(id, &action).unwrap(), action)
+                })
+                .collect::<Vec<_>>()
+        });
+        gate.wait();
+        let mut appended = (0..10)
+            .map(|n| {
+                let action = Action::Extract {
+                    selector: format!("#b{n}"),
+                };
+                (second.push_step(id, &action).unwrap(), action)
+            })
+            .collect::<Vec<_>>();
+        appended.extend(writer.join().unwrap());
+        let steps = second.get(id).unwrap().steps;
+        assert_eq!(steps.len(), 22);
+        let indices: std::collections::HashSet<_> = appended.iter().map(|(i, _)| *i).collect();
+        assert_eq!(indices.len(), 20);
+        for (index, action) in appended {
+            assert_eq!(steps[index], action);
+        }
+    }
+    #[test]
+    fn old_db_gains_goal_column() {
+        let dir = temp_dir("ledger-old-schema");
+        let path = dir.0.join("ledger.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(r#"
+            CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, steps TEXT NOT NULL,
+                cursor INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, approved_step INTEGER, finished_ms INTEGER);
+            CREATE TABLE steps (seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, step INTEGER NOT NULL, json TEXT NOT NULL);
+            INSERT INTO tasks(id,title,steps,cursor,state) VALUES(1,'old','[{"op":"extract","selector":"h1"}]',1,'"Committed"');
+            INSERT INTO steps(task_id,step,json) VALUES(1,0,'{"step":0,"action":{"op":"extract","selector":"h1"},"decision":"auto","after":null,"outcome":"old heading","at_ms":1}');
+        "#).unwrap();
+        drop(conn);
+        let ledger = Ledger::open(&path).unwrap();
+        assert_eq!(ledger.get(1).unwrap().goal, None);
+        assert_eq!(
+            ledger.get(1).unwrap().steps,
+            vec![Action::Extract {
+                selector: "h1".into()
+            }]
+        );
+        assert_eq!(ledger.get(1).unwrap().cursor, 1);
+        assert_eq!(ledger.get(1).unwrap().state, State::Committed);
+        let records = ledger.records(1).unwrap();
+        assert_eq!(records[0].outcome, "old heading");
+        assert_eq!(records[0].thought, None);
+        assert_eq!(records[0].model_request, None);
+        let id = ledger.add_goal("new", "Read more").unwrap();
+        assert_eq!(ledger.get(id).unwrap().goal.as_deref(), Some("Read more"));
+        drop(ledger);
+        let reopened = Ledger::open(path).unwrap();
+        assert_eq!(reopened.get(id).unwrap().goal.as_deref(), Some("Read more"));
+        assert_eq!(reopened.records(1).unwrap(), records);
     }
 }

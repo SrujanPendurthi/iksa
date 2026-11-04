@@ -233,7 +233,7 @@ fn run_with_empty_queue() {
 }
 
 #[test]
-fn key_and_secret_set_use_fake_keychain() {
+fn secret_set_uses_fake_keychain() {
     let h = TempDir::new();
     let fake = TempDir::new();
     for (args, path, value) in [
@@ -269,4 +269,82 @@ fn key_and_secret_set_use_fake_keychain() {
             0o600
         );
     }
+}
+
+#[test]
+fn ask_without_model_refuses() {
+    let h = TempDir::new();
+    let o = cmd(&h)
+        .args(["ask", "Read", "the", "page"])
+        .env("CHROMIUM", "/nonexistent")
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(o.stderr).unwrap().trim(),
+        "error: configure \"model\" in config.json"
+    );
+    assert!(
+        Ledger::open(h.0.join("ledger.db"))
+            .unwrap()
+            .list()
+            .unwrap()
+            .is_empty()
+    );
+}
+#[test]
+fn ask_queues_goal_task() {
+    let h = TempDir::new();
+    let mut cfg = Config::default();
+    cfg.model = Some(serde_json::from_value(serde_json::json!({"provider":"anthropic","endpoint":"http://127.0.0.1:1","name":"test-model"})).unwrap());
+    std::fs::write(h.0.join("config.json"), serde_json::to_vec(&cfg).unwrap()).unwrap();
+    let words = [
+        "Open",
+        "https://example.com/",
+        "and",
+        "read",
+        "the",
+        "title",
+    ];
+    let o = cmd(&h)
+        .arg("ask")
+        .args(words)
+        .env("CHROMIUM", "/nonexistent")
+        .output()
+        .unwrap();
+    let id: i64 = ok(o).trim().parse().unwrap();
+    let ledger = Ledger::open(h.0.join("ledger.db")).unwrap();
+    let goal = "Open https://example.com/ and read the title";
+    let queued = ledger.get(id).unwrap();
+    assert_eq!(queued.goal.as_deref(), Some(goal));
+    assert_eq!(queued.title, goal);
+    assert_eq!(queued.state, State::Queued);
+    assert!(queued.steps.is_empty());
+    assert_eq!(queued.cursor, 0);
+    let scripted = add(&h);
+    let list = ok(run(&h, &["list"]));
+    assert!(
+        list.lines()
+            .any(|line| line.starts_with(&format!("{id}\t[goal] "))
+                && line.contains(goal)
+                && line.ends_with("Queued")),
+        "{list}"
+    );
+    assert!(
+        list.lines()
+            .any(|line| line.starts_with(&format!("{scripted}\thello\t"))
+                && !line.contains("[goal]")),
+        "{list}"
+    );
+    for args in [vec!["ask"], vec!["ask", "   "]] {
+        let o = run(&h, &args);
+        assert_eq!(o.status.code(), Some(2));
+        let usage = String::from_utf8(o.stderr).unwrap();
+        assert!(usage.contains("ask <goal"), "{usage}");
+        assert!(
+            usage.contains("key set") && usage.contains("secret set"),
+            "{usage}"
+        );
+    }
+    assert_eq!(ledger.list().unwrap().len(), 2);
 }

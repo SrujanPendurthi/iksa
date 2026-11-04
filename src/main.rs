@@ -24,7 +24,7 @@ struct TaskInput {
     title: String,
     steps: Vec<Action>,
 }
-const USAGE: &str = "usage: iksa setup | add <task.json|-> | key set | secret set <name> | run | list | approve <id> | resume <id> | report <id> | gc";
+const USAGE: &str = "usage: iksa setup | add <task.json|-> | ask <goal…> | key set | secret set <name> | run | list | approve <id> | resume <id> | report <id> | gc";
 #[tokio::main]
 async fn main() {
     let result = execute().await;
@@ -70,6 +70,12 @@ async fn execute() -> anyhow::Result<i32> {
             keychain::set_interactive("iksa-secret", name)?;
         }
         ["setup"] => println!("{}", setup::install(&home)?.display()),
+        ["ask", ref words @ ..] if words.iter().any(|word| !word.trim().is_empty()) => {
+            let (cfg, ledger, _) = open()?;
+            anyhow::ensure!(cfg.model.is_some(), "configure \"model\" in config.json");
+            let goal = words.join(" ");
+            println!("{}", ledger.add_goal(&goal, &goal)?);
+        }
         ["add", path] => {
             let (_, ledger, _) = open()?;
             let mut json = String::new();
@@ -98,7 +104,13 @@ async fn execute() -> anyhow::Result<i32> {
         }
         ["list"] => {
             for t in open()?.1.list()? {
-                println!("{}\t{}\t{:?}", t.id, t.title, t.state);
+                println!(
+                    "{}\t{}{}\t{:?}",
+                    t.id,
+                    if t.goal.is_some() { "[goal] " } else { "" },
+                    t.title,
+                    t.state
+                );
             }
         }
         ["approve", n] if id(n).is_some() => open()?.1.approve(id(n).unwrap())?,

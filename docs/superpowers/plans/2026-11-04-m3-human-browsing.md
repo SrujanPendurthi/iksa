@@ -18,6 +18,19 @@
 - `docs/perf.md` H2 (deferred address-bar check).
 - M2b plan: `docs/superpowers/plans/2026-11-04-m2b-proactive.md`.
 
+## User-confirmed choices (2026-11-04)
+
+Reviewed and approved by the user. Codex must not change these without a new decision from the user.
+
+1. **Cookie sharing is off until the user lists sites** in `share_cookies`.
+   - The agent acts as the user only on listed sites, because logged-in pages carry account data to the model.
+   - Changes the agent makes to cookies are copied back only when its task is `Committed`.
+   - If the human changed the same cookie meanwhile, the human's value is kept. (Task 4)
+2. **A CAPTCHA-paused task stays live for 15 minutes** (`HOLD`), so the user can solve it in Agent View and the agent continues on the same page. After that it falls back to replaying its steps from the start. (Task 5)
+3. **The lock never applies to read-only steps**, and standing grants don't override it. Approving the step does. (Task 7)
+4. **Memory is tight:** 5 tabs + 3 agents already measured 98–99.5% of 1.2 GB. If the extension pushes it over, stop and report BLOCKED with the numbers; never raise the limit. (Global Constraints, Task 8)
+5. **The extension loading method is checked first.** `--load-extension` worked in spike S4. Task 0's first test confirms it on the pinned 156 build; if not, fall back to CDP `Extensions.loadUnpacked` with `--enable-unsafe-extension-debugging` and record which was used. (Task 0)
+
 ## Decisions this plan makes
 
 - **Prerequisite:** M2b is complete (daemon, `schedule.rs`, `Handoff::Paused`, grants, `domain_matches`). M3 changes `daemon.rs`/`engine.rs` and runs no tasks of its own.

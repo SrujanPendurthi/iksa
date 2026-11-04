@@ -7,7 +7,7 @@ use iksa::{
     engine::Engine,
     keychain,
     ledger::{Handoff, Ledger, State},
-    setup,
+    schedule, setup,
 };
 use serde::Deserialize;
 use std::{
@@ -24,7 +24,14 @@ struct TaskInput {
     title: String,
     steps: Vec<Action>,
 }
-const USAGE: &str = "usage: iksa setup | add <task.json|-> | ask <goal…> | key set | secret set <name> | run | list | inbox | accept <id> | dismiss <id> | approve <id> | resume <id> | report <id> | gc";
+const USAGE: &str = "usage: iksa setup | add <task.json|-> | ask <goal…> | key set | secret set <name> | schedule add [--auto] <spec> <goal…> | schedule list | schedule set <id> auto|suggest | schedule rm <id> | run | list | inbox | accept <id> | dismiss <id> | approve <id> | resume <id> | report <id> | gc";
+fn local_time(ms: u64) -> String {
+    let c = schedule::local(ms);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} local",
+        c.year, c.month, c.day, c.hour, c.minute
+    )
+}
 #[tokio::main]
 async fn main() {
     let result = execute().await;
@@ -76,6 +83,55 @@ async fn execute() -> anyhow::Result<i32> {
             let goal = words.join(" ");
             println!("{}", ledger.add_goal(&goal, &goal)?);
         }
+        ["schedule", "add", ref words @ ..] => {
+            let (auto, words) = if words.first() == Some(&"--auto") {
+                (true, &words[1..])
+            } else {
+                (false, &words[..])
+            };
+            if words.len() < 2 || !words[1..].iter().any(|word| !word.trim().is_empty()) {
+                eprintln!("{USAGE}");
+                return Ok(2);
+            }
+            let (cfg, ledger, _) = open()?;
+            anyhow::ensure!(cfg.model.is_some(), "configure \"model\" in config.json");
+            let spec = match schedule::parse(words[0]) {
+                Ok(spec) => spec,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    return Ok(2);
+                }
+            };
+            let Some(next) = schedule::next_fire_ms(&spec, audit::now_ms()) else {
+                eprintln!(
+                    "error: schedule {:?} never fires or timestamp overflows",
+                    words[0]
+                );
+                return Ok(2);
+            };
+            let id = ledger.add_schedule(words[0], &words[1..].join(" "), auto, next)?;
+            println!("{id}\tnext {}", local_time(next));
+        }
+        ["schedule", "list"] => {
+            for s in open()?.1.schedules()? {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}/{} accepted\t{}",
+                    s.id,
+                    s.spec,
+                    local_time(s.next_ms),
+                    if s.auto { "auto" } else { "suggest" },
+                    s.accepted,
+                    u64::from(s.accepted) + u64::from(s.dismissed),
+                    s.goal
+                );
+            }
+        }
+        ["schedule", "set", n, mode] if id(n).is_some() && matches!(mode, "auto" | "suggest") => {
+            open()?
+                .1
+                .set_schedule_auto(id(n).unwrap(), mode == "auto")?;
+        }
+        ["schedule", "rm", n] if id(n).is_some() => open()?.1.remove_schedule(id(n).unwrap())?,
         ["add", path] => {
             let (_, ledger, _) = open()?;
             let mut json = String::new();

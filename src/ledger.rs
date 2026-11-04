@@ -1,8 +1,10 @@
 use crate::{action::Action, challenge::ChallengeKind};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 
-const SELECT: &str = "SELECT id,title,steps,cursor,state,approved_step,finished_ms,goal FROM tasks";
+const SELECT: &str =
+    "SELECT id,title,steps,cursor,state,approved_step,finished_ms,goal,schedule_id FROM tasks";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Handoff {
@@ -30,11 +32,23 @@ pub struct Task {
     pub id: i64,
     pub title: String,
     pub goal: Option<String>,
+    pub schedule_id: Option<i64>,
     pub steps: Vec<Action>,
     pub cursor: usize,
     pub state: State,
     pub approved_step: Option<usize>,
     pub finished_ms: Option<u64>,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Schedule {
+    pub id: i64,
+    pub spec: String,
+    pub goal: String,
+    pub auto: bool,
+    pub next_ms: u64,
+    pub last_task: Option<i64>,
+    pub accepted: u32,
+    pub dismissed: u32,
 }
 pub struct Ledger {
     conn: rusqlite::Connection,
@@ -50,18 +64,30 @@ impl Ledger {
                 cursor INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL,
                 approved_step INTEGER, finished_ms INTEGER
             );
-            CREATE TABLE IF NOT EXISTS steps (seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, step INTEGER NOT NULL, json TEXT NOT NULL);",
+            CREATE TABLE IF NOT EXISTS steps (seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, step INTEGER NOT NULL, json TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, spec TEXT NOT NULL, goal TEXT NOT NULL,
+                auto INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL, last_task INTEGER);",
         )?;
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
-        let has_goal: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name='goal')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_goal {
-            tx.execute("ALTER TABLE tasks ADD COLUMN goal TEXT", [])?;
+        for (name, kind) in [
+            ("goal", "TEXT"),
+            ("schedule_id", "INTEGER"),
+            ("accepted_ms", "INTEGER"),
+        ] {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name=?1)",
+                [name],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                tx.execute(&format!("ALTER TABLE tasks ADD COLUMN {name} {kind}"), [])?;
+            }
         }
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS tasks_by_schedule ON tasks(schedule_id)",
+            [],
+        )?;
         tx.commit()?;
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         Ok(Self { conn })
@@ -113,6 +139,16 @@ impl Ledger {
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
         )?;
+        let id = Self::unique_goal(&tx, goal, &State::Suggested, None)?;
+        tx.commit()?;
+        Ok(id)
+    }
+    fn unique_goal(
+        tx: &rusqlite::Transaction<'_>,
+        goal: &str,
+        state: &State,
+        schedule_id: Option<i64>,
+    ) -> anyhow::Result<Option<i64>> {
         {
             let mut stmt = tx.prepare("SELECT state FROM tasks WHERE goal=?1")?;
             let rows = stmt.query_map([goal], |row| row.get::<_, String>(0))?;
@@ -123,12 +159,10 @@ impl Ledger {
             }
         }
         tx.execute(
-            "INSERT INTO tasks (title, goal, steps, state) VALUES (?1, ?1, '[]', ?2)",
-            rusqlite::params![goal, serde_json::to_string(&State::Suggested)?],
+            "INSERT INTO tasks (title, goal, steps, state, schedule_id) VALUES (?1, ?1, '[]', ?2, ?3)",
+            rusqlite::params![goal, serde_json::to_string(state)?, schedule_id],
         )?;
-        let id = tx.last_insert_rowid();
-        tx.commit()?;
-        Ok(Some(id))
+        Ok(Some(tx.last_insert_rowid()))
     }
     pub fn accept(&self, id: i64) -> anyhow::Result<()> {
         self.transition_from(id, State::Suggested, State::Queued, None)
@@ -156,6 +190,121 @@ impl Ledger {
         tx.commit()?;
         Ok(index)
     }
+    pub fn add_schedule(
+        &self,
+        spec: &str,
+        goal: &str,
+        auto: bool,
+        next_ms: u64,
+    ) -> anyhow::Result<i64> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let count: i64 = tx.query_row("SELECT count(*) FROM schedules", [], |row| row.get(0))?;
+        anyhow::ensure!(count < 32, "at most 32 schedules");
+        tx.execute(
+            "INSERT INTO schedules (spec, goal, auto, next_ms) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![spec, goal, auto, next_ms],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+    pub fn set_schedule_auto(&self, id: i64, auto: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.conn.execute(
+                "UPDATE schedules SET auto=?2 WHERE id=?1",
+                rusqlite::params![id, auto]
+            )? > 0,
+            "schedule {id} not found"
+        );
+        Ok(())
+    }
+    pub fn remove_schedule(&self, id: i64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.conn
+                .execute("DELETE FROM schedules WHERE id=?1", [id])?
+                > 0,
+            "schedule {id} not found"
+        );
+        Ok(())
+    }
+    pub fn schedules(&self) -> anyhow::Result<Vec<Schedule>> {
+        let mut stmt = self.conn.prepare("SELECT s.id, s.spec, s.goal, s.auto, s.next_ms, s.last_task,
+            count(CASE WHEN t.accepted_ms IS NOT NULL THEN 1 END), count(CASE WHEN t.state=?1 THEN 1 END)
+            FROM schedules s LEFT JOIN tasks t ON t.schedule_id=s.id GROUP BY s.id ORDER BY s.id")?;
+        let rows = stmt.query_map([serde_json::to_string(&State::Dismissed)?], |row| {
+            Ok(Schedule {
+                id: row.get(0)?,
+                spec: row.get(1)?,
+                goal: row.get(2)?,
+                auto: row.get(3)?,
+                next_ms: row.get(4)?,
+                last_task: row.get(5)?,
+                accepted: row.get(6)?,
+                dismissed: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+    pub fn fire_due(
+        &self,
+        now_ms: u64,
+        next: impl Fn(&str, u64) -> u64,
+    ) -> anyhow::Result<Vec<i64>> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let mut ids = Vec::new();
+        for schedule in self
+            .schedules()?
+            .into_iter()
+            .filter(|s| s.next_ms <= now_ms)
+        {
+            let next_ms = next(&schedule.spec, now_ms);
+            anyhow::ensure!(
+                next_ms > now_ms,
+                "schedule {}: next fire must be after now",
+                schedule.id
+            );
+            let last: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM tasks WHERE id=?1 AND schedule_id=?2",
+                    rusqlite::params![schedule.last_task, schedule.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let last = last
+                .as_deref()
+                .map(serde_json::from_str::<State>)
+                .transpose()?;
+            let id = if last.as_ref().is_some_and(is_open) {
+                None
+            } else {
+                Self::unique_goal(
+                    &tx,
+                    &schedule.goal,
+                    if schedule.auto {
+                        &State::Queued
+                    } else {
+                        &State::Suggested
+                    },
+                    Some(schedule.id),
+                )?
+            };
+            tx.execute(
+                "UPDATE schedules SET next_ms=?2, last_task=COALESCE(?3, last_task) WHERE id=?1",
+                rusqlite::params![schedule.id, next_ms, id],
+            )?;
+            if let Some(id) = id {
+                ids.push(id);
+            }
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
     pub fn get(&self, id: i64) -> anyhow::Result<Task> {
         let mut stmt = self.conn.prepare(&format!("{SELECT} WHERE id=?1"))?;
         let mut rows = stmt.query([id])?;
@@ -169,6 +318,7 @@ impl Ledger {
             id: row.get(0)?,
             title: row.get(1)?,
             goal: row.get(7)?,
+            schedule_id: row.get(8)?,
             steps: serde_json::from_str(&row.get::<_, String>(2)?)?,
             cursor: row.get(3)?,
             state: serde_json::from_str(&row.get::<_, String>(4)?)?,
@@ -235,8 +385,8 @@ impl Ledger {
             })
             .transpose()?;
         if self.conn.execute(
-            "UPDATE tasks SET state=?2, finished_ms=CASE WHEN ?3 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) END, steps=COALESCE(?5, steps) WHERE id=?1 AND state=?4",
-            rusqlite::params![id, serde_json::to_string(&to)?, terminal, serde_json::to_string(&from)?, redacted],
+            "UPDATE tasks SET state=?2, finished_ms=CASE WHEN ?3 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) END, steps=COALESCE(?5, steps), accepted_ms=CASE WHEN ?6 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) ELSE accepted_ms END WHERE id=?1 AND state=?4",
+            rusqlite::params![id, serde_json::to_string(&to)?, terminal, serde_json::to_string(&from)?, redacted, from == State::Suggested && to == State::Queued],
         )? == 0 {
             anyhow::bail!("illegal transition from {:?} to {to:?}", self.get(id)?.state);
         }
@@ -484,7 +634,8 @@ mod tests {
                 cursor: 0,
                 state: State::Queued,
                 approved_step: None,
-                finished_ms: None
+                finished_ms: None,
+                schedule_id: None,
             }
         );
         assert_eq!(
@@ -910,5 +1061,278 @@ mod tests {
         assert_eq!(results.iter().filter(|r| r.is_some()).count(), 1);
         assert_eq!(second.list().unwrap().len(), 1);
         assert_eq!(second.list().unwrap()[0].state, State::Suggested);
+    }
+    #[test]
+    fn fire_due_creates_and_advances() {
+        let dir = temp_dir("schedules-fire");
+        let path = dir.0.join("ledger.db");
+        let ledger = Ledger::open(&path).unwrap();
+        let suggest = ledger
+            .add_schedule("every 5m", "suggested", false, 0)
+            .unwrap();
+        let auto = ledger
+            .add_schedule("every 1h", "automatic", true, 0)
+            .unwrap();
+        let ids = ledger.fire_due(1000, |_, now| now + 60_000).unwrap();
+        assert_eq!(ids.len(), 2);
+        for (id, schedule_id, state) in [
+            (ids[0], suggest, State::Suggested),
+            (ids[1], auto, State::Queued),
+        ] {
+            let task = ledger.get(id).unwrap();
+            assert_eq!(task.schedule_id, Some(schedule_id));
+            assert_eq!(task.state, state);
+            assert!(task.steps.is_empty());
+        }
+        let schedules = ledger.schedules().unwrap();
+        assert_eq!(schedules[0].last_task, Some(ids[0]));
+        assert_eq!(schedules[1].last_task, Some(ids[1]));
+        assert!(schedules.iter().all(|s| s.next_ms == 61_000));
+        assert!(
+            ledger
+                .fire_due(1000, |_, _| panic!("not due"))
+                .unwrap()
+                .is_empty()
+        );
+        drop(ledger);
+        assert_eq!(Ledger::open(path).unwrap().schedules().unwrap(), schedules);
+    }
+    #[test]
+    fn schedule_trial_counts() {
+        let dir = temp_dir("schedules-trials");
+        let path = dir.0.join("ledger.db");
+        let ledger = Ledger::open(&path).unwrap();
+        let sid = ledger.add_schedule("every 5m", "trial", false, 0).unwrap();
+        for now in 0..3 {
+            let id = ledger.fire_due(now, |_, n| n + 1).unwrap()[0];
+            if now == 0 {
+                ledger.accept(id).unwrap();
+                assert_eq!(ledger.schedules().unwrap()[0].accepted, 1);
+                ledger.transition(id, State::Executing).unwrap();
+                ledger.transition(id, State::Committed).unwrap();
+            } else {
+                ledger.dismiss(id).unwrap();
+            }
+        }
+        let s = &ledger.schedules().unwrap()[0];
+        assert_eq!((s.accepted, s.dismissed), (1, 2));
+        ledger.set_schedule_auto(sid, true).unwrap();
+        let auto = ledger.fire_due(3, |_, n| n + 1).unwrap()[0];
+        assert_eq!(ledger.get(auto).unwrap().state, State::Queued);
+        ledger.transition(auto, State::Executing).unwrap();
+        ledger.transition(auto, State::Committed).unwrap();
+        ledger.set_schedule_auto(sid, false).unwrap();
+        let trial = ledger.fire_due(4, |_, n| n + 1).unwrap()[0];
+        ledger.transition(trial, State::Queued).unwrap();
+        ledger.transition(trial, State::Executing).unwrap();
+        ledger
+            .transition(trial, State::Failed("unavailable".into()))
+            .unwrap();
+        drop(ledger);
+        let s = &Ledger::open(path).unwrap().schedules().unwrap()[0];
+        assert_eq!((s.accepted, s.dismissed), (2, 2));
+    }
+    #[test]
+    fn schedule_cap() {
+        let dir = temp_dir("schedules-cap");
+        let path = dir.0.join("ledger.db");
+        let ledger = Ledger::open(&path).unwrap();
+        let mut last = 0;
+        for n in 0..32 {
+            last = ledger
+                .add_schedule("every 5m", &format!("goal {n}"), false, 0)
+                .unwrap();
+        }
+        assert!(
+            ledger
+                .add_schedule("every 5m", "overflow", false, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("at most 32 schedules")
+        );
+        ledger.remove_schedule(last).unwrap();
+        let second = Ledger::open(&path).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let peer = barrier.clone();
+        let writer = std::thread::spawn(move || {
+            peer.wait();
+            second.add_schedule("every 5m", "concurrent", false, 0)
+        });
+        barrier.wait();
+        let results = [
+            ledger.add_schedule("every 5m", "concurrent", false, 0),
+            writer.join().unwrap(),
+        ];
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert!(
+            results
+                .into_iter()
+                .find_map(Result::err)
+                .unwrap()
+                .to_string()
+                .contains("at most 32 schedules")
+        );
+        assert_eq!(ledger.schedules().unwrap().len(), 32);
+    }
+    #[test]
+    fn missed_runs_collapse() {
+        let dir = temp_dir("schedules-missed");
+        let ledger = Ledger::open(dir.0.join("ledger.db")).unwrap();
+        ledger.add_schedule("every 1h", "missed", true, 0).unwrap();
+        let now = 72 * 3_600_000;
+        let ids = ledger
+            .fire_due(now, |spec, n| {
+                assert_eq!(spec, "every 1h");
+                assert_eq!(n, now);
+                n + 3_600_000
+            })
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ledger.list().unwrap().len(), 1);
+        assert_eq!(ledger.schedules().unwrap()[0].next_ms, now + 3_600_000);
+    }
+    #[test]
+    fn open_task_skips_fire() {
+        let dir = temp_dir("schedules-open");
+        let ledger = Ledger::open(dir.0.join("ledger.db")).unwrap();
+        let sid = ledger.add_schedule("every 5m", "open", true, 0).unwrap();
+        let id = ledger.fire_due(1000, |_, n| n + 60_000).unwrap()[0];
+        assert_eq!(ledger.get(id).unwrap().state, State::Queued);
+        for state in [
+            State::Queued,
+            State::Executing,
+            State::AwaitingHandoff(Handoff::Approval),
+        ] {
+            if state != State::Queued {
+                ledger.transition(id, state).unwrap();
+            }
+            ledger
+                .conn
+                .execute("UPDATE schedules SET next_ms=0 WHERE id=?1", [sid])
+                .unwrap();
+            assert!(ledger.fire_due(2000, |_, n| n + 60_000).unwrap().is_empty());
+            assert_eq!(ledger.schedules().unwrap()[0].next_ms, 62_000);
+        }
+        ledger
+            .transition(id, State::Failed("stopped".into()))
+            .unwrap();
+        ledger
+            .conn
+            .execute("UPDATE schedules SET next_ms=0 WHERE id=?1", [sid])
+            .unwrap();
+        let second = ledger.fire_due(3000, |_, n| n + 60_000).unwrap()[0];
+        ledger.delete_task(second).unwrap();
+        // A reused task ID from an unrelated manual goal must not block this schedule.
+        let manual = ledger.add_goal("manual", "different goal").unwrap();
+        assert_eq!(manual, second);
+        ledger
+            .conn
+            .execute("UPDATE schedules SET next_ms=0 WHERE id=?1", [sid])
+            .unwrap();
+        assert_eq!(ledger.fire_due(4000, |_, n| n + 60_000).unwrap().len(), 1);
+    }
+    #[test]
+    fn schedules_dedupe_and_keep_history() {
+        let dir = temp_dir("schedules-dedupe");
+        let ledger = Ledger::open(dir.0.join("ledger.db")).unwrap();
+        let manual = ledger.add_goal("manual", "same").unwrap();
+        let first = ledger.add_schedule("every 5m", "same", true, 0).unwrap();
+        let second = ledger.add_schedule("every 1h", "same", false, 0).unwrap();
+        assert!(ledger.fire_due(0, |_, n| n + 1).unwrap().is_empty());
+        assert!(
+            ledger
+                .schedules()
+                .unwrap()
+                .iter()
+                .all(|s| s.next_ms == 1 && s.last_task.is_none())
+        );
+        ledger.transition(manual, State::Executing).unwrap();
+        ledger.transition(manual, State::Committed).unwrap();
+        let id = ledger.fire_due(1, |_, n| n + 1).unwrap()[0];
+        assert_eq!(ledger.list().unwrap().len(), 2);
+        assert_eq!(ledger.get(id).unwrap().schedule_id, Some(first));
+        assert!(ledger.fire_due(2, |_, n| n + 1).unwrap().is_empty());
+        ledger.remove_schedule(first).unwrap();
+        assert_eq!(ledger.get(id).unwrap().schedule_id, Some(first));
+        ledger.remove_schedule(second).unwrap();
+        let replacement = ledger
+            .add_schedule("every 5m", "replacement", false, 0)
+            .unwrap();
+        assert!(
+            replacement > second,
+            "removed schedule ids must not be reused"
+        );
+        let s = &ledger.schedules().unwrap()[0];
+        assert_eq!((s.accepted, s.dismissed), (0, 0));
+        assert_eq!(
+            ledger.remove_schedule(first).unwrap_err().to_string(),
+            format!("schedule {first} not found")
+        );
+        assert_eq!(
+            ledger.set_schedule_auto(-1, true).unwrap_err().to_string(),
+            "schedule -1 not found"
+        );
+    }
+    #[test]
+    fn concurrent_fire_due_once() {
+        let dir = temp_dir("schedules-concurrent");
+        let path = dir.0.join("ledger.db");
+        let first = Ledger::open(&path).unwrap();
+        first.add_schedule("every 5m", "once", false, 0).unwrap();
+        let second = Ledger::open(&path).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let peer = barrier.clone();
+        let writer = std::thread::spawn(move || {
+            peer.wait();
+            first.fire_due(1000, |_, n| n + 60_000).unwrap()
+        });
+        barrier.wait();
+        let mut ids = second.fire_due(1000, |_, n| n + 60_000).unwrap();
+        ids.extend(writer.join().unwrap());
+        assert_eq!(ids.len(), 1);
+        assert_eq!(second.list().unwrap().len(), 1);
+        assert_eq!(second.schedules().unwrap()[0].next_ms, 61_000);
+    }
+    #[test]
+    fn fire_due_rolls_back_invalid_advance() {
+        let dir = temp_dir("schedules-rollback");
+        let ledger = Ledger::open(dir.0.join("ledger.db")).unwrap();
+        ledger.add_schedule("every 5m", "first", false, 0).unwrap();
+        ledger.add_schedule("every 1h", "second", false, 0).unwrap();
+        let error = ledger
+            .fire_due(
+                1000,
+                |spec, n| if spec == "every 1h" { n } else { n + 60_000 },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("next fire must be after now"));
+        assert!(ledger.list().unwrap().is_empty());
+        assert!(
+            ledger
+                .schedules()
+                .unwrap()
+                .iter()
+                .all(|s| s.next_ms == 0 && s.last_task.is_none())
+        );
+    }
+    #[test]
+    fn old_db_gains_schedule_column() {
+        let dir = temp_dir("schedules-migrate");
+        let path = dir.0.join("ledger.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(r#"CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, goal TEXT, steps TEXT NOT NULL,
+            cursor INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, approved_step INTEGER, finished_ms INTEGER);
+            INSERT INTO tasks(id,title,goal,steps,state) VALUES(1,'legacy','legacy','[]','"Queued"');"#).unwrap();
+        drop(conn);
+        let ledger = Ledger::open(&path).unwrap();
+        assert_eq!(ledger.get(1).unwrap().schedule_id, None);
+        let sid = ledger.add_schedule("every 5m", "new", false, 0).unwrap();
+        let id = ledger.fire_due(0, |_, n| n + 1).unwrap()[0];
+        ledger.accept(id).unwrap();
+        drop(ledger);
+        let ledger = Ledger::open(path).unwrap();
+        assert_eq!(ledger.get(1).unwrap().goal.as_deref(), Some("legacy"));
+        assert_eq!(ledger.get(id).unwrap().schedule_id, Some(sid));
+        assert_eq!(ledger.schedules().unwrap()[0].accepted, 1);
     }
 }

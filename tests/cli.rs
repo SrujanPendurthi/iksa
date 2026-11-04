@@ -414,3 +414,103 @@ fn inbox_accept_dismiss() {
     assert_eq!(run(&h, &["dismiss", &first_id]).status.code(), Some(1));
     assert_eq!(ledger.get(first).unwrap().state, State::Queued);
 }
+
+fn schedule_model(h: &TempDir) {
+    let mut cfg = Config::default();
+    cfg.model = Some(serde_json::from_value(serde_json::json!({"provider":"anthropic","endpoint":"http://127.0.0.1:1","name":"test-model"})).unwrap());
+    std::fs::write(h.0.join("config.json"), serde_json::to_vec(&cfg).unwrap()).unwrap();
+}
+#[test]
+fn schedule_add_list_rm() {
+    let h = TempDir::new();
+    schedule_model(&h);
+    let before = iksa::audit::now_ms();
+    let added = ok(run(&h, &["schedule", "add", "every 2h", "check", "hn"]));
+    let after = iksa::audit::now_ms();
+    let ledger = Ledger::open(h.0.join("ledger.db")).unwrap();
+    let schedules = ledger.schedules().unwrap();
+    assert_eq!(schedules.len(), 1);
+    let s = &schedules[0];
+    assert_eq!(s.goal, "check hn");
+    assert!(!s.auto);
+    assert!((before + 7_200_000..=after + 7_200_000).contains(&s.next_ms));
+    let c = iksa::schedule::local(s.next_ms);
+    let date = format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} local",
+        c.year, c.month, c.day, c.hour, c.minute
+    );
+    assert_eq!(added, format!("{}\tnext {date}\n", s.id));
+    let id = s.id.to_string();
+    assert_eq!(
+        ok(run(&h, &["schedule", "list"])),
+        format!("{id}\tevery 2h\t{date}\tsuggest\t0/0 accepted\tcheck hn\n")
+    );
+    ok(run(&h, &["schedule", "set", &id, "auto"]));
+    assert!(ok(run(&h, &["schedule", "list"])).contains("\tauto\t"));
+    ok(run(&h, &["schedule", "set", &id, "suggest"]));
+    assert!(!ledger.schedules().unwrap()[0].auto);
+    ok(run(
+        &h,
+        &["schedule", "add", "--auto", "0 9 * * 1", "weekly", "digest"],
+    ));
+    assert!(ledger.schedules().unwrap()[1].auto);
+    ok(run(&h, &["schedule", "rm", &id]));
+    assert_eq!(ok(run(&h, &["schedule", "list"])).lines().count(), 1);
+    let out = run(&h, &["schedule", "rm", "9"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "error: schedule 9 not found\n"
+    );
+    assert!(
+        ledger.list().unwrap().is_empty(),
+        "adding schedules must not run their goals"
+    );
+    assert!(!h.0.join("profile").exists());
+}
+#[test]
+fn bad_spec_is_usage_error() {
+    let h = TempDir::new();
+    let out = run(&h, &["schedule", "add", "every 5m", "x"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("configure \"model\""));
+    schedule_model(&h);
+    for (spec, reason) in [
+        ("every 5s", "every 5s"),
+        ("every 4m", "every 4m"),
+        ("0 0 30 2 *", "never fires"),
+        ("every 18446744073709551615d", "invalid interval"),
+    ] {
+        let out = run(&h, &["schedule", "add", spec, "x"]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{spec}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(reason),
+            "{spec}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    for args in [
+        vec!["schedule", "add"],
+        vec!["schedule", "add", "every 5m"],
+        vec!["schedule", "add", "--auto", "every 5m", " "],
+        vec!["schedule", "set", "abc", "auto"],
+        vec!["schedule", "set", "1", "other"],
+        vec!["schedule", "rm", "abc"],
+    ] {
+        let out = run(&h, &args);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("usage:"));
+    }
+    assert!(
+        Ledger::open(h.0.join("ledger.db"))
+            .unwrap()
+            .schedules()
+            .unwrap()
+            .is_empty()
+    );
+}

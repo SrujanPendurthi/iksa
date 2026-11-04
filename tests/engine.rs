@@ -521,3 +521,201 @@ async fn missing_selector_names_it() {
         "{state:?}"
     );
 }
+
+async fn observation_page(b: &iksa::cdp::Browser, path: &str) -> String {
+    use serde_json::json;
+    let t = b
+        .call(
+            "Target.createTarget",
+            json!({"url":"about:blank", "hidden":true}),
+            None,
+        )
+        .await
+        .unwrap();
+    let s = b
+        .call(
+            "Target.attachToTarget",
+            json!({"targetId":t["targetId"],"flatten":true}),
+            None,
+        )
+        .await
+        .unwrap()["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    b.call(
+        "Emulation.setDeviceMetricsOverride",
+        json!({"width":1280,"height":800,"deviceScaleFactor":1,"mobile":false}),
+        Some(&s),
+    )
+    .await
+    .unwrap();
+    b.call("Page.enable", json!({}), Some(&s)).await.unwrap();
+    let mut events = b.events();
+    b.call("Page.navigate", json!({"url":path}), Some(&s))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let e = events.recv().await.unwrap();
+            if e.method == "Page.loadEventFired" && e.session_id.as_deref() == Some(&s) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    s
+}
+async fn eval_page(b: &iksa::cdp::Browser, s: &str, expression: &str) -> serde_json::Value {
+    let r = b
+        .call(
+            "Runtime.evaluate",
+            serde_json::json!({"expression":expression,"returnByValue":true}),
+            Some(s),
+        )
+        .await
+        .unwrap();
+    assert!(r.get("exceptionDetails").is_none(), "{r}");
+    r["result"]["value"].clone()
+}
+async fn assert_observed_selectors(
+    b: &iksa::cdp::Browser,
+    s: &str,
+    o: &iksa::observe::Observation,
+) {
+    for e in &o.elements {
+        let sel = serde_json::to_string(&e.selector).unwrap();
+        assert_eq!(
+            eval_page(b, s, &format!("document.querySelectorAll({sel}).length")).await,
+            1,
+            "{}",
+            e.selector
+        );
+    }
+}
+#[tokio::test]
+#[ignore]
+async fn observe_lists_interactive_elements() {
+    let chrome = common::Chrome::new(&[]);
+    let port = common::serve(&[("/form", common::Response { status:200, headers:vec![], hang:false, body:r#"<title>Form</title><h1>Form</h1><label for=q>Query</label><input id=q placeholder=Search><button id=go>Go</button>"#.into() })]);
+    let url = format!("http://127.0.0.1:{port}/form");
+    let runner_profile = common::temp_dir("observe-runner");
+    let e = Engine::launch(&common::chromium(), &runner_profile.0, true).unwrap();
+    let s = observation_page(chrome.b(), &url).await;
+    let b = chrome.b();
+    let o = e.observe(b, &s).await.unwrap();
+    assert_eq!(o.url, url);
+    assert_eq!(o.title, "Form");
+    assert!(o.text.contains("Form"));
+    assert!(
+        o.elements
+            .iter()
+            .any(|e| e.line.contains("textbox \"Query\"") && e.line.contains(" empty"))
+    );
+    assert!(o.elements.iter().any(|e| e.line.contains("button \"Go\"")));
+    assert_observed_selectors(b, &s, &o).await;
+    eval_page(b, &s, "document.querySelector('#q').focus()").await;
+    b.call(
+        "Input.insertText",
+        serde_json::json!({"text":"hunter2"}),
+        Some(&s),
+    )
+    .await
+    .unwrap();
+    eval_page(b, &s, "document.body.insertAdjacentHTML('beforeend', '<h2>hunter2</h2><button>hunter2</button>'); document.title = 'hunter2'").await;
+    let o = e.observe(b, &s).await.unwrap();
+    assert!(!o.title.contains("hunter2"));
+    assert!(!o.text.contains("hunter2"));
+    let q = o.elements.iter().find(|e| e.selector == "#q").unwrap();
+    assert!(q.line.contains("filled"), "{}", q.line);
+    assert!(o.elements.iter().all(|e| !e.line.contains("hunter2")));
+    eval_page(b, &s, r#"document.body.innerHTML = `<label for=p>Password</label><input id=p type=password value=private-password><textarea aria-label=Notes>private-notes</textarea><div contenteditable aria-label=Editor>private-edit</div><select aria-label=Size><option value=private-option>Small</option><option>Large</option></select><a href='/next?private=query'>Next</a><div role=tab tabindex=0>Tab</div><button aria-label='${'界'.repeat(90)}'>Long</button><p>${'text '.repeat(1000)}</p>`"#).await;
+    let o = e.observe(b, &s).await.unwrap();
+    assert_observed_selectors(b, &s, &o).await;
+    for secret in [
+        "private-password",
+        "private-notes",
+        "private-edit",
+        "private-option",
+    ] {
+        assert!(!o.text.contains(secret), "text leaked {secret}: {}", o.text);
+        assert!(
+            o.elements.iter().all(|e| !e.line.contains(secret)),
+            "line leaked {secret}"
+        );
+    }
+    assert!(
+        o.elements
+            .iter()
+            .any(|e| e.line.contains("type=password filled"))
+    );
+    assert!(
+        o.elements
+            .iter()
+            .any(|e| e.line.contains("combobox \"Size\"")
+                && e.line.contains("Small")
+                && e.line.contains("Large"))
+    );
+    assert!(
+        o.elements
+            .iter()
+            .any(|e| e.line.contains("link \"Next\" → /next"))
+    );
+    assert!(o.elements.iter().any(|e| e.line.contains("tab \"Tab\"")));
+    let long = o.elements.iter().find(|e| e.line.contains('界')).unwrap();
+    assert_eq!(long.line.matches('界').count(), 80);
+    assert!(o.text.chars().count() <= 4_000);
+    eval_page(b, &s, "document.body.innerHTML = '<span hidden id=name>Hidden label</span><button aria-labelledby=name></button>'").await;
+    let o = e.observe(b, &s).await.unwrap();
+    assert_eq!(o.elements[0].line, "[1] button \"Hidden label\"");
+    eval_page(
+        b,
+        &s,
+        "document.body.innerHTML = '<button>Go</button>'.repeat(220)",
+    )
+    .await;
+    assert_eq!(e.observe(b, &s).await.unwrap().elements.len(), 200);
+}
+#[tokio::test]
+#[ignore]
+async fn observe_skips_hidden() {
+    let chrome = common::Chrome::new(&[]);
+    let runner_profile = common::temp_dir("observe-runner");
+    let e = Engine::launch(&common::chromium(), &runner_profile.0, true).unwrap();
+    let s = observation_page(chrome.b(), "data:text/html,<button>Visible</button><button style='display:none'>Hidden</button><button style='visibility:hidden'>Invisible</button><div style='display:none'><button>Ancestor hidden</button></div><button style='width:0;height:0;padding:0;border:0'>Zero</button>").await;
+    let o = e.observe(chrome.b(), &s).await.unwrap();
+    assert_eq!(o.elements.len(), 1, "{o:?}");
+    assert_eq!(o.elements[0].line, "[1] button \"Visible\"");
+}
+#[tokio::test]
+#[ignore]
+async fn observe_selectors_unique_without_ids() {
+    let chrome = common::Chrome::new(&[]);
+    let runner_profile = common::temp_dir("observe-runner");
+    let e = Engine::launch(&common::chromium(), &runner_profile.0, true).unwrap();
+    let s = observation_page(chrome.b(), "data:text/html,<main><section><button>Buy</button><button>Buy</button><button>Buy</button></section></main>").await;
+    let o = e.observe(chrome.b(), &s).await.unwrap();
+    assert_eq!(o.elements.len(), 3);
+    let selectors: std::collections::HashSet<_> = o.elements.iter().map(|e| &e.selector).collect();
+    assert_eq!(selectors.len(), 3);
+    assert_observed_selectors(chrome.b(), &s, &o).await;
+    for (i, element) in o.elements.iter().enumerate() {
+        assert_eq!(element.r#ref, i as u32 + 1);
+        assert_eq!(element.line, format!("[{}] button \"Buy\"", i + 1));
+    }
+    eval_page(chrome.b(), &s, r#"document.body.innerHTML = '<div id="a:b"><button id=dup>Buy</button><button id=dup>Buy</button><button id="1:x">Buy</button></div>'"#).await;
+    let o = e.observe(chrome.b(), &s).await.unwrap();
+    assert_eq!(o.elements.len(), 3);
+    assert_observed_selectors(chrome.b(), &s, &o).await;
+    assert!(o.elements[0].selector.starts_with("#a\\:b"));
+    assert!(o.elements[2].selector.starts_with('#'));
+    eval_page(chrome.b(), &s, "document.body.id = 'root:body'; document.body.innerHTML = '<section><button>Buy</button></section>'").await;
+    let o = e.observe(chrome.b(), &s).await.unwrap();
+    assert!(
+        o.elements[0].selector.starts_with("#root\\:body > "),
+        "{}",
+        o.elements[0].selector
+    );
+    assert_observed_selectors(chrome.b(), &s, &o).await;
+}

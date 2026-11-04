@@ -77,6 +77,16 @@ impl Engine {
             &launch_args(profile, mock_keychain),
         )?))
     }
+    pub async fn observe(
+        &self,
+        b: &Browser,
+        session: &str,
+    ) -> anyhow::Result<crate::observe::Observation> {
+        let value = self
+            .eval(b, session, crate::observe::OBSERVE_JS.into())
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
     async fn eval(&self, b: &Browser, s: &str, expr: String) -> anyhow::Result<Value> {
         let r = b
             .call(

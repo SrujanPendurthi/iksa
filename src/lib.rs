@@ -19,3 +19,5 @@ pub mod observe;
 pub mod llm;
 
 pub mod keychain;
+
+pub mod planner;

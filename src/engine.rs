@@ -8,7 +8,7 @@ use crate::{
     gate::{self, Decision, Risk},
     keychain,
     ledger::{Handoff, Ledger, State},
-    snapshot,
+    llm, observe, planner, snapshot,
 };
 use serde_json::{Value, json};
 use std::{
@@ -73,6 +73,77 @@ fn scrub_snapshot(html: &str, secrets: &[String]) -> String {
     variants.sort_by_key(|s| std::cmp::Reverse(s.len()));
     variants.dedup();
     scrub(html, &variants)
+}
+#[derive(Default)]
+struct ModelStep {
+    request: Option<String>,
+    thought: Option<String>,
+}
+impl ModelStep {
+    fn attach(&self, record: &mut StepRecord, secrets: &[String]) {
+        record.model_request = self.request.clone();
+        record.thought = self.thought.as_ref().map(|s| {
+            scrub_model(s, secrets)
+                .chars()
+                .take(crate::audit::MAX_THOUGHT_CHARS)
+                .collect()
+        });
+    }
+}
+fn planner_record(
+    l: &Ledger,
+    id: i64,
+    step: usize,
+    outcome: String,
+    metadata: &ModelStep,
+    secrets: &[String],
+) -> anyhow::Result<()> {
+    // Audit-only page-observation marker: never append or execute this as a browser step.
+    let mut record = StepRecord::new(
+        step,
+        &Action::Extract {
+            selector: "html".into(),
+        },
+        "planner".into(),
+        None,
+        scrub_model(&outcome, secrets),
+    );
+    metadata.attach(&mut record, secrets);
+    l.record_step(id, &record)?;
+    Ok(())
+}
+fn action_summary(action: &Action) -> String {
+    match action {
+        Action::Navigate { url } => format!("navigate {url}"),
+        Action::Search { .. } => "search".into(),
+        Action::Click { .. } => "click element".into(),
+        Action::Type { .. } => "type element".into(),
+        Action::Extract { .. } => "extract element".into(),
+    }
+}
+fn action_contains_secret(action: &Action, secrets: &[String]) -> bool {
+    let fields: Vec<&str> = match action {
+        Action::Navigate { url } => vec![url],
+        Action::Search { query } => vec![query],
+        Action::Click { selector, .. } | Action::Extract { selector } => vec![selector],
+        Action::Type { selector, text, .. } => vec![selector, text],
+    };
+    fields.iter().any(|value| {
+        secrets
+            .iter()
+            .any(|s| !s.is_empty() && value.contains(s.as_str()))
+    })
+}
+fn scrub_model(text: &str, secrets: &[String]) -> String {
+    let mut variants = Vec::new();
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        variants.push(secret.clone());
+        let quoted = serde_json::to_string(secret).unwrap();
+        variants.push(quoted[1..quoted.len() - 1].to_owned());
+    }
+    variants.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    variants.dedup();
+    scrub(text, &variants)
 }
 /// Sequential execution on the caller's future; the ledger is deliberately not Sync.
 pub struct Engine {
@@ -345,10 +416,35 @@ impl Engine {
                 _ => None,
             })
             .collect();
+        let mut private_fields: Vec<String> = task
+            .steps
+            .iter()
+            .take(task.cursor)
+            .filter_map(|a| match a {
+                Action::Type {
+                    text,
+                    secret: false,
+                    ..
+                } if !text.is_empty() => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
         let mut secret_on_page = false;
         l.transition(id, State::Executing)?;
         let mut context = None;
+        let mut model_step = ModelStep::default();
         let result: anyhow::Result<State> = async {
+            anyhow::ensure!(task.cursor <= task.steps.len(), "invalid task cursor");
+            // A used placeholder may precede the last navigation, so replay alone cannot
+            // restore the redaction list. Re-read only secrets this task already typed.
+            let used: std::collections::HashSet<_> = task.steps[..task.cursor].iter().filter_map(|a| match a {
+                Action::Type {text,secret:true,..} => keychain::secret_name(text).map(str::to_owned),
+                _ => None,
+            }).collect();
+            for name in used {
+                let value = tokio::time::timeout(timeout, tokio::task::spawn_blocking(move || keychain::get("iksa-secret", &name))).await???;
+                if !secrets.contains(&value) { secrets.push(value); }
+            }
             let ctx = tokio::time::timeout(
                 timeout,
                 b.call("Target.createBrowserContext", json!({}), None),
@@ -417,61 +513,164 @@ impl Engine {
             })
             .await??;
             let s = result;
-            let task = l.get(id)?;
-            for (n, a) in task.steps.iter().enumerate().skip(task.cursor) {
+            let mut invalid_streak = l.records(id)?.iter().rev()
+                .take_while(|r| r.outcome.starts_with("invalid:")).count();
+            loop {
+                let task = l.get(id)?;
+                if task.steps.get(task.cursor).is_none() {
+                    let Some(goal) = task.goal.as_deref() else {
+                        l.transition(id, State::Committed)?;
+                        return Ok(State::Committed);
+                    };
+                    let model = cfg.model.as_ref().ok_or_else(|| anyhow::anyhow!("configure \"model\" in config.json"))?;
+                    let records = l.records(id)?;
+                    // Control records each spend a model turn. An action spends one
+                    // turn per appended step, even if approval/challenge replay records it twice.
+                    // CAS hashes alone cannot count turns: redaction may make bodies identical.
+                    let control_turns = records.iter().filter(|r| r.model_request.is_some() && r.decision == "planner").count();
+                    let action_turns = records.iter().filter(|r| r.model_request.is_some() && r.decision != "planner")
+                        .map(|r| r.step).collect::<std::collections::HashSet<_>>().len();
+                    let turns = control_turns + action_turns;
+                    if turns >= model.max_steps as usize {
+                        let state = State::Failed("step budget exhausted".into());
+                        l.transition(id, state.clone())?;
+                        return Ok(state);
+                    }
+                    // Capture the original host and pruned observation atomically in one evaluation.
+                    let value = tokio::time::timeout(timeout, self.eval(b, &s,
+                        format!("({{host:location.hostname,fields:Array.from(document.querySelectorAll('input,textarea,[contenteditable]')).filter(e=>e.tagName!=='INPUT'||!['checkbox','radio','button','submit','reset','image'].includes(e.type)).flatMap(e=>[e.value||'',e.defaultValue||'',e.hasAttribute('contenteditable')?e.innerText:'']),observation:{}}})", observe::OBSERVE_JS)))
+                        .await??;
+                    let host = value["host"].as_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+                    if cfg.never_send.iter().any(|suffix| {
+                        let suffix = suffix.trim_start_matches('.').trim_end_matches('.').to_ascii_lowercase();
+                        !suffix.is_empty() && (host == suffix || host.ends_with(&format!(".{suffix}")))
+                    }) {
+                        planner_record(l, id, task.cursor,
+                            format!("blocked: {host} is on never_send"), &ModelStep::default(), &secrets)?;
+                        let state = State::AwaitingHandoff(Handoff::Approval);
+                        l.transition(id, state.clone())?;
+                        return Ok(state);
+                    }
+                    if let Some(fields) = value["fields"].as_array() {
+                        for field in fields.iter().filter_map(Value::as_str).filter(|v| !v.is_empty()) {
+                            if !private_fields.iter().any(|v| v == field) { private_fields.push(field.to_owned()); }
+                        }
+                    }
+                    let mut redactions = secrets.clone();
+                    redactions.extend(private_fields.iter().cloned());
+                    let observation: observe::Observation = serde_json::from_value(value["observation"].clone())?;
+                    let log: Vec<_> = records.iter().enumerate().map(|(n,r)| {
+                        let summary = if r.decision == "planner" { "planner".into() } else { action_summary(&r.action) };
+                        format!("{}. {} → {}", n+1, scrub_model(&summary, &redactions),
+                            scrub_model(&r.outcome, &redactions).chars().take(200).collect::<String>())
+                    }).collect();
+                    let user = scrub_model(&planner::user_message(goal, &log, &observe::render(&observation)), &redactions);
+                    let body = llm::request_body(model, planner::SYSTEM, &planner::tools(), &user);
+                    model_step = ModelStep { request:Some(c.put(&serde_json::to_vec(&body)?)?.to_hex().to_string()), thought:None };
+                    let model = model.clone();
+                    let reply = tokio::task::spawn_blocking(move || {
+                        let key = llm::api_key()?;
+                        llm::call(&model, &key, &body)
+                    }).await??;
+                    model_step.thought = Some(reply.text);
+                    let chosen = if reply.tool_count != 1 {
+                        Err("expected exactly one tool call".to_owned())
+                    } else if let Some((tool, input)) = &reply.tool {
+                        planner::to_action(tool, input, &observation).and_then(|action| {
+                            if let Some(Action::Type { text, secret:true, .. }) = &action {
+                                let name = keychain::secret_name(text).unwrap();
+                                if !goal.split(|c:char| !c.is_ascii_alphanumeric() && c != '_' && c != '-').any(|word| word == name) {
+                                    return Err(format!("goal does not name secret {name}"));
+                                }
+                            }
+                            if action.as_ref().is_some_and(|a| action_contains_secret(a, &secrets)) {
+                                return Err("action contains a resolved secret; use a named placeholder".into());
+                            }
+                            Ok(action)
+                        })
+                    } else { Err("expected exactly one tool call".into()) };
+                    match chosen {
+                        Err(error) => {
+                            planner_record(l, id, task.cursor, format!("invalid: {error}"), &model_step, &secrets)?;
+                            model_step = ModelStep::default();
+                            invalid_streak += 1;
+                            if invalid_streak >= 3 {
+                                let state = State::Failed("model kept choosing invalid actions".into());
+                                l.transition(id, state.clone())?;
+                                return Ok(state);
+                            }
+                            continue;
+                        }
+                        Ok(None) => {
+                            let answer = reply.tool.as_ref().unwrap().1["answer"].as_str().unwrap();
+                            planner_record(l, id, task.cursor, format!("done: {answer}"), &model_step, &secrets)?;
+                            l.transition(id, State::Committed)?;
+                            return Ok(State::Committed);
+                        }
+                        Ok(Some(action)) => {
+                            invalid_streak = 0;
+                            l.push_step(id, &action)?;
+                        }
+                    }
+                }
+                let task = l.get(id)?;
+                let n = task.cursor;
+                let a = &task.steps[n];
+                if task.goal.is_some() && model_step.request.is_none() {
+                    if let Some(record) = l.records(id)?.iter().rev().find(|r|
+                        r.step == n && r.action == *a && r.model_request.is_some() ) {
+                        model_step = ModelStep {request:record.model_request.clone(),thought:record.thought.clone()};
+                    }
+                }
                 let decision = if gate::decide(cfg.auto_max, a.risk()) == Decision::NeedsApproval {
                     if task.approved_step != Some(n) {
+                        if model_step.request.is_some() {
+                            let mut record = StepRecord::new(n, a, "needs approval".into(), None, "awaiting approval".into());
+                            model_step.attach(&mut record, &secrets);
+                            l.record_step(id, &record)?;
+                        }
                         let state = State::AwaitingHandoff(Handoff::Approval);
                         l.transition(id, state.clone())?;
                         return Ok(state);
                     }
                     "approved"
-                } else {
-                    "auto"
-                };
+                } else { "auto" };
                 let deadline = Instant::now() + timeout;
                 let execution = async {
                     let before_document = if secret_on_page && url_of(a, cfg).is_some() {
                         Some(b.call("Page.getFrameTree", json!({}), Some(&s)).await?["frameTree"]["frame"]["loaderId"].clone())
-                    } else {
-                        None
-                    };
+                    } else { None };
                     let (outcome, status, headers) = self.action(b, &s, a, cfg, deadline, timeout, &mut secrets).await?;
+                    if task.goal.is_some() {
+                        if let Action::Type {text,secret:false,..} = a {
+                            if !text.is_empty() && !private_fields.contains(text) { private_fields.push(text.clone()); }
+                        }
+                    }
                     let new_document = if let Some(before) = before_document {
                         before != b.call("Page.getFrameTree", json!({}), Some(&s)).await?["frameTree"]["frame"]["loaderId"]
-                    } else {
-                        false
-                    };
+                    } else { false };
                     match a {
-                        Action::Type { secret: true, .. } => secret_on_page = true,
-                        // Fragment navigation leaves the secret-bearing Document intact.
-                        Action::Navigate { .. } | Action::Search { .. } if new_document => {
-                            secret_on_page = false
-                        }
+                        Action::Type { secret:true, .. } => secret_on_page = true,
+                        Action::Navigate { .. } | Action::Search { .. } if new_document => secret_on_page = false,
                         _ => {}
                     }
-                    let html = self
-                        .eval(b, &s, "document.documentElement.outerHTML".into())
-                        .await?
-                        .as_str()
-                        .unwrap_or("")
-                        .to_owned();
-                    let after = if secret_on_page || a.risk() == Risk::Financial {
-                        None
-                    } else {
-                        Some(snapshot::put(c, &scrub_snapshot(&html, &secrets))?.to_hex().to_string())
-                    };
-                    l.record_step(
-                        id,
-                        &StepRecord::new(n, a, decision.into(), after, scrub(&outcome, &secrets)),
-                    )?;
+                    let html = self.eval(b, &s, "document.documentElement.outerHTML".into()).await?.as_str().unwrap_or("").to_owned();
+                    let after = if secret_on_page || a.risk() == Risk::Financial { None }
+                        else { Some(snapshot::put(c, &scrub_snapshot(&html, &secrets))?.to_hex().to_string()) };
+                    let safe_outcome = if task.goal.is_some() {
+                        let mut redactions = secrets.clone();
+                        redactions.extend(private_fields.iter().cloned());
+                        scrub_model(&outcome, &redactions)
+                    } else { scrub(&outcome, &secrets) };
+                    let mut record = StepRecord::new(n, a, decision.into(), after, safe_outcome);
+                    model_step.attach(&mut record, &secrets);
+                    l.record_step(id, &record)?;
                     let challenge = challenge::detect(status, &headers, &html);
                     Ok::<_, anyhow::Error>(match challenge {
                         Some(k) if self.remaining_challenge(b, &s, k).await? => Some(k),
                         _ => None,
                     })
                 };
-                // Poll the action first so locate can report its selector at the same deadline.
                 let execution = tokio::select! {
                     biased;
                     result = execution => result,
@@ -483,9 +682,8 @@ impl Engine {
                     return Ok(state);
                 }
                 l.set_cursor(id, n + 1)?;
+                model_step = ModelStep::default();
             }
-            l.transition(id, State::Committed)?;
-            Ok(State::Committed)
         }
         .await;
         let cleanup_failed = if let Some(ctx) = context {
@@ -515,6 +713,8 @@ impl Engine {
                 let message = scrub(
                     &if e.is::<tokio::time::error::Elapsed>() {
                         format!("timeout at step {}", task.cursor)
+                    } else if task.goal.is_some() {
+                        e.to_string()
                     } else {
                         format!("error: {e}")
                     },
@@ -522,21 +722,22 @@ impl Engine {
                 );
                 if task.state == State::Executing {
                     if let Some(a) = task.steps.get(task.cursor) {
-                        l.record_step(
-                            id,
-                            &StepRecord::new(
-                                task.cursor,
-                                a,
-                                if task.approved_step == Some(task.cursor) {
-                                    "approved"
-                                } else {
-                                    "auto"
-                                }
-                                .into(),
-                                None,
-                                message.clone(),
-                            ),
-                        )?;
+                        let mut record = StepRecord::new(
+                            task.cursor,
+                            a,
+                            if task.approved_step == Some(task.cursor) {
+                                "approved"
+                            } else {
+                                "auto"
+                            }
+                            .into(),
+                            None,
+                            message.clone(),
+                        );
+                        model_step.attach(&mut record, &secrets);
+                        l.record_step(id, &record)?;
+                    } else if task.goal.is_some() {
+                        planner_record(l, id, task.cursor, message.clone(), &model_step, &secrets)?;
                     }
                     let state = State::Failed(message);
                     l.transition(id, state.clone())?;

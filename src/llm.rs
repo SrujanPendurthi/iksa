@@ -5,6 +5,7 @@ use std::time::Duration;
 
 #[derive(Debug)]
 pub struct Reply {
+    pub tool_count: usize,
     pub tool: Option<(String, Value)>,
     pub text: String,
     pub stop_reason: String,
@@ -147,6 +148,7 @@ pub fn call(cfg: &ModelConfig, key: &str, body: &Value) -> anyhow::Result<Reply>
             .collect::<Vec<_>>()
             .join("\n");
         return Ok(Reply {
+            tool_count: blocks.iter().filter(|b| b["type"] == "tool_use").count(),
             tool,
             text,
             stop_reason,

@@ -2,26 +2,47 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** iksa acts without being asked each time. `iksa daemon` fires scheduled goals (interval or cron), runs queued work with up to `max_agents` tasks at once, and keeps a suggestion inbox the user accepts or dismisses.
+**Goal:** iksa acts without being asked each time, and asks for human attention as rarely and as precisely as safety allows.
+- `iksa daemon` fires scheduled goals (interval or cron) and runs queued work with up to `max_agents` tasks at once.
+- It keeps a suggestion inbox the user accepts or dismisses.
+- Standing grants let routine Write steps proceed without a pause.
+- A task can be paused while it runs, and a looping task fails on its own.
 
 **Architecture:**
 - **Ledger:** gains the `Suggested`/`Dismissed` states and a `schedules` table.
 - **`schedule.rs`:** pure module that parses specs and computes the next fire time.
 - **`daemon.rs`:** one dispatcher loop on a tokio `LocalSet`. Each tick it moves due schedules into the ledger, then starts queued tasks on a shared `Rc<Engine>`; each worker opens its own `Ledger`/`Cas` connection. Chromium is launched lazily and closed after an idle period, so an idle daemon holds no browser.
 - **`iksa run`:** becomes the daemon in drain mode: fire due schedules, run until nothing is queued or running, then exit.
-- **Suggestion sources:** schedules with `--suggest`, and the planner's `done` tool proposing follow-up goals.
+- **Suggestion sources:** schedules in `suggest` mode (the default), and the planner's `done` tool proposing follow-up goals.
 
 **Tech Stack:** M2a stack. tokio gains the `signal` and `rt` (LocalSet) features. `libc::localtime_r`/`mktime` for local time. No new crates.
 
 **Spec:** `PRD.md` §1.1 pillar 3 (schedules, propose tasks) and pillar 2 (bounded concurrency), §3.2 (lifecycle states, schedule trigger, suggestion inbox), §3.7 (`max_agents`), §5 (concurrency, memory, egress). M2a plan: `docs/superpowers/plans/2026-11-03-m2a-planner.md`. User decisions (2026-11-03): M2 triggers are **schedule + suggestion inbox**. Watch triggers were not chosen. Page-visit triggers need human tabs, so they belong to M3.
 
+**Research input:** `reports/DeepSeek Super Agent for iksa.md` (local, untracked). It covers the design of DeepSeek's dsh-superagent prototype. No code is copied (TypeScript/DSH runtime, no browser layer); the ideas below are re-implemented:
+- observe-first proactivity → schedules default to `suggest`;
+- fire-once-after-gap → missed runs collapse;
+- revalidated standing grants;
+- a slot reserved for human-started work;
+- a "waiting on" view and a deterministic stuck detector;
+- owner pause/resume.
+
 ## Decisions this plan makes
 
 - **Schedules fire goals only.** Scripted JSON tasks stay manual (`add`). Schedule commands require a configured model, like `ask` (PRD §3.2: proactive features stay off until a model is configured).
-- **Spec syntax** is one argument, either `every <N>m|h|d` (N ≥ 1, minimum 1 minute) or a 5-field cron `min hour dom month dow` in **local time**:
+- **Spec syntax** is one argument, either `every <N>m|h|d` (minimum 5 minutes) or a 5-field cron `min hour dom month dow` in **local time**:
   - Fields accept `*`, `N`, `a-b`, `*/s`, `a-b/s` and comma lists.
   - `dow` runs 0–7, where both 0 and 7 mean Sunday.
   - If both `dom` and `dow` are restricted, a day matches when either one does (Vixie cron).
+- **Observe first:** a new schedule defaults to mode `suggest`, so fires land in the inbox. `schedule set <id> auto` promotes it once its record looks right: `schedule list` shows how many of its suggestions were accepted and how many dismissed. Limits: 32 schedules, minimum interval 5 minutes.
+- **Standing grants:** `grant <domain> [--schedule <id>] [--days N]` (N defaults to 7, maximum 30).
+  - A grant lets **Write** steps on that domain and its subdomains run without approval, either for one schedule's tasks or for any task.
+  - Each use is revalidated against the expiry, `never_send`, and a policy fingerprint (BLAKE3 of `auto_max` + `never_send` at grant time). If `config.json` changed those, every grant goes inert until it is re-granted.
+  - **Financial steps never use a grant** (PRD §3.3), and granting `financial` is impossible.
+  - Each auto-run step's record names the grant (`decision: "grant:<id>"`).
+- **Human work first:** tasks the user started (`ask`, `add`, `accept`, `approve`/`resume`) may use one slot beyond `max_agents`; scheduled `auto` tasks may not.
+- **Pause:** `pause <id>` on a `Queued` or `Executing` task stops it before its next step, as `AwaitingHandoff(Paused)`; `resume <id>` continues it.
+- **Stuck detector (no model):** a goal task whose model picks the same action (op + selector + text) 3 times in a row with an unchanged observation hash ends `Failed("stuck: repeated <op> 3 times")`. There is no wall-clock deadline: the step budget × `STEP_TIMEOUT` already bounds a run.
 - **Missed runs collapse.** After sleep or downtime, a due schedule fires once, and its next fire time is computed from *now*.
 - **No pile-up.** If the task the schedule created last time is still open (`Suggested`, `Queued`, `Executing` or `AwaitingHandoff`), the fire is skipped and only `next_ms` advances.
 - **Suggestions never run by themselves.** `Suggested` → `Queued` happens only through `accept`. Dismissed tasks are terminal and garbage-collected like `Committed`.
@@ -31,9 +52,14 @@
   - They are stored only on `Committed`, and deduplicated against open tasks with the same goal.
 - **One process runs tasks.** `daemon` and `run` take the same `run.lock`. Every other CLI command only writes the ledger, and the daemon notices within one poll (2 s).
 - **Idle daemon = no Chromium.** The browser closes after `idle_close` (60 s) with no running task and relaunches on demand. Idle footprint is iksa alone.
-- **Notifications:** when a task enters `AwaitingHandoff` or a suggestion is created, the daemon runs `osascript -e 'display notification "<msg>" with title "iksa"'`.
-  - `<msg>` is only `task <id> needs approval`, `task <id> needs you to solve a challenge` or `<n> new suggestion(s)`. Goal text never appears on the lock screen.
-  - `IKSA_NOTIFY=off` disables them, which all tests set.
+- **One digest notification, not one per event:** after a tick in which the set of tasks waiting on the user changed, the daemon runs `osascript -e 'display notification "<msg>" with title "iksa"'` once.
+  - `<msg>` is counts only, e.g. `waiting on you: 2 approvals, 1 challenge, 3 suggestions`. Goal text never appears on the lock screen.
+  - `IKSA_NOTIFY=off` disables it, which all tests set.
+- **"Waiting on" in `list`:** each `AwaitingHandoff` row ends with what it needs:
+  - `approve step N: <op> (<risk>)`;
+  - `solve <kind> challenge`;
+  - `paused`;
+  - `blocked: <host> is on never_send`.
 - **No `daemon install`.** README documents a `launchd` plist for start-at-login. Add a command when someone asks.
 
 ## Global Constraints
@@ -52,6 +78,7 @@
 - **Second daemon, or `run` while the daemon runs:** refused with `another iksa run is active`, and the daemon is untouched. Test `daemon_holds_run_lock` (Task 3).
 - **Daemon killed mid-task:** on restart the task is `Queued` again and runs. Test `daemon_recovers_executing` (Task 3).
 - **Cron that never fires (`0 0 30 2 *`) or a malformed spec:** rejected at `schedule add` with the reason; nothing is stored. Tests `cron_never_fires_rejected`, `bad_spec_is_usage_error` (Tasks 1, 2).
+- **A grant used where it doesn't apply:** other domain, expired, Financial step, `never_send` added later, or `auto_max` changed. Each must still pause. Test `grant_scope_is_enforced` (Task 6).
 
 ## Running this plan with Codex (gpt-6.1-sol)
 
@@ -119,31 +146,37 @@ Same as M2a. Codex does one task per run with TDD, runs all ignored tests (`--sk
 **Interfaces:**
 - Consumes: `schedule::{parse, next_fire_ms}`, `ledger::is_open`.
 - Produces:
-  - Table `schedules(id INTEGER PRIMARY KEY, spec TEXT NOT NULL, goal TEXT NOT NULL, suggest INTEGER NOT NULL, next_ms INTEGER NOT NULL, last_task INTEGER)`, created `IF NOT EXISTS` in `open`.
-  - `pub struct Schedule { id: i64, spec: String, goal: String, suggest: bool, next_ms: u64, last_task: Option<i64> }`.
-  - `Ledger::add_schedule(spec, goal, suggest, next_ms) -> Result<i64, LedgerError>`.
+  - Table `schedules(id INTEGER PRIMARY KEY, spec TEXT NOT NULL, goal TEXT NOT NULL, auto INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL, last_task INTEGER)`, created `IF NOT EXISTS` in `open`.
+  - `tasks.schedule_id INTEGER` column, added with the same `pragma_table_info` migration as `goal`; `Task.schedule_id: Option<i64>`.
+  - `pub struct Schedule { id: i64, spec: String, goal: String, auto: bool, next_ms: u64, last_task: Option<i64>, accepted: u32, dismissed: u32 }`. The two counts are derived from the schedule's tasks: accepted = left `Suggested` for any state but `Dismissed`.
+  - `Ledger::add_schedule(spec, goal, auto, next_ms) -> Result<i64, LedgerError>`: refuses a 33rd schedule with `at most 32 schedules`.
+  - `Ledger::set_schedule_auto(id, auto: bool) -> Result<(), LedgerError>`.
   - `Ledger::schedules() -> Result<Vec<Schedule>, LedgerError>`.
   - `Ledger::remove_schedule(id) -> Result<(), LedgerError>` (`NotFound` if absent; created tasks are kept).
   - `Ledger::fire_due(now_ms: u64, next: impl Fn(&str, u64) -> u64) -> Result<Vec<i64>, LedgerError>`:
     - one IMMEDIATE transaction;
-    - for each schedule with `next_ms <= now_ms`, if `last_task` is missing or not open, insert a goal task (`Queued`, or `Suggested` when `suggest`) and set `last_task`;
+    - for each schedule with `next_ms <= now_ms`, if `last_task` is missing or not open, insert a goal task with `schedule_id` set (`Queued` when `auto`, else `Suggested`, deduped like `suggest`) and set `last_task`;
     - always set `next_ms = next(spec, now_ms)`;
     - returns the new task IDs.
 - CLI:
-  - `schedule add [--suggest] <spec> <goal…>` requires a model, parses the spec (an error is a usage error, exit 2, with the reason on stderr) and prints `{id}\tnext {YYYY-MM-DD HH:MM} local`.
-  - `schedule list` prints `{id}\t{spec}\t{next local}\t{"suggest"|"queue"}\t{goal}`.
+  - `schedule add [--auto] <spec> <goal…>` requires a model, parses the spec (an error is a usage error, exit 2, with the reason on stderr; intervals under 5 minutes are rejected) and prints `{id}\tnext {YYYY-MM-DD HH:MM} local`.
+  - `schedule list` prints `{id}\t{spec}\t{next local}\t{"suggest"|"auto"}\t{accepted}/{accepted+dismissed} accepted\t{goal}`.
+  - `schedule set <id> auto|suggest`.
   - `schedule rm <id>`.
 
 - [ ] **Step 1: Failing tests:**
-  - `ledger::fire_due_creates_and_advances`: two schedules due at 0, one with suggest. `fire_due(1000, |_, n| n + 60_000)` → 2 IDs, one `Queued` and one `Suggested`, both `next_ms == 61_000`. A second `fire_due(1000, …)` → empty.
+  - `ledger::fire_due_creates_and_advances`: two schedules due at 0, one `auto`. `fire_due(1000, |_, n| n + 60_000)` → 2 IDs, one `Queued` and one `Suggested`, both with `schedule_id` set and `next_ms == 61_000`. A second `fire_due(1000, …)` → empty.
+  - `ledger::schedule_trial_counts`: three fires of a `suggest` schedule (the open task is closed each time). Accepting one and dismissing two gives `accepted == 1, dismissed == 2`.
+  - `ledger::schedule_cap`: the 33rd `add_schedule` → `Err` containing `at most 32`.
   - `ledger::missed_runs_collapse`: `next_ms = 0`, `fire_due(72 * 3_600_000, …)` → exactly 1 task.
   - `ledger::open_task_skips_fire`: fire → task `Queued`. Moving `next_ms` back to 0 and firing again → no new task, `next_ms` advanced. Transition that task to `Failed` and fire again → new task.
   - `cli::schedule_add_list_rm`:
     - `schedule add "every 2h" check hn` with a model configured prints an id and `next `;
-    - `schedule list` shows `every 2h` and `queue`;
-    - `schedule add --suggest "0 9 * * 1" weekly digest` shows `suggest`;
+    - `schedule list` shows `every 2h`, `suggest` and `0/0 accepted`;
+    - `schedule set 1 auto` → list shows `auto`;
+    - `schedule add --auto "0 9 * * 1" weekly digest` shows `auto`;
     - `schedule rm 1` → list has 1 row; `schedule rm 9` → exit 1.
-  - `cli::bad_spec_is_usage_error`: `schedule add "every 5s" x` → exit 2, stderr contains `every 5s`. `schedule add "0 0 30 2 *" x` → exit 2 with `never fires`. No model → exit 1 `configure "model"`.
+  - `cli::bad_spec_is_usage_error`: `schedule add "every 5s" x` → exit 2, stderr contains `every 5s`. `schedule add "every 4m" x` → exit 2. `schedule add "0 0 30 2 *" x` → exit 2 with `never fires`. No model → exit 1 `configure "model"`.
 - [ ] **Step 2:** FAIL. **Step 3:** implement. Format local time via `schedule::local`.
 - [ ] **Step 4:** pass. **Step 5:** Commit `feat: schedules (ledger + CLI)`.
 
@@ -158,17 +191,20 @@ Same as M2a. Codex does one task per run with TDD, runs all ignored tests (`--sk
   - `pub async fn run(home: &Path, opts: Opts) -> anyhow::Result<()>`: takes the run lock (moved from `main.rs` into `pub fn lock(home) -> anyhow::Result<File>`), then `recover()`, `gc`, then the loop:
     - `fire_due` (with `next_fire_ms`; a `None` from it removes the schedule and prints `schedule {id} will never fire again; removed`);
     - run each queued task, printing exactly what `run` prints today;
-    - notify on handoff and new suggestions;
+    - send the digest notification when the waiting-on-you counts changed during the tick;
     - sleep `poll`, interrupted early by SIGINT/SIGTERM;
     - drop the engine after `idle_close` with nothing running.
   - With `drain`, the loop returns once nothing is queued. The first tick still prints `no queued tasks` and never launches Chromium when nothing is due.
   - On a signal it stops starting tasks, drops the engine and returns `Ok`. A task interrupted mid-run stays `Executing` and is recovered next start.
 - CLI: `daemon` = `daemon::run(home, Opts::default())`. `run` = `daemon::run(home, Opts { drain: true, ..Default })`.
+- `pub fn waiting_on(task: &Task) -> Option<String>` in `ledger.rs`: the "waiting on" text from Decisions, used by `list` as a final tab-separated column on `AwaitingHandoff` rows. `pub fn digest(tasks: &[Task]) -> Option<String>` in `daemon.rs` builds the count message; it returns `None` when nothing waits.
 
 - [ ] **Step 1: Failing tests:**
   - All existing `tests/cli.rs` `run` tests pass unchanged. They are the regression suite for drain mode.
+  - Unit `ledger::waiting_on_text`: an approval pause at cursor 2 on a Click with Write risk → `approve step 3: click (write)`. Challenge → `solve Turnstile challenge`. Committed → `None`.
+  - Unit `daemon::digest_counts`: 2 approvals, 1 challenge and 3 suggested give `waiting on you: 2 approvals, 1 challenge, 3 suggestions`; no waiting tasks give `None`; singulars read `1 approval`.
   - `cli::daemon_fires_due_schedule`:
-    - `schedule add --suggest "every 1m" x`, then set `next_ms = 0` with `rusqlite` on `ledger.db`;
+    - `schedule add "every 5m" x` (default `suggest` mode), then set `next_ms = 0` with `rusqlite` on `ledger.db`;
     - spawn `iksa daemon` (`CHROMIUM=/nonexistent`, `IKSA_NOTIFY=off`);
     - within 5 s `inbox` lists `x`;
     - SIGTERM → exit 0 within 3 s.
@@ -189,10 +225,12 @@ Same as M2a. Codex does one task per run with TDD, runs all ignored tests (`--sk
   - `Config.max_agents: u32` (serde default 3, validate 1..=8).
   - `Ledger::queued(limit: usize) -> Result<Vec<Task>, LedgerError>`, oldest first.
   - Engine: replace `self.browser.borrow_mut().take()` on cleanup failure with a `broken: Cell<bool>` flag. When set, new runs return `browser unavailable after cleanup timeout` and the daemon drops and relaunches the engine once no worker holds it. `RefCell<Option<Browser>>` stays for the drop.
-  - The daemon runs inside a `tokio::task::LocalSet`. It keeps `running: HashSet<i64>` and starts `queued(max_agents)` tasks not in `running` with `spawn_local`. Each worker opens its own `Ledger` and `Cas` and shares `Rc<Engine>`. The dispatcher is single-threaded, so no claim race is possible.
+  - The daemon runs inside a `tokio::task::LocalSet`. It keeps `running: HashSet<i64>` and starts queued tasks not in `running` with `spawn_local`. Each worker opens its own `Ledger` and `Cas` and shares `Rc<Engine>`. The dispatcher is single-threaded, so no claim race is possible.
+  - Slot rule: a task with `schedule_id.is_some()` that never sat in `Suggested` is background. The inbox's accept counts as a human start, so `Ledger` records `accepted_ms` (new nullable column) on `accept`. Background tasks start only while running < `max_agents`; human tasks start while running < `max_agents + 1`.
 
 - [ ] **Step 1: Failing tests (`#[ignore]`):** the mock model delays each reply by 1 s and records peak concurrent requests.
   - `daemon::max_agents_bounds_concurrency`: 4 one-step goals with `max_agents = 3` → peak 3, all `Committed`, wall < 3.5 s. With `max_agents = 1` → peak 1.
+  - `daemon::human_task_gets_reserved_slot`: `max_agents = 1`, two `auto` schedule tasks plus one `ask` task, mock delay 1 s. Peak is 2, with the `ask` task among the first two started; the second scheduled task starts only after the first finishes.
   - `daemon::concurrent_tasks_isolated`: two goals on one fixture that sets a cookie and a `localStorage` value. Each task's extract sees only its own value.
   - Unit `config::max_agents_range`: 0 and 9 → `Err` naming `max_agents`; a missing field → 3.
 - [ ] **Step 2:** FAIL. **Step 3:** implement.
@@ -207,7 +245,7 @@ Same as M2a. Codex does one task per run with TDD, runs all ignored tests (`--sk
   - The `done` tool schema becomes `{answer: string, suggestions: {type: array, items: string}}`, both required.
   - `SYSTEM` gains one sentence: `In done, suggestions may list up to three short follow-up goals the user might want next; use an empty list when none are useful.`
   - `pub fn suggestions(input: &Value) -> Vec<String>`: trimmed, non-empty, items over 300 chars dropped, deduplicated, first 3.
-  - On `Committed` the engine stores each suggestion with `ledger.suggest(&scrub_model(s, &redactions))`. The daemon's `<n> new suggestion(s)` notification compares the `Suggested` count before and after each tick, the same mechanism Task 3 uses for schedule suggestions, so the engine reports nothing extra.
+  - On `Committed` the engine stores each suggestion with `ledger.suggest(&scrub_model(s, &redactions))`. They reach the user through Task 3's digest notification, which counts `Suggested` tasks, so the engine reports nothing extra.
   - A `done` without `suggestions` stays valid (old mock replies); it means none.
 
 - [ ] **Step 1: Failing tests:**
@@ -217,7 +255,70 @@ Same as M2a. Codex does one task per run with TDD, runs all ignored tests (`--sk
   - `#[ignore]` `failed_task_suggests_nothing`: a step-budget failure creates no suggestions.
 - [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** pass. **Step 5:** Commit `feat: planner proposes follow-up goals to the inbox`.
 
-### Task 6: Pillars and docs
+### Task 6: Standing grants
+
+**Files:** `src/ledger.rs`, `src/engine.rs`, `src/main.rs`, `tests/cli.rs`, `tests/engine.rs`.
+
+**Interfaces:**
+- Consumes: `gate::decide`, `Task.schedule_id`, the never_send suffix rule already in `engine.rs`. Move that rule into `pub fn config::domain_matches(host: &str, suffix: &str) -> bool` and reuse it for grants.
+- Produces:
+  - Table `grants(id INTEGER PRIMARY KEY, domain TEXT NOT NULL, schedule_id INTEGER, expires_ms INTEGER NOT NULL, policy TEXT NOT NULL)`.
+  - `pub fn Config::policy_fingerprint(&self) -> String`: the BLAKE3 hex of `serde_json::to_string(&(&self.auto_max, &self.never_send))`.
+  - `Ledger::add_grant(domain, schedule_id: Option<i64>, expires_ms, policy) -> Result<i64, LedgerError>`.
+  - `Ledger::grants() -> Result<Vec<Grant>, LedgerError>`.
+  - `Ledger::remove_grant(id) -> Result<(), LedgerError>`.
+  - `pub fn grant_for(grants: &[Grant], host: &str, schedule_id: Option<i64>, risk: Risk, now_ms: u64, cfg: &Config) -> Option<i64>`. It is a pure fn and returns `None` unless all of these hold:
+    - `risk == Write`;
+    - the host matches;
+    - the schedule matches (a grant without `schedule_id` matches any task);
+    - not expired;
+    - `policy == cfg.policy_fingerprint()`;
+    - the host is not on `never_send`.
+  - Engine: where `decide` returns `NeedsApproval` for a non-approved step, it calls `grant_for` with the current page host. `Some(id)` runs the step and records `decision: "grant:<id>"`.
+  - CLI:
+    - `grant <domain> [--schedule <id>] [--days N]` (N 1..=30, default 7) prints `{id}\texpires {local}`;
+    - `grant list`;
+    - `grant rm <id>`;
+    - a `--risk` flag does not exist, so no Financial grant can be made.
+
+- [ ] **Step 1: Failing tests:**
+  - Unit `grant_scope_is_enforced`: a base grant for `shop.example`, any schedule, unexpired, current fingerprint.
+    - `Some` for Write on `shop.example` and `a.shop.example`.
+    - `None` for:
+      - `evilshop.example`;
+      - Financial;
+      - Read (Read never needs one);
+      - expired;
+      - a different `schedule_id` on a schedule-bound grant;
+      - `never_send` now containing `shop.example`;
+      - `auto_max` changed.
+  - `#[ignore]` `engine::grant_runs_write_without_pause`: a scripted task on the local fixture (served at `127.0.0.1`, granted `127.0.0.1`) with Type then Click, both Write → `Committed` with no approval. Both records carry `decision == "grant:1"`. A Financial Click on the same host still pauses `AwaitingHandoff(Approval)`.
+  - `cli::grant_add_list_rm`: `grant shop.example --days 3` prints `expires `. `grant list` shows it. `grant x --days 31` → exit 2. `grant rm 1` → empty list.
+- [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** full ignored suite passes. **Step 5:** Commit `feat: standing grants for routine write steps`.
+
+### Task 7: Pause and stuck detector
+
+**Files:** `src/ledger.rs`, `src/engine.rs`, `src/main.rs`, `tests/cli.rs`, `tests/planner.rs`.
+
+**Interfaces:**
+- Produces:
+  - `Handoff::Paused`.
+  - `Ledger::request_pause(id)`:
+    - on a `Queued` task: transition directly to `AwaitingHandoff(Paused)` (new allowlisted edge);
+    - on an `Executing` task: set a new nullable `pause_requested` column;
+    - anything else → `Illegal`.
+  - The engine checks `pause_requested` before each step. When set, it clears it and transitions to `AwaitingHandoff(Paused)`. A step already in flight finishes first.
+  - `resume` accepts `Paused` as well as `Challenge`.
+  - Stuck detector in the goal loop: keep the last 3 `(action JSON with selector, observation hash)` pairs. Three equal in a row → `Failed("stuck: repeated <op> 3 times")`.
+
+- [ ] **Step 1: Failing tests:**
+  - Unit `ledger::pause_queued_and_resume`: Queued → `request_pause` → `AwaitingHandoff(Paused)` → `resume` → `Queued`. `request_pause` on `Committed` → `Illegal`.
+  - `#[ignore]` `planner::pause_stops_running_goal`: the mock model delays 1 s per turn. After the first request arrives the test calls `request_pause`. The task ends `AwaitingHandoff(Paused)` with fewer steps than the mock script. After `resume` and another run it reaches `Committed`.
+  - `#[ignore]` `planner::stuck_model_fails`: the mock always answers `click` on the same ref of a static page → `Failed` containing `stuck: repeated click 3 times`, after exactly 3 click records.
+  - `cli::pause_command`: `pause 1` on a queued task → `list` shows `paused` in the waiting-on column.
+- [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** full ignored suite passes. **Step 5:** Commit `feat: pause/resume running tasks; fail stuck model loops`.
+
+### Task 8: Pillars and docs
 
 **Files:** `tests/pillars.rs`, `docs/perf.md`, `CLAUDE.md` (README + module map).
 
@@ -227,7 +328,7 @@ Same as M2a. Codex does one task per run with TDD, runs all ignored tests (`--sk
 - [ ] **Step 2:** Run them plus the full ignored suite. Record in `docs/perf.md` under `## M2b`: idle daemon footprint, egress result, the `max_agents_bounds_concurrency` wall time and the binary size.
 - [ ] **Step 3: CLAUDE.md.**
   - Module map: add `schedule` (interval/cron specs, local next-fire time) and `daemon` (dispatcher: schedules, inbox, bounded workers, lazy browser).
-  - README: add `daemon`, `schedule add/list/rm`, `inbox`, `accept`, `dismiss`, and the `max_agents` field.
+  - README: add `daemon`, `schedule add/list/set/rm`, `inbox`, `accept`, `dismiss`, `grant`, `pause`, and the `max_agents` field. State plainly that a grant lets Write steps on that domain run unattended until it expires, and that Financial steps always ask.
   - README: add a `~/Library/LaunchAgents/dev.iksa.daemon.plist` example (`ProgramArguments` = path to `iksa`, `daemon`; `RunAtLoad` true; `KeepAlive` true), loaded with `launchctl bootstrap gui/$(id -u) <plist>`. `ANTHROPIC_API_KEY` is not put in the plist; the Keychain key is used.
 - [ ] **Step 4:** Commit `docs: M2b pillars, daemon README`.
 
@@ -243,7 +344,9 @@ Same as M2a. Codex does one task per run with TDD, runs all ignored tests (`--sk
 | E4 | 3 | full ignored suite `--skip live_` | Old `run` tests unchanged; daemon lock, recover, idle-close pass |
 | E5 | 4 | full ignored suite `--skip live_` | Peak concurrency == max_agents; isolation; M1 pillars still pass |
 | E6 | 5 | full ignored suite `--skip live_` | Suggestions bounded, scrubbed, only on Committed |
-| E7 | 6 | pillar tests | Idle daemon: no Chromium, ≤ 30 MB, no sockets |
-| E8 | all | `ls -l target/release/iksa` | < 60 MB |
+| E7 | 6 | full ignored suite `--skip live_` | Grant scope enforced; Financial always pauses; records name the grant |
+| E8 | 7 | full ignored suite `--skip live_` | Pause stops before next step; stuck loop fails after 3 |
+| E9 | 8 | pillar tests | Idle daemon: no Chromium, ≤ 30 MB, no sockets |
+| E10 | all | `ls -l target/release/iksa` | < 60 MB |
 
-After E8: M3 plan (human browsing in iksa's profile, bundled MV3 extension UI with ledger/inbox/approvals over native messaging, Agent View, copy-on-write cookies, page-visit triggers, per-domain mutation lock, H2 address-bar check).
+After E10: M3 plan (human browsing in iksa's profile, bundled MV3 extension UI with ledger/inbox/approvals over native messaging, Agent View, copy-on-write cookies, page-visit triggers, per-domain mutation lock, H2 address-bar check).

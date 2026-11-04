@@ -14,3 +14,4 @@ blake3 = "1.8"
 zstd = "0.13"
 thiserror = "2"
 rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
+ureq = { version = "3", features = ["json"] }

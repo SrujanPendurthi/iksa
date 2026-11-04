@@ -504,3 +504,20 @@ async fn about_blank_navigation_commits() {
     assert_eq!(state, State::Committed);
     assert_eq!(f.outcome(id), "d");
 }
+
+#[tokio::test]
+#[ignore]
+async fn missing_selector_names_it() {
+    let f = EngineFixture::new();
+    let id =
+        f.l.add("missing", &[f.nav("/form"), extract("#nope")])
+            .unwrap();
+    let state =
+        f.e.run_with_timeout(&f.l, &f.c, &Config::default(), id, Duration::from_secs(2))
+            .await
+            .unwrap();
+    assert!(
+        matches!(state, State::Failed(ref s) if s.contains("selector \"#nope\" not found within 2s")),
+        "{state:?}"
+    );
+}

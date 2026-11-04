@@ -65,7 +65,11 @@ async fn execute() -> anyhow::Result<i32> {
             let (_, ledger, _) = open()?;
             let mut json = String::new();
             if path == "-" {
+                if unsafe { libc::isatty(0) } == 1 {
+                    eprintln!("reading task JSON from stdin (Ctrl-D to finish)…");
+                }
                 std::io::stdin().read_to_string(&mut json)?;
+                anyhow::ensure!(!json.trim().is_empty(), "no task JSON on stdin");
             } else {
                 json = std::fs::read_to_string(path).with_context(|| path.to_owned())?;
             }
@@ -112,6 +116,10 @@ async fn execute() -> anyhow::Result<i32> {
             let (cfg, ledger, cas) = open()?;
             ledger.recover()?;
             audit::gc(&ledger, &cas, cfg.retention_days, audit::now_ms())?;
+            if ledger.next_queued()?.is_none() {
+                println!("no queued tasks");
+                return Ok(0);
+            }
             let chromium =
                 setup::chromium_path(&home).context("Chromium is not installed; run iksa setup")?;
             let engine = Engine::launch(

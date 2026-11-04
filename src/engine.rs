@@ -151,8 +151,17 @@ impl Engine {
             (None, vec![])
         })
     }
-    async fn locate(&self, b: &Browser, s: &str, selector: &str) -> anyhow::Result<Value> {
+    async fn locate(
+        &self,
+        b: &Browser,
+        s: &str,
+        selector: &str,
+        deadline: Instant,
+        timeout: Duration,
+    ) -> anyhow::Result<Value> {
+        let original = selector;
         let selector = serde_json::to_string(selector)?;
+        tokio::time::timeout_at(deadline.into(), async {
         loop {
             let v=self.eval(b,s,format!("(()=>{{const e=document.querySelector({selector});if(!e)return null;e.scrollIntoView({{block:'center'}});const r=e.getBoundingClientRect();return {{x:r.x+r.width/2,y:r.y+r.height/2}}}})()")).await?;
             if !v.is_null() {
@@ -160,6 +169,7 @@ impl Engine {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        }).await.map_err(|_| anyhow::anyhow!("timeout: selector {original:?} not found within {timeout:?}"))?
     }
     async fn action(
         &self,
@@ -167,6 +177,8 @@ impl Engine {
         s: &str,
         a: &Action,
         cfg: &Config,
+        deadline: Instant,
+        timeout: Duration,
     ) -> anyhow::Result<(String, Option<u16>, Vec<(String, String)>)> {
         let (status, headers) = match a {
             Action::Navigate { .. } | Action::Search { .. } => {
@@ -174,7 +186,7 @@ impl Engine {
                 (st, h)
             }
             Action::Click { selector, .. } | Action::Type { selector, .. } => {
-                let xy = self.locate(b, s, selector).await?;
+                let xy = self.locate(b, s, selector, deadline, timeout).await?;
                 for kind in ["mousePressed", "mouseReleased"] {
                     b.call(
                         "Input.dispatchMouseEvent",
@@ -205,7 +217,7 @@ impl Engine {
             Action::Click { .. } => "clicked".into(),
             Action::Type { .. } => "typed".into(),
             Action::Extract { selector } => {
-                self.locate(b, s, selector).await?;
+                self.locate(b, s, selector, deadline, timeout).await?;
                 let selector = serde_json::to_string(selector)?;
                 self.eval(
                     b,
@@ -339,7 +351,7 @@ impl Engine {
                             .await?;
                         for a in replay {
                             if let Action::Type { secret, .. } = a {
-                                self.action(b, &s, a, cfg).await?;
+                                self.action(b, &s, a, cfg, Instant::now() + timeout, timeout).await?;
                                 secret_on_page |= *secret;
                             }
                         }
@@ -361,13 +373,14 @@ impl Engine {
                 } else {
                     "auto"
                 };
-                let execution = tokio::time::timeout(timeout, async {
+                let deadline = Instant::now() + timeout;
+                let execution = async {
                     let before_document = if secret_on_page && url_of(a, cfg).is_some() {
                         Some(b.call("Page.getFrameTree", json!({}), Some(&s)).await?["frameTree"]["frame"]["loaderId"].clone())
                     } else {
                         None
                     };
-                    let (outcome, status, headers) = self.action(b, &s, a, cfg).await?;
+                    let (outcome, status, headers) = self.action(b, &s, a, cfg, deadline, timeout).await?;
                     let new_document = if let Some(before) = before_document {
                         before != b.call("Page.getFrameTree", json!({}), Some(&s)).await?["frameTree"]["frame"]["loaderId"]
                     } else {
@@ -401,9 +414,14 @@ impl Engine {
                         Some(k) if self.remaining_challenge(b, &s, k).await? => Some(k),
                         _ => None,
                     })
-                })
-                .await;
-                if let Some(k) = execution?? {
+                };
+                // Poll the action first so locate can report its selector at the same deadline.
+                let execution = tokio::select! {
+                    biased;
+                    result = execution => result,
+                    _ = tokio::time::sleep_until(deadline.into()) => Err(anyhow::anyhow!("timeout at step {n}")),
+                };
+                if let Some(k) = execution? {
                     let state = State::AwaitingHandoff(Handoff::Challenge(k));
                     l.transition(id, state.clone())?;
                     return Ok(state);

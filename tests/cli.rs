@@ -145,6 +145,7 @@ fn chromium_launch_failure_keeps_task_queued() {
 #[test]
 fn run_without_setup_says_run_setup() {
     let h = TempDir::new();
+    add(&h);
     let o = cmd(&h).env_remove("CHROMIUM").arg("run").output().unwrap();
     assert_eq!(o.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&o.stderr).contains("iksa setup"));
@@ -204,4 +205,29 @@ fn bad_id_is_usage_error() {
     let o = run(&h, &["approve", "x"]);
     assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stderr).contains("usage:"));
+}
+
+#[test]
+fn add_from_tty_explains() {
+    let h = TempDir::new();
+    let o = cmd(&h)
+        .args(["add", "-"])
+        .stdin(std::fs::File::open("/dev/null").unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(o.stderr).unwrap().trim(),
+        "error: no task JSON on stdin"
+    );
+}
+#[test]
+fn run_with_empty_queue() {
+    let h = TempDir::new();
+    let o = cmd(&h)
+        .arg("run")
+        .env("CHROMIUM", "/nonexistent")
+        .output()
+        .unwrap();
+    assert_eq!(ok(o).trim(), "no queued tasks");
 }

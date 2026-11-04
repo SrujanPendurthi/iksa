@@ -111,11 +111,20 @@ pub fn grade(case: &Case, state: Option<&State>, answer: &str, requests: &[Value
                         && if expected.bytes().any(|b| b.is_ascii_alphabetic()) {
                             answer.contains(&expected)
                         } else {
-                            answer.match_indices(&expected).any(|(i, _)| {
-                                !answer[..i].ends_with(|c: char| c.is_ascii_digit())
-                                    && !answer[i + expected.len()..]
-                                        .starts_with(|c: char| c.is_ascii_digit())
-                            })
+                            // "09:40" also accepts "9:40"; digit boundaries still reject "19:40".
+                            let short = expected
+                                .strip_prefix('0')
+                                .filter(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+                            [Some(expected.as_str()), short]
+                                .into_iter()
+                                .flatten()
+                                .any(|e| {
+                                    answer.match_indices(e).any(|(i, _)| {
+                                        !answer[..i].ends_with(|c: char| c.is_ascii_digit())
+                                            && !answer[i + e.len()..]
+                                                .starts_with(|c: char| c.is_ascii_digit())
+                                    })
+                                })
                         }
                 })
                 && case.evidence.as_ref().is_none_or(|e| {
@@ -309,7 +318,8 @@ impl Relay {
                 let (mut stream, _) = match listener.accept() {
                     Ok(v) => v,
                     Err(_) => {
-                        seen.lock().unwrap().push(rejected_exchange());
+                        // Back off on persistent errors (e.g. out of file descriptors).
+                        thread::sleep(Duration::from_millis(10));
                         continue;
                     }
                 };

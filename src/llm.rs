@@ -3,6 +3,8 @@ use anyhow::Context;
 use serde_json::{Value, json};
 use std::time::Duration;
 
+pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug)]
 pub struct Reply {
     pub tool_count: usize,
@@ -53,7 +55,7 @@ pub fn call(cfg: &ModelConfig, key: &str, body: &Value) -> anyhow::Result<Reply>
         .http_status_as_error(false)
         .max_redirects(0)
         .proxy(None)
-        .timeout_global(Some(Duration::from_secs(60)))
+        .timeout_global(Some(CLIENT_TIMEOUT))
         .build()
         .into();
     let url = format!("{}/v1/messages", cfg.endpoint.trim_end_matches('/'));

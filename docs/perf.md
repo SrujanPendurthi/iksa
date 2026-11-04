@@ -62,3 +62,57 @@ Pillar fix: `idle_egress_is_loopback_only` once saw 2 page targets because `Pill
 **H2 — address bar with memory flags:** deferred to M3. Not run manually; it only affects human browsing in iksa's own profile, which M3 introduces. M3's plan carries it as an automated or guided check with the bundled extension.
 
 **M1 closed 2026-11-03.**
+
+
+## M2a planner eval — preparation (2026-11-04)
+
+**D9: NOT RUN.** The live evaluation is awaiting explicit API-spend approval. No live score, token usage, or actual cost is claimed below. The harness and fixtures are in `tests/eval.rs` and `tests/eval/`.
+
+The manifest contains 15 local fixture goals and five public, read-only goals. The initial navigation is an ordinary ledger step. Real-site write actions require approval; an approval pause fails those read-only goals. Reference values for the public pages are captured before the run in the same isolated Chromium process; Hacker News and DuckDuckGo are captured last and evaluated first to reduce drift. Missing references count as failed tasks, with no fabricated expected answer.
+
+| # | Goal | Live success | Steps | Input / output tokens | USD |
+|---|---|---|---|---|---|
+| 1 | Search form | Not run | — | — | — |
+| 2 | Multi-page navigation | Not run | — | — | — |
+| 3 | Pagination | Not run | — | — | — |
+| 4 | Table cell | Not run | — | — | — |
+| 5 | Dismiss modal | Not run | — | — | — |
+| 6 | Fix validation | Not run | — | — | — |
+| 7 | Named secret login | Not run | — | — | — |
+| 8 | Financial approval | Not run | — | — | — |
+| 9 | CAPTCHA handoff | Not run | — | — | — |
+| 10 | Distractor links | Not run | — | — | — |
+| 11 | Native select | Not run | — | — | — |
+| 12 | Checkbox and terms | Not run | — | — | — |
+| 13 | Same-page anchor | Not run | — | — | — |
+| 14 | Impossible goal | Not run | — | — | — |
+| 15 | Blocked domain | Not run | — | — | — |
+| 16 | Wikipedia fact | Not run | — | — | — |
+| 17 | Hacker News top title | Not run | — | — | — |
+| 18 | Example.com paragraph | Not run | — | — | — |
+| 19 | DuckDuckGo result | Not run | — | — | — |
+| 20 | MDN property fact | Not run | — | — | — |
+
+The grade requires the expected terminal state and answer string, or the expected approval/challenge pause. Validation-error and same-page-anchor cases also require evidence in a subsequent model request. Financial approval must pause on a pending Financial click. Native select behavior is measured as implemented; the fixture and grade do not bypass missing product capabilities. The live test asserts that all 20 cases were attempted, plus secret and never_send privacy invariants; it does not assert a success threshold. D9 requires at least 16/20 on Opus 5.5.
+
+Usage is captured by a test-only loopback relay forwarding the exact Messages request to the Anthropic endpoint. It preserves retries and drains in-flight work before reading measurements. API keys are forwarded in headers and are not logged. Prompt token totals include uncached input, cache creation and cache reads. USD is a valuation of returned usage at the verified public rates, not an invoice. Missing usage remains unknown. Fallback/refusal billing, including possible credits, is marked unknown rather than assigning an invented cost; per-attempt usage is retained in the JSON output.
+
+The offline harness runs local fixtures with mock model replies, skips the five external sites, verifies login/validation/checkbox interactions with scripted browser actions, and labels every row **not scored**. Offline tokens are explicitly mock data. They are not live evaluation results.
+
+### Estimated API spend for approval
+
+Rates checked against [Anthropic's pricing documentation](https://platform.claude.com/docs/en/about-claude/pricing) on 2026-11-04: Opus 5.5 input $4/MTok, output $20/MTok, 5-minute cache writes $5/MTok and cache reads $0.20/MTok. [Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching) applies only when the prefix qualifies and cache entries remain valid. [Fallback billing](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback) can add attempts or credits.
+
+Assume 20 goals × 8 turns = 160 calls, about 6,000 input tokens/call (960,000 total), and a reusable 1,000-token prefix. With one cache write and 159 hits, 400 output tokens/call gives **about $4.52**; with no cache, **$5.12**. At 1,000 output tokens/call these become **$6.44 / $7.04**. At the full 4,096-token output limit, 160 calls cost about **$16.95** without caching. If all 20 goals reach 25 turns, the same input estimate and full output limit give about **$52.96**, before retries or fallback effects. These are estimates, not spend caps.
+
+### Running after approval
+
+`live_eval` is ignored and additionally requires `IKSA_LIVE_EVAL_APPROVED=1` and an existing `ANTHROPIC_API_KEY` environment variable. It never reads the real Keychain: the demo secret uses the isolated fake Keychain. It uses `claude-opus-5-5`, effort `low`, 25 turns maximum per goal. This command is recorded for later use; it has **not** been run:
+
+```sh
+IKSA_LIVE_EVAL_APPROVED=1 CHROMIUM=$PWD/.spike-home/chromium/Chromium.app/Contents/MacOS/Chromium cargo test --release --test eval live_eval -- --ignored --test-threads=1 --nocapture
+```
+
+The run prints a Markdown table and one `EVAL_RESULT` JSON object. After a user-approved run, replace the pending table with its actual measurements and record success totals, privacy assertions, cost, and any unpriced usage. Only then make Task 7's live-results commit. A result below 16/20 is reported as below target and belongs to M2a-tune; grades must not be weakened.
+
+Offline validation on 2026-11-04: all **115 regular tests** and **52 non-live ignored tests** passed, including nine eval helper checks and the offline Chromium smoke run. Both commands excluded `live_*`. These results validate the harness and existing product; they do not establish a live score or D9 pass.

@@ -1,0 +1,152 @@
+[
+  {
+    "path": "/search",
+    "file": "search.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/multi",
+    "file": "multi.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/research",
+    "file": "research.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/schedule",
+    "file": "schedule.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/catalog?page=1",
+    "file": "catalog1.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/catalog?page=2",
+    "file": "catalog2.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/catalog?page=3",
+    "file": "catalog3.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/warehouse",
+    "file": "warehouse.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/modal",
+    "file": "modal.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/validation",
+    "file": "validation.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/login",
+    "file": "login.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/buy",
+    "file": "buy.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/captcha",
+    "file": "captcha.html",
+    "status": 403,
+    "challenge": true
+  },
+  {
+    "path": "/distractors",
+    "file": "distractors.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/hours",
+    "file": "hours.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/select",
+    "file": "select.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/terms",
+    "file": "terms.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/anchor",
+    "file": "anchor.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/impossible",
+    "file": "impossible.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/private",
+    "file": "private.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/offline",
+    "file": "offline.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/weather",
+    "file": "decoy.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/parking",
+    "file": "decoy.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/cafeteria",
+    "file": "decoy.html",
+    "status": 200,
+    "challenge": false
+  },
+  {
+    "path": "/archive",
+    "file": "decoy.html",
+    "status": 200,
+    "challenge": false
+  }
+]

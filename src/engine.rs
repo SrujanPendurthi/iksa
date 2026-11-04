@@ -57,22 +57,28 @@ fn scrub(s: &str, secrets: &[String]) -> String {
         .filter(|s| !s.is_empty())
         .fold(s.to_owned(), |s, secret| s.replace(secret, "••••"))
 }
+fn scrub_forms(text: &str, secrets: &[String], forms: impl Fn(&str) -> Vec<String>) -> String {
+    let mut variants: Vec<_> = secrets
+        .iter()
+        .filter(|s| !s.is_empty())
+        .flat_map(|s| forms(s))
+        .collect();
+    variants.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    variants.dedup();
+    scrub(text, &variants)
+}
 fn scrub_snapshot(html: &str, secrets: &[String]) -> String {
     // outerHTML escapes text and attributes differently. Redact both serialized forms.
-    let mut variants = Vec::new();
-    for secret in secrets {
+    scrub_forms(html, secrets, |secret| {
         let amp = secret.replace('&', "&amp;");
         let text = amp.replace('<', "&lt;").replace('>', "&gt;");
-        variants.extend([
-            secret.clone(),
+        vec![
+            secret.to_owned(),
             text.clone(),
             text.replace('"', "&quot;"),
             amp.replace('"', "&quot;"),
-        ]);
-    }
-    variants.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    variants.dedup();
-    scrub(html, &variants)
+        ]
+    })
 }
 #[derive(Default)]
 struct ModelStep {
@@ -135,15 +141,10 @@ fn action_contains_secret(action: &Action, secrets: &[String]) -> bool {
     })
 }
 fn scrub_model(text: &str, secrets: &[String]) -> String {
-    let mut variants = Vec::new();
-    for secret in secrets.iter().filter(|s| !s.is_empty()) {
-        variants.push(secret.clone());
+    scrub_forms(text, secrets, |secret| {
         let quoted = serde_json::to_string(secret).unwrap();
-        variants.push(quoted[1..quoted.len() - 1].to_owned());
-    }
-    variants.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    variants.dedup();
-    scrub(text, &variants)
+        vec![secret.to_owned(), quoted[1..quoted.len() - 1].to_owned()]
+    })
 }
 /// Sequential execution on the caller's future; the ledger is deliberately not Sync.
 pub struct Engine {

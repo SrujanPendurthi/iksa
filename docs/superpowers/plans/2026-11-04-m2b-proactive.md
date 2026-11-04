@@ -93,9 +93,9 @@ Same as M2a. Codex does one task per run with TDD, runs all ignored tests (`--sk
 **Interfaces:**
 - Produces:
   - `State::Suggested`, `State::Dismissed`, added as unit variants so old rows still parse.
-  - `Ledger::suggest(&self, goal: &str) -> Result<Option<i64>, LedgerError>`: inserts a `Suggested` goal task with title = goal. Returns `None` without inserting if an open task (`Suggested | Queued | Executing | AwaitingHandoff(_)`) has the same goal.
-  - `Ledger::accept(id) -> Result<(), LedgerError>`: conditional `Suggested`→`Queued`.
-  - `Ledger::dismiss(id) -> Result<(), LedgerError>`: `Suggested`→`Dismissed`, sets `finished_ms`.
+  - `Ledger::suggest(&self, goal: &str) -> anyhow::Result<Option<i64>>`: inserts a `Suggested` goal task with title = goal. Returns `None` without inserting if an open task (`Suggested | Queued | Executing | AwaitingHandoff(_)`) has the same goal.
+  - `Ledger::accept(id) -> anyhow::Result<()>`: conditional `Suggested`→`Queued`.
+  - `Ledger::dismiss(id) -> anyhow::Result<()>`: `Suggested`→`Dismissed`, sets `finished_ms`.
   - `Ledger::is_open(state: &State) -> bool`: a free fn `ledger::is_open`.
 - CLI:
   - `inbox` lists `Suggested` tasks as `{id}\t{goal}`, or prints `inbox empty`.
@@ -107,7 +107,7 @@ Same as M2a. Codex does one task per run with TDD, runs all ignored tests (`--sk
     - suggest → state `Suggested`, `next_queued()` is `None`;
     - accept → `Queued`;
     - a second suggest → dismiss → `Dismissed` with `finished_ms.is_some()`;
-    - accept on a dismissed task → `Illegal`; dismiss on a `Queued` task → `Illegal`.
+    - accept on a dismissed task → `Err("illegal transition …")`; dismiss on a `Queued` task → `Err("illegal transition …")`.
   - `ledger::suggest_dedupes_open_goal`: suggest "x" twice → `Some`, then `None`. After the first is dismissed, suggest "x" → `Some`. Also `add_goal("x","x")` Queued, then suggest "x" → `None`.
   - `audit::dismissed_is_gc_eligible`: a dismissed task older than retention is removed by `gc`.
   - `cli::inbox_accept_dismiss`: the test inserts suggestions via `Ledger::open(home/ledger.db)` + `suggest`. `inbox` prints both. `accept 1` with no model → exit 1 with `configure "model"`. With a model, `accept 1` → `list` shows `Queued`. `dismiss 2` → `inbox empty`. `accept abc` → exit 2.
@@ -149,11 +149,11 @@ Same as M2a. Codex does one task per run with TDD, runs all ignored tests (`--sk
   - Table `schedules(id INTEGER PRIMARY KEY, spec TEXT NOT NULL, goal TEXT NOT NULL, auto INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL, last_task INTEGER)`, created `IF NOT EXISTS` in `open`.
   - `tasks.schedule_id INTEGER` column, added with the same `pragma_table_info` migration as `goal`; `Task.schedule_id: Option<i64>`.
   - `pub struct Schedule { id: i64, spec: String, goal: String, auto: bool, next_ms: u64, last_task: Option<i64>, accepted: u32, dismissed: u32 }`. The two counts are derived from the schedule's tasks: accepted = left `Suggested` for any state but `Dismissed`.
-  - `Ledger::add_schedule(spec, goal, auto, next_ms) -> Result<i64, LedgerError>`: refuses a 33rd schedule with `at most 32 schedules`.
-  - `Ledger::set_schedule_auto(id, auto: bool) -> Result<(), LedgerError>`.
-  - `Ledger::schedules() -> Result<Vec<Schedule>, LedgerError>`.
-  - `Ledger::remove_schedule(id) -> Result<(), LedgerError>` (`NotFound` if absent; created tasks are kept).
-  - `Ledger::fire_due(now_ms: u64, next: impl Fn(&str, u64) -> u64) -> Result<Vec<i64>, LedgerError>`:
+  - `Ledger::add_schedule(spec, goal, auto, next_ms) -> anyhow::Result<i64>`: refuses a 33rd schedule with `at most 32 schedules`.
+  - `Ledger::set_schedule_auto(id, auto: bool) -> anyhow::Result<()>`.
+  - `Ledger::schedules() -> anyhow::Result<Vec<Schedule>>`.
+  - `Ledger::remove_schedule(id) -> anyhow::Result<()>` (`Err("task {id} not found")` if absent; created tasks are kept).
+  - `Ledger::fire_due(now_ms: u64, next: impl Fn(&str, u64) -> u64) -> anyhow::Result<Vec<i64>>`:
     - one IMMEDIATE transaction;
     - for each schedule with `next_ms <= now_ms`, if `last_task` is missing or not open, insert a goal task with `schedule_id` set (`Queued` when `auto`, else `Suggested`, deduped like `suggest`) and set `last_task`;
     - always set `next_ms = next(spec, now_ms)`;
@@ -223,7 +223,7 @@ Same as M2a. Codex does one task per run with TDD, runs all ignored tests (`--sk
 - Consumes: Task 3's loop.
 - Produces:
   - `Config.max_agents: u32` (serde default 3, validate 1..=8).
-  - `Ledger::queued(limit: usize) -> Result<Vec<Task>, LedgerError>`, oldest first.
+  - `Ledger::queued(limit: usize) -> anyhow::Result<Vec<Task>>`, oldest first.
   - Engine: replace `self.browser.borrow_mut().take()` on cleanup failure with a `broken: Cell<bool>` flag. When set, new runs return `browser unavailable after cleanup timeout` and the daemon drops and relaunches the engine once no worker holds it. `RefCell<Option<Browser>>` stays for the drop.
   - The daemon runs inside a `tokio::task::LocalSet`. It keeps `running: HashSet<i64>` and starts queued tasks not in `running` with `spawn_local`. Each worker opens its own `Ledger` and `Cas` and shares `Rc<Engine>`. The dispatcher is single-threaded, so no claim race is possible.
   - Slot rule: a task with `schedule_id.is_some()` that never sat in `Suggested` is background. The inbox's accept counts as a human start, so `Ledger` records `accepted_ms` (new nullable column) on `accept`. Background tasks start only while running < `max_agents`; human tasks start while running < `max_agents + 1`.
@@ -264,9 +264,9 @@ Same as M2a. Codex does one task per run with TDD, runs all ignored tests (`--sk
 - Produces:
   - Table `grants(id INTEGER PRIMARY KEY, domain TEXT NOT NULL, schedule_id INTEGER, expires_ms INTEGER NOT NULL, policy TEXT NOT NULL)`.
   - `pub fn Config::policy_fingerprint(&self) -> String`: the BLAKE3 hex of `serde_json::to_string(&(&self.auto_max, &self.never_send))`.
-  - `Ledger::add_grant(domain, schedule_id: Option<i64>, expires_ms, policy) -> Result<i64, LedgerError>`.
-  - `Ledger::grants() -> Result<Vec<Grant>, LedgerError>`.
-  - `Ledger::remove_grant(id) -> Result<(), LedgerError>`.
+  - `Ledger::add_grant(domain, schedule_id: Option<i64>, expires_ms, policy) -> anyhow::Result<i64>`.
+  - `Ledger::grants() -> anyhow::Result<Vec<Grant>>`.
+  - `Ledger::remove_grant(id) -> anyhow::Result<()>`.
   - `pub fn grant_for(grants: &[Grant], host: &str, schedule_id: Option<i64>, risk: Risk, now_ms: u64, cfg: &Config) -> Option<i64>`. It is a pure fn and returns `None` unless all of these hold:
     - `risk == Write`;
     - the host matches;
@@ -306,13 +306,13 @@ Same as M2a. Codex does one task per run with TDD, runs all ignored tests (`--sk
   - `Ledger::request_pause(id)`:
     - on a `Queued` task: transition directly to `AwaitingHandoff(Paused)` (new allowlisted edge);
     - on an `Executing` task: set a new nullable `pause_requested` column;
-    - anything else → `Illegal`.
+    - anything else → `Err("illegal transition …")`.
   - The engine checks `pause_requested` before each step. When set, it clears it and transitions to `AwaitingHandoff(Paused)`. A step already in flight finishes first.
   - `resume` accepts `Paused` as well as `Challenge`.
   - Stuck detector in the goal loop: keep the last 3 `(action JSON with selector, observation hash)` pairs. Three equal in a row → `Failed("stuck: repeated <op> 3 times")`.
 
 - [ ] **Step 1: Failing tests:**
-  - Unit `ledger::pause_queued_and_resume`: Queued → `request_pause` → `AwaitingHandoff(Paused)` → `resume` → `Queued`. `request_pause` on `Committed` → `Illegal`.
+  - Unit `ledger::pause_queued_and_resume`: Queued → `request_pause` → `AwaitingHandoff(Paused)` → `resume` → `Queued`. `request_pause` on `Committed` → `Err("illegal transition …")`.
   - `#[ignore]` `planner::pause_stops_running_goal`: the mock model delays 1 s per turn. After the first request arrives the test calls `request_pause`. The task ends `AwaitingHandoff(Paused)` with fewer steps than the mock script. After `resume` and another run it reaches `Committed`.
   - `#[ignore]` `planner::stuck_model_fails`: the mock always answers `click` on the same ref of a static page → `Failed` containing `stuck: repeated click 3 times`, after exactly 3 click records.
   - `cli::pause_command`: `pause 1` on a queued task → `list` shows `paused` in the waiting-on column.

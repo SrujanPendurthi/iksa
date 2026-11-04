@@ -1,23 +1,17 @@
 pub mod action;
+pub mod audit;
 pub mod cas;
 pub mod cdp;
 pub mod challenge;
 pub mod config;
-pub mod gate;
-pub mod ledger;
-pub mod snapshot;
-
-pub mod audit;
 pub mod engine;
+pub mod gate;
+pub mod keychain;
+pub mod ledger;
+pub mod llm;
+pub mod observe;
+pub mod planner;
+pub mod setup;
+pub mod snapshot;
 #[doc(hidden)]
 pub mod testutil;
-
-pub mod setup;
-
-pub mod observe;
-
-pub mod llm;
-
-pub mod keychain;
-
-pub mod planner;

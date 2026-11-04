@@ -28,22 +28,11 @@ pub struct Task {
     pub approved_step: Option<usize>,
     pub finished_ms: Option<u64>,
 }
-#[derive(Debug, thiserror::Error)]
-pub enum LedgerError {
-    #[error(transparent)]
-    Sql(#[from] rusqlite::Error),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-    #[error("task {0} not found")]
-    NotFound(i64),
-    #[error("illegal transition from {from:?} to {to:?}")]
-    Illegal { from: State, to: State },
-}
 pub struct Ledger {
     conn: rusqlite::Connection,
 }
 impl Ledger {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
+    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let conn = rusqlite::Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(
@@ -69,11 +58,7 @@ impl Ledger {
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         Ok(Self { conn })
     }
-    pub fn record_step(
-        &self,
-        id: i64,
-        record: &crate::audit::StepRecord,
-    ) -> Result<(), LedgerError> {
+    pub fn record_step(&self, id: i64, record: &crate::audit::StepRecord) -> anyhow::Result<()> {
         let mut record = record.clone();
         record.thought = record
             .thought
@@ -84,20 +69,20 @@ impl Ledger {
         )?;
         Ok(())
     }
-    pub fn records(&self, id: i64) -> Result<Vec<crate::audit::StepRecord>, LedgerError> {
+    pub fn records(&self, id: i64) -> anyhow::Result<Vec<crate::audit::StepRecord>> {
         let mut stmt = self
             .conn
             .prepare("SELECT json FROM steps WHERE task_id=?1 ORDER BY seq")?;
         let rows = stmt.query_map([id], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
-    pub fn delete_task(&self, id: i64) -> Result<(), LedgerError> {
+    pub fn delete_task(&self, id: i64) -> anyhow::Result<()> {
         if self.conn.execute("DELETE FROM tasks WHERE id=?1", [id])? == 0 {
-            return Err(LedgerError::NotFound(id));
+            anyhow::bail!("task {id} not found");
         }
         Ok(())
     }
-    pub fn add(&self, title: &str, steps: &[Action]) -> Result<i64, LedgerError> {
+    pub fn add(&self, title: &str, steps: &[Action]) -> anyhow::Result<i64> {
         self.conn.execute(
             "INSERT INTO tasks (title, steps, state) VALUES (?1, ?2, ?3)",
             rusqlite::params![
@@ -108,14 +93,14 @@ impl Ledger {
         )?;
         Ok(self.conn.last_insert_rowid())
     }
-    pub fn add_goal(&self, title: &str, goal: &str) -> Result<i64, LedgerError> {
+    pub fn add_goal(&self, title: &str, goal: &str) -> anyhow::Result<i64> {
         self.conn.execute(
             "INSERT INTO tasks (title, goal, steps, state) VALUES (?1, ?2, '[]', ?3)",
             rusqlite::params![title, goal, serde_json::to_string(&State::Queued)?],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
-    pub fn push_step(&self, id: i64, action: &Action) -> Result<usize, LedgerError> {
+    pub fn push_step(&self, id: i64, action: &Action) -> anyhow::Result<usize> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
@@ -130,13 +115,15 @@ impl Ledger {
         tx.commit()?;
         Ok(index)
     }
-    pub fn get(&self, id: i64) -> Result<Task, LedgerError> {
+    pub fn get(&self, id: i64) -> anyhow::Result<Task> {
         let mut stmt = self.conn.prepare(&format!("{SELECT} WHERE id=?1"))?;
         let mut rows = stmt.query([id])?;
-        let row = rows.next()?.ok_or(LedgerError::NotFound(id))?;
+        let row = rows
+            .next()?
+            .ok_or_else(|| anyhow::anyhow!("task {id} not found"))?;
         Self::task(row)
     }
-    fn task(row: &rusqlite::Row<'_>) -> Result<Task, LedgerError> {
+    fn task(row: &rusqlite::Row<'_>) -> anyhow::Result<Task> {
         Ok(Task {
             id: row.get(0)?,
             title: row.get(1)?,
@@ -148,7 +135,7 @@ impl Ledger {
             finished_ms: row.get(6)?,
         })
     }
-    pub fn list(&self) -> Result<Vec<Task>, LedgerError> {
+    pub fn list(&self) -> anyhow::Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(&format!("{SELECT} ORDER BY id"))?;
         let mut rows = stmt.query([])?;
         let mut tasks = Vec::new();
@@ -157,24 +144,24 @@ impl Ledger {
         }
         Ok(tasks)
     }
-    pub fn set_cursor(&self, id: i64, cursor: usize) -> Result<(), LedgerError> {
+    pub fn set_cursor(&self, id: i64, cursor: usize) -> anyhow::Result<()> {
         if self.conn.execute(
             "UPDATE tasks SET cursor=?2 WHERE id=?1",
             rusqlite::params![id, cursor],
         )? == 0
         {
-            return Err(LedgerError::NotFound(id));
+            anyhow::bail!("task {id} not found");
         }
         Ok(())
     }
-    pub fn next_queued(&self) -> Result<Option<Task>, LedgerError> {
+    pub fn next_queued(&self) -> anyhow::Result<Option<Task>> {
         let mut stmt = self
             .conn
             .prepare(&format!("{SELECT} WHERE state=?1 ORDER BY id LIMIT 1"))?;
         let mut rows = stmt.query([serde_json::to_string(&State::Queued)?])?;
         rows.next()?.map(Self::task).transpose()
     }
-    pub fn transition(&self, id: i64, to: State) -> Result<(), LedgerError> {
+    pub fn transition(&self, id: i64, to: State) -> anyhow::Result<()> {
         let task = self.get(id)?;
         let from = task.state;
         if !matches!(
@@ -186,7 +173,7 @@ impl Ledger {
                 )
                 | (State::AwaitingHandoff(_), State::Queued | State::Failed(_))
         ) {
-            return Err(LedgerError::Illegal { from, to });
+            anyhow::bail!("illegal transition from {from:?} to {to:?}");
         }
         let steps = matches!(to, State::Committed | State::Failed(_)).then_some(task.steps);
         self.transition_from(id, from, to, steps)
@@ -197,7 +184,7 @@ impl Ledger {
         from: State,
         to: State,
         steps: Option<Vec<Action>>,
-    ) -> Result<(), LedgerError> {
+    ) -> anyhow::Result<()> {
         let terminal = matches!(to, State::Committed | State::Failed(_));
         let redacted = steps
             .map(|steps| {
@@ -208,7 +195,7 @@ impl Ledger {
             "UPDATE tasks SET state=?2, finished_ms=CASE WHEN ?3 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) END, steps=COALESCE(?5, steps) WHERE id=?1 AND state=?4",
             rusqlite::params![id, serde_json::to_string(&to)?, terminal, serde_json::to_string(&from)?, redacted],
         )? == 0 {
-            return Err(LedgerError::Illegal { from: self.get(id)?.state, to });
+            anyhow::bail!("illegal transition from {:?} to {to:?}", self.get(id)?.state);
         }
         if terminal {
             // The state update has committed. A busy reader may defer secret erasure
@@ -220,33 +207,27 @@ impl Ledger {
         }
         Ok(())
     }
-    pub fn approve(&self, id: i64) -> Result<(), LedgerError> {
+    pub fn approve(&self, id: i64) -> anyhow::Result<()> {
         let task = self.get(id)?;
         if task.state != State::AwaitingHandoff(Handoff::Approval) {
-            return Err(LedgerError::Illegal {
-                from: task.state,
-                to: State::Queued,
-            });
+            anyhow::bail!("illegal transition from {:?} to Queued", task.state);
         }
         if self.conn.execute(
             "UPDATE tasks SET state=?2, approved_step=cursor, finished_ms=NULL WHERE id=?1 AND state=?3",
             rusqlite::params![id, serde_json::to_string(&State::Queued)?, serde_json::to_string(&State::AwaitingHandoff(Handoff::Approval))?],
         )? == 0 {
-            return Err(LedgerError::Illegal { from: self.get(id)?.state, to: State::Queued });
+            anyhow::bail!("illegal transition from {:?} to Queued", self.get(id)?.state);
         }
         Ok(())
     }
-    pub fn resume(&self, id: i64) -> Result<(), LedgerError> {
+    pub fn resume(&self, id: i64) -> anyhow::Result<()> {
         let task = self.get(id)?;
         if !matches!(task.state, State::AwaitingHandoff(Handoff::Challenge(_))) {
-            return Err(LedgerError::Illegal {
-                from: task.state,
-                to: State::Queued,
-            });
+            anyhow::bail!("illegal transition from {:?} to Queued", task.state);
         }
         self.transition_from(id, task.state, State::Queued, None)
     }
-    pub fn recover(&self) -> Result<usize, LedgerError> {
+    pub fn recover(&self) -> anyhow::Result<usize> {
         Ok(self.conn.execute(
             "UPDATE tasks SET state=?1 WHERE state=?2",
             rusqlite::params![
@@ -368,6 +349,22 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
     }
     #[test]
+    fn ledger_errors_keep_messages() {
+        let dir = temp_dir("ledger-error-messages");
+        let path = dir.0.join("ledger.db");
+        let first = Ledger::open(&path).unwrap();
+        let second = Ledger::open(&path).unwrap();
+        let missing: anyhow::Result<Task> = first.get(-1);
+        assert_eq!(missing.unwrap_err().to_string(), "task -1 not found");
+        let id = first.add("x", &[]).unwrap();
+        first.transition(id, State::Executing).unwrap();
+        let stale: anyhow::Result<()> = second.transition(id, State::Executing);
+        assert_eq!(
+            stale.unwrap_err().to_string(),
+            "illegal transition from Executing to Executing"
+        );
+    }
+    #[test]
     fn stale_handle_transition_rejected() {
         let dir = temp_dir("ledger-stale");
         let path = dir.0.join("ledger.db");
@@ -375,13 +372,13 @@ mod tests {
         let second = Ledger::open(&path).unwrap();
         let id = first.add("x", &[]).unwrap();
         first.transition(id, State::Executing).unwrap();
-        assert!(matches!(
-            second.transition(id, State::Executing),
-            Err(LedgerError::Illegal {
-                from: State::Executing,
-                to: State::Executing
-            })
-        ));
+        assert_eq!(
+            second
+                .transition(id, State::Executing)
+                .unwrap_err()
+                .to_string(),
+            "illegal transition from Executing to Executing"
+        );
         assert_eq!(second.get(id).unwrap().state, State::Executing);
     }
     #[test]
@@ -466,7 +463,7 @@ mod tests {
             ledger.approve(-1).unwrap_err(),
             ledger.resume(-1).unwrap_err(),
         ] {
-            assert!(matches!(error, LedgerError::NotFound(-1)));
+            assert_eq!(error.to_string(), "task -1 not found");
         }
         drop(ledger);
         assert_eq!(Ledger::open(path).unwrap().get(id).unwrap().title, "first");
@@ -499,8 +496,9 @@ mod tests {
                     result.unwrap();
                     assert_eq!(ledger.get(id).unwrap().state, to);
                 } else {
-                    assert!(
-                        matches!(result, Err(LedgerError::Illegal { from: f, to: t }) if f == from && t == to)
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        format!("illegal transition from {from:?} to {to:?}")
                     );
                     assert_eq!(ledger.get(id).unwrap().state, from);
                 }
@@ -518,10 +516,10 @@ mod tests {
             let before = ledger.get(id).unwrap();
             assert!(before.finished_ms.unwrap() > 0);
             for to in states() {
-                assert!(matches!(
-                    ledger.transition(id, to),
-                    Err(LedgerError::Illegal { .. })
-                ));
+                assert_eq!(
+                    ledger.transition(id, to.clone()).unwrap_err().to_string(),
+                    format!("illegal transition from {:?} to {to:?}", before.state)
+                );
             }
             assert!(ledger.approve(id).is_err());
             assert!(ledger.resume(id).is_err());
@@ -666,10 +664,10 @@ mod tests {
             ledger.get(id).unwrap().goal.as_deref(),
             Some("Read a heading")
         );
-        assert!(matches!(
-            ledger.push_step(-1, &nav),
-            Err(LedgerError::NotFound(-1))
-        ));
+        assert_eq!(
+            ledger.push_step(-1, &nav).unwrap_err().to_string(),
+            "task -1 not found"
+        );
         let scripted = ledger.add("scripted", &[nav]).unwrap();
         assert_eq!(ledger.push_step(scripted, &extract).unwrap(), 1);
         drop(ledger);

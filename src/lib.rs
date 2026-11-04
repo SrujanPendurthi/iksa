@@ -11,6 +11,7 @@ pub mod ledger;
 pub mod llm;
 pub mod observe;
 pub mod planner;
+pub mod schedule;
 pub mod setup;
 pub mod snapshot;
 #[doc(hidden)]

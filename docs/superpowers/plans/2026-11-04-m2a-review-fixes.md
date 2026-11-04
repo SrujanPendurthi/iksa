@@ -37,7 +37,7 @@ The live eval (M2a Task 7 Step 2) runs **after** this plan, unchanged in approva
 
 **Files:** `tests/eval/support.rs`, `tests/eval.rs`, `.gitignore`.
 
-- [ ] **Step 1: Failing tests (in `tests/eval.rs`, non-ignored):**
+- [x] **Step 1: Failing tests (in `tests/eval.rs`, non-ignored):**
   - `relay_rejects_malformed_request`:
     - `Relay::mock()`; open a `TcpStream` to its endpoint and write `GET / HTTP/1.1\r\n\r\n`;
     - read the response; assert it starts with `HTTP/1.1 400`;
@@ -51,8 +51,8 @@ The live eval (M2a Task 7 Step 2) runs **after** this plan, unchanged in approva
     - The text case `"NOVA-42"` keeps its current behaviour.
   - `relay_timeout_below_client_timeout`: `assert!(support::RELAY_UPSTREAM_TIMEOUT < iksa::llm::CLIENT_TIMEOUT)`.
   - `external_order_names_every_external_case`: `support::CAPTURE_ORDER` and `support::RUN_ORDER` are each a permutation of the ids of the 5 non-local cases. `RUN_ORDER` starts with `"hacker-news"`, `"duckduckgo"`; `CAPTURE_ORDER` ends with `"duckduckgo"`, `"hacker-news"`.
-- [ ] **Step 2:** `cargo test --test eval` → the 4 new tests FAIL (compile errors count).
-- [ ] **Step 3: Implement.**
+- [x] **Step 2:** `cargo test --test eval` → the 4 new tests FAIL (compile errors count).
+- [x] **Step 3: Implement.**
   - `src/llm.rs`: `pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);`, used where `timeout_global` is set now (line 56). The value is unchanged.
   - `support.rs`:
     - `pub const RELAY_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(55);`, used at the Forward agent's `timeout_global`.
@@ -61,8 +61,8 @@ The live eval (M2a Task 7 Step 2) runs **after** this plan, unchanged in approva
     - `pub const CAPTURE_ORDER: [&str; 5] = ["wikipedia", "example", "mdn", "duckduckgo", "hacker-news"]` and `pub const RUN_ORDER: [&str; 5] = ["hacker-news", "duckduckgo", "wikipedia", "example", "mdn"]`. Look up cases by `id`, replacing the index arrays at lines 692 and 712. Local cases still run after them, in manifest order.
     - Line 785: bind `ledger.get(id)?` once.
   - `.gitignore`: add `/reports` and `/research_notes`.
-- [ ] **Step 4:** `cargo test -- --skip live_` passes, plus the full ignored suite with `--skip live_` (it includes `offline_eval_harness`).
-- [ ] **Step 5:** Commit everything uncommitted from Task 7 prep plus these fixes. `git status` must show `reports/` and `research_notes/` ignored and not staged.
+- [x] **Step 4:** `cargo test -- --skip live_` passes, plus the full ignored suite with `--skip live_` (it includes `offline_eval_harness`).
+- [x] **Step 5:** Commit everything uncommitted from Task 7 prep plus these fixes. `git status` must show `reports/` and `research_notes/` ignored and not staged.
   ```bash
   git add .gitignore src/llm.rs tests/eval.rs tests/eval docs/perf.md
   git commit -m "test: M2a eval harness (live run pending), relay and grading hardened"
@@ -74,16 +74,16 @@ The live eval (M2a Task 7 Step 2) runs **after** this plan, unchanged in approva
 
 Each item is a pure deletion or shrink. Behaviour and all other tests are unchanged.
 
-- [ ] **Step 1: Delete:**
+- [x] **Step 1: Delete:**
   - the 1-hour cache-write pricing in `measure` (`hour` variable and `hour * 8.0`). iksa sends only 5-minute ephemeral cache, so price `writes * 5.0`;
   - `estimate()`, its test `estimate_states_its_token_assumptions` and the `println!("{}", estimate())` in `run_isolated` (the estimate lives in `docs/perf.md`);
   - test `external_eval_requires_write_approval` and, if then unused outside `run_isolated`, inline `case_risk`.
-- [ ] **Step 2: Shrink:**
+- [x] **Step 2: Shrink:**
   - **Totals:** replace `aggregate(&[Exchange])` and the three `try_fold` totals at the end of `run_isolated` with one `fn total<'a>(m: impl IntoIterator<Item = &'a Measurement>) -> Measurement`, used for per-row and overall totals.
   - **Relay accept loop:** a blocking `accept()`, with no `set_nonblocking`, no `WouldBlock` arm and no 5 ms sleep. `shutdown` sets `stop`, then makes one `TcpStream::connect(endpoint)` to wake `accept`. The loop checks `stop` after each accept and drops that wake-up connection without recording it.
   - **Rows:** `Vec<Option<Row>>` sized to the case count, filled by index. Delete the `(usize, Row)` tuples and the sort.
-- [ ] **Step 3:** `cargo test --test eval` + `offline_eval_harness` (ignored, `--skip live_`) pass. `relay_drains_late_exchange_before_reporting` and `relay_preserves_body_failure_retries` still pass unchanged.
-- [ ] **Step 4:** `git diff --stat` shows net deletions in both files. Commit `refactor: trim eval harness`.
+- [x] **Step 3:** `cargo test --test eval` + `offline_eval_harness` (ignored, `--skip live_`) pass. `relay_drains_late_exchange_before_reporting` and `relay_preserves_body_failure_retries` still pass unchanged.
+- [x] **Step 4:** `git diff --stat` shows net deletions in both files. Commit `refactor: trim eval harness`.
 
 ### Task 2: Core trims (`thiserror`, scrub helpers, lib.rs)
 
@@ -92,18 +92,18 @@ Each item is a pure deletion or shrink. Behaviour and all other tests are unchan
 **Interfaces:**
 - Produces: every `Ledger` method returns `anyhow::Result<_>`. Errors carry exactly the current `Display` texts: `task {id} not found`, `illegal transition from {from:?} to {to:?}`, and the transparent SQL/JSON errors via `?`.
 
-- [ ] **Step 1: Failing test:** `ledger::ledger_errors_keep_messages`:
+- [x] **Step 1: Failing test:** `ledger::ledger_errors_keep_messages`:
   - `get(-1)` error `to_string() == "task -1 not found"`;
   - a stale-handle transition error `to_string() == "illegal transition from Executing to Executing"`.
 
   Change the two tests that match on variants (`stale_handle_transition_rejected`, the `NotFound(-1)` loop) to assert on `to_string()` with the same texts. Run it: it FAILS to compile until Step 2 lands, because `LedgerError` still exists and the new helper type doesn't.
-- [ ] **Step 2: Implement:**
+- [x] **Step 2: Implement:**
   - Delete `LedgerError` and the `thiserror` dependency; use `anyhow::bail!`/`anyhow!` with the texts above.
   - Replace `scrub_snapshot` and `scrub_model` in `engine.rs` with `fn scrub_forms(text: &str, secrets: &[String], forms: impl Fn(&str) -> Vec<String>) -> String`, which does the shared work (skip empty secrets, collect forms, sort longest first, dedup, `scrub`). Each call site passes its own encoding closure: the HTML variants, or raw + JSON-escaped. `snapshot_scrubs_html_escaped_secrets` must pass unchanged.
   - `lib.rs`: one sorted block of `pub mod` lines; keep `#[doc(hidden)]` on `testutil`.
   - In the M2b plan, replace every `Result<…, LedgerError>` with `anyhow::Result<…>` and `→ Illegal` with `→ Err("illegal transition …")`.
-- [ ] **Step 3:** `cargo test -- --skip live_` + full ignored suite `--skip live_` pass. `cargo tree | grep thiserror` prints nothing for the `iksa` crate's direct deps (a transitive one is fine). `ls -l target/release/iksa` is recorded.
-- [ ] **Step 4:** Commit `refactor: drop thiserror, share secret-scrub forms`.
+- [x] **Step 3:** `cargo test -- --skip live_` + full ignored suite `--skip live_` pass. `cargo tree | grep thiserror` prints nothing for the `iksa` crate's direct deps (a transitive one is fine). `ls -l target/release/iksa` is recorded.
+- [x] **Step 4:** Commit `refactor: drop thiserror, share secret-scrub forms`.
 
 ---
 
@@ -114,5 +114,7 @@ Each item is a pure deletion or shrink. Behaviour and all other tests are unchan
 | F1 | 0 | 4 new eval tests + `offline_eval_harness` | Pass; harness committed; `reports/`, `research_notes/` ignored |
 | F2 | 1 | `git diff --stat HEAD~1` | Net deletions; eval tests unchanged and passing |
 | F3 | 2 | full suites `--skip live_`; `cargo tree -e normal --depth 1` | Pass; no `thiserror` |
+
+Done: Tasks 0–2 implemented in commits `67566e5`, `d414ff5`, `903524c`.
 
 After F3: the user runs the live eval with the M2a Task 7 command, with `ANTHROPIC_API_KEY` exported in their own terminal. Codex then fills in D9 from `target/codex/task7-live.log` and makes the Task 7 results commit.

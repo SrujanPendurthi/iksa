@@ -152,7 +152,7 @@ Same as M2a. Codex does one task per run with TDD, runs all ignored tests (`--sk
   - `Ledger::add_schedule(spec, goal, auto, next_ms) -> anyhow::Result<i64>`: refuses a 33rd schedule with `at most 32 schedules`.
   - `Ledger::set_schedule_auto(id, auto: bool) -> anyhow::Result<()>`.
   - `Ledger::schedules() -> anyhow::Result<Vec<Schedule>>`.
-  - `Ledger::remove_schedule(id) -> anyhow::Result<()>` (`Err("task {id} not found")` if absent; created tasks are kept).
+  - `Ledger::remove_schedule(id) -> anyhow::Result<()>` (`Err("schedule {id} not found")` if absent; created tasks are kept).
   - `Ledger::fire_due(now_ms: u64, next: impl Fn(&str, u64) -> u64) -> anyhow::Result<Vec<i64>>`:
     - one IMMEDIATE transaction;
     - for each schedule with `next_ms <= now_ms`, if `last_task` is missing or not open, insert a goal task with `schedule_id` set (`Queued` when `auto`, else `Suggested`, deduped like `suggest`) and set `last_task`;

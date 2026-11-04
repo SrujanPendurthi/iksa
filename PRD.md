@@ -1,7 +1,7 @@
 # Product Requirement Document (PRD)
 
 ## Project Title: Agentic Browser (Codename: iksa)
-**Document Status:** Engineering — M1 done, M2a in evaluation, M2b and M3 planned (updated 2026-11-04)  
+**Document Status:** Engineering — M1 done, M2a code done (live eval not run), M2b, M3 and M4 planned (updated 2026-11-04)  
 **Target Release:** v0.1.0-alpha  
 **License:** MIT
 
@@ -122,7 +122,7 @@ Existing web browsers are passive document viewers. iksa is an **Agent-First Bro
 | Milestone | Scope | Status | Plan |
 | :--- | :--- | :--- | :--- |
 | **M1** Agent core | Pipe CDP client, hidden contexts, scripted tasks, risk gates, CAPTCHA pause, CAS audit, ledger, privacy launch, `setup` | Done 2026-11-03 | `docs/superpowers/plans/2026-10-28-m1-agent-core-v2.md` |
-| **M2a** Goal planner | `ask`, observation with refs, Anthropic client, Keychain key and secrets, planner loop, eval | Built; live eval pending | `docs/superpowers/plans/2026-11-03-m2a-planner.md` |
+| **M2a** Goal planner | `ask`, observation with refs, Anthropic client, Keychain key and secrets, planner loop, eval | Code done incl. review fixes (`67566e5`, `d414ff5`, `903524c`); live eval not run | `docs/superpowers/plans/2026-11-03-m2a-planner.md`, `docs/superpowers/plans/2026-11-04-m2a-review-fixes.md` |
 | **M2b** Proactive | Daemon, schedules, inbox, `max_agents`, follow-up suggestions, grants, pause, stuck detector | Planned | `docs/superpowers/plans/2026-11-04-m2b-proactive.md` |
 | **M3** Human browsing | Browsing in iksa's profile, extension side panel, Agent View, shared cookies, visit triggers, mutation lock, address-bar check | Planned | `docs/superpowers/plans/2026-11-04-m3-human-browsing.md` |
-| **M4** Remaining v0.1 | MCP host, `iksa update`, OpenAI-compatible and local model providers (DeepSeek opt-in), uBlock Origin/Bitwarden checks, research context system, vision | Not planned | — |
+| **M4** Remaining v0.1 | MCP host, `iksa update`, OpenAI-compatible and local model providers (DeepSeek opt-in), uBlock Origin/Bitwarden checks, research context system, vision | Planned (plan covers all but the research context system) | `docs/superpowers/plans/2026-11-04-m4-providers-mcp-update.md` |

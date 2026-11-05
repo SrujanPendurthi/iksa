@@ -116,3 +116,52 @@ IKSA_LIVE_EVAL_APPROVED=1 CHROMIUM=$PWD/.spike-home/chromium/Chromium.app/Conten
 The run prints a Markdown table and one `EVAL_RESULT` JSON object. After a user-approved run, replace the pending table with its actual measurements and record success totals, privacy assertions, cost, and any unpriced usage. Only then make Task 7's live-results commit. A result below 16/20 is reported as below target and belongs to M2a-tune; grades must not be weakened.
 
 Offline validation on 2026-11-04: all **115 regular tests** and **52 non-live ignored tests** passed, including nine eval helper checks and the offline Chromium smoke run. Both commands excluded `live_*`. These results validate the harness and existing product; they do not establish a live score or D9 pass.
+
+## M2b
+
+Measured on 2026-11-05 with the release build and the pinned Chromium. The daemon
+checks start a fresh `iksa daemon` with an empty ledger in an isolated temporary
+data directory, wait ten seconds, verify it is still running, and stop it with
+SIGTERM. Tests write their artifacts only in their temporary directories; the
+local command logs below are Codex scratch, not test output paths.
+
+| Check | Actual result | Local evidence |
+| --- | --- | --- |
+| E9 idle daemon footprint | Three fresh processes: **2,480 / 2,400 / 2,464 KiB**; median **2,464 KiB** (2.40625 MiB), below **30,720 KiB**. Every process had **zero descendants**, including no Chromium child. | `target/codex/m2b-task8-final-daemon-pillars.log` |
+| E9 idle daemon egress | After ten seconds, `lsof -nP -a -p <pid> -i` returned **status 1, zero stdout bytes and zero stderr bytes**: no Internet sockets. The daemon remained alive with no descendants. | `target/codex/m2b-task8-final-daemon-pillars.log` |
+| E5 bounded concurrency | Four goals: `max_agents=3` reached **peak 3** and finished in **3.092757042 s**, below the unchanged **3.5 s** bound. `max_agents=1` reached **peak 1** and finished in **4.812079042 s**. All goals committed without duplicate dispatch. | `target/codex/m2b-task8-concurrency.log` |
+| E10 release binary | **7,309,408 bytes**, below **60,000,000 bytes**. | `ls -l target/release/iksa` |
+
+The footprint uses `common::tree_footprint_kib`: summed process-tree
+`phys_footprint`, not RSS. The daemon's readiness probe waits for creation of its
+fresh ledger before checking that its run lock is held, so the probe cannot
+compete with the initial lock acquisition. Socket checking distinguishes the
+expected no-match exit status from an `lsof` error. Limits and pre-existing M1
+pillar assertions are unchanged.
+
+Reproduce the focused measurements serially:
+
+```sh
+CHROMIUM=$PWD/.spike-home/chromium/Chromium.app/Contents/MacOS/Chromium cargo test --release --test pillars idle_daemon_ -- --ignored --test-threads=1 --skip live_ --nocapture
+CHROMIUM=$PWD/.spike-home/chromium/Chromium.app/Contents/MacOS/Chromium cargo test --release --test daemon max_agents_bounds_concurrency -- --ignored --test-threads=1 --skip live_ --nocapture
+ls -l target/release/iksa
+```
+
+Independent acceptance checks are kept unchanged. Validation uses
+`cargo test --test acceptance_m2b -- --skip live_`,
+`cargo test -- --skip live_`, and the complete ignored suite:
+
+```sh
+CHROMIUM=$PWD/.spike-home/chromium/Chromium.app/Contents/MacOS/Chromium cargo test --release -- --ignored --test-threads=1 --skip live_
+```
+
+These measurements use local model mocks. No `live_*` test or `live_eval` was
+run; the M2a D9 live score remains unmeasured.
+
+Final validation on 2026-11-05 passed **185 regular tests**, including all
+**22 unchanged independent acceptance checks**, and **76 non-live ignored
+tests**, including both new daemon pillars and all four existing M1 pillars.
+The focused two-pillar measurement and concurrency benchmark also passed.
+Evidence: `target/codex/m2b-task8-{acceptance,full,ignored}.log`,
+`m2b-task8-final-daemon-pillars.log`, and `m2b-task8-concurrency.log`.
+The LaunchAgent example passed `plutil -lint`; it was not installed or loaded.

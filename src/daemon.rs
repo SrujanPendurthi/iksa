@@ -8,6 +8,7 @@ use crate::{
 };
 use anyhow::Context;
 use std::{
+    collections::HashSet,
     fs::File,
     os::{
         fd::AsRawFd,
@@ -15,9 +16,13 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Command,
+    rc::Rc,
     time::{Duration, Instant},
 };
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::{
+    signal::unix::{SignalKind, signal},
+    task::{JoinError, JoinSet, LocalSet},
+};
 
 pub const POLL: Duration = Duration::from_secs(2);
 pub const IDLE_CLOSE: Duration = Duration::from_secs(60);
@@ -120,44 +125,118 @@ pub async fn run(home: &Path, opts: Opts) -> anyhow::Result<()> {
     let _lock = lock(home)?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
-    // Dropping dispatch cancels the in-flight step and closes its owned browser
-    // before the run lock is released. Executing tasks are recovered next start.
-    tokio::select! {
-        biased;
-        _ = terminate.recv() => Ok(()),
-        _ = interrupt.recv() => Ok(()),
-        result = dispatch(home, &opts) => result,
+    // LocalSet owns all non-Send workers. Drop it before releasing the lock so
+    // every worker and the final shared browser are gone on shutdown.
+    let local = LocalSet::new();
+    let result = local
+        .run_until(async {
+            tokio::select! {
+                biased;
+                _ = terminate.recv() => Ok(()),
+                _ = interrupt.recv() => Ok(()),
+                result = dispatch(home, &opts) => result,
+            }
+        })
+        .await;
+    drop(local);
+    result
+}
+type Completion = (i64, anyhow::Result<Option<State>>);
+fn complete(
+    result: Result<Completion, JoinError>,
+    running: &mut HashSet<i64>,
+    background: &mut HashSet<i64>,
+) -> anyhow::Result<()> {
+    let (id, state) = result?;
+    running.remove(&id);
+    background.remove(&id);
+    if let Some(state) = state? {
+        report(id, &state);
     }
+    Ok(())
+}
+fn is_background(task: &Task) -> bool {
+    task.schedule_id.is_some()
+        && task.accepted_ms.is_none()
+        && task.human_started_ms.is_none()
+        && task.approved_step.is_none()
+}
+async fn notifications(
+    ledger: &Ledger,
+    previous: &mut Vec<(i64, State, usize)>,
+) -> anyhow::Result<()> {
+    let tasks = ledger.list()?;
+    let current = waiting(&tasks);
+    if current != *previous {
+        if let Some(message) = digest(&tasks) {
+            notify(message).await;
+        }
+        *previous = current;
+    }
+    Ok(())
 }
 async fn dispatch(home: &Path, opts: &Opts) -> anyhow::Result<()> {
-    let cfg = Config::load(home)?;
+    let mut cfg = Config::load(home)?;
     let ledger = Ledger::open(home.join("ledger.db"))?;
     let cas = Cas::open(home.join("cas"))?;
     ledger.recover()?;
     audit::gc(&ledger, &cas, cfg.retention_days, audit::now_ms())?;
     let mut previous = waiting(&ledger.list()?);
-    let mut engine: Option<Engine> = None;
+    let mut engine: Option<Rc<Engine>> = None;
+    let mut workers: JoinSet<Completion> = JoinSet::new();
+    let mut running = HashSet::new();
+    let mut background = HashSet::new();
     let mut last_busy = Instant::now();
     let mut last_gc = Instant::now();
+    let mut next_tick = tokio::time::Instant::now();
     let mut ran_any = false;
     loop {
-        let (_, removed) = ledger.fire_due_with_expiry(audit::now_ms(), |text, now| {
-            schedule::parse(text)
-                .ok()
-                .and_then(|spec| schedule::next_fire_ms(&spec, now))
-        })?;
-        for id in removed {
-            eprintln!("schedule {id} will never fire again; removed");
+        while let Some(result) = workers.try_join_next() {
+            complete(result, &mut running, &mut background)?;
+            last_busy = Instant::now();
         }
-        let mut ran_tick = false;
-        while let Some(task) = ledger.next_queued()? {
-            // Launch failures can be entirely synchronous; let shutdown win
-            // between tasks even when this batch has no browser I/O to await.
+        if running.is_empty() && engine.as_ref().is_some_and(|e| !e.is_available()) {
+            engine = None;
+        }
+        let ticked = tokio::time::Instant::now() >= next_tick;
+        if ticked {
+            cfg = Config::load(home)?;
+            let (_, removed) = ledger.fire_due_with_expiry(audit::now_ms(), |text, now| {
+                schedule::parse(text)
+                    .ok()
+                    .and_then(|spec| schedule::next_fire_ms(&spec, now))
+            })?;
+            for id in removed {
+                eprintln!("schedule {id} will never fire again; removed");
+            }
+            next_tick = tokio::time::Instant::now() + opts.poll;
+        }
+        let cap = cfg.max_agents as usize;
+        // Bounded reads, plus a separate human window so a background backlog
+        // cannot conceal work eligible for the reserved slot.
+        let window = cap + 1 + running.len();
+        let mut queued = ledger.queued(window)?;
+        queued.extend(ledger.queued_humans(window)?);
+        queued.sort_by_key(|t| t.id);
+        queued.dedup_by_key(|t| t.id);
+        for task in queued {
+            if running.contains(&task.id) {
+                continue;
+            }
+            let is_background = is_background(&task);
+            let allowed = running.len() < cap
+                || (!is_background && !background.is_empty() && running.len() < cap + 1);
+            if !allowed {
+                continue;
+            }
+            // Synchronous launch failures must not starve signal handling.
             tokio::task::yield_now().await;
-            let cfg = Config::load(home)?;
+            if engine.as_ref().is_some_and(|e| !e.is_available()) {
+                break;
+            }
             if engine.is_none() {
                 match launch(home, opts) {
-                    Ok(browser) => engine = Some(browser),
+                    Ok(browser) => engine = Some(Rc::new(browser)),
                     Err(error) if opts.drain => return Err(error),
                     Err(error) => {
                         ledger.transition(task.id, State::Executing)?;
@@ -165,47 +244,69 @@ async fn dispatch(home: &Path, opts: &Opts) -> anyhow::Result<()> {
                         ledger.transition(task.id, state.clone())?;
                         report(task.id, &state);
                         ran_any = true;
-                        ran_tick = true;
                         continue;
                     }
                 }
             }
-            let active = engine.as_ref().unwrap();
-            let state = active.run(&ledger, &cas, &cfg, task.id).await?;
-            report(task.id, &state);
-            if !active.is_available() {
-                engine = None;
+            let active = engine.as_ref().unwrap().clone();
+            let path = home.to_owned();
+            let config = cfg.clone();
+            let id = task.id;
+            running.insert(id);
+            if is_background {
+                background.insert(id);
             }
-            last_busy = Instant::now();
+            workers.spawn_local(async move {
+                let result = async {
+                    let ledger = Ledger::open(path.join("ledger.db"))?;
+                    let cas = Cas::open(path.join("cas"))?;
+                    // Another worker may have broken the engine since admission.
+                    // Leave this goal queued for the replacement browser.
+                    if !active.is_available() {
+                        return Ok(None);
+                    }
+                    active.run(&ledger, &cas, &config, id).await.map(Some)
+                }
+                .await;
+                (id, result)
+            });
             ran_any = true;
-            ran_tick = true;
         }
-        let tasks = ledger.list()?;
-        let current = waiting(&tasks);
-        if current != previous {
-            if let Some(message) = digest(&tasks) {
-                notify(message).await;
-            }
-            previous = current;
+        if ticked {
+            notifications(&ledger, &mut previous).await?;
         }
-        if last_busy.elapsed() >= opts.idle_close {
-            engine = None;
-        }
-        if !ran_tick && last_gc.elapsed() >= Duration::from_secs(3600) {
-            let cfg = Config::load(home)?;
-            audit::gc(&ledger, &cas, cfg.retention_days, audit::now_ms())?;
-            last_gc = Instant::now();
-        }
-        if opts.drain {
-            if !ran_tick {
+        if running.is_empty() {
+            let pending = ledger.next_queued()?.is_some();
+            if opts.drain && !pending {
+                notifications(&ledger, &mut previous).await?;
                 if !ran_any {
                     println!("no queued tasks");
                 }
                 return Ok(());
             }
-            continue;
+            if engine.as_ref().is_some_and(|e| !e.is_available()) {
+                engine = None;
+            }
+            if last_busy.elapsed() >= opts.idle_close {
+                engine = None;
+            }
+            if !pending && last_gc.elapsed() >= Duration::from_secs(3600) {
+                audit::gc(&ledger, &cas, cfg.retention_days, audit::now_ms())?;
+                last_gc = Instant::now();
+            }
+            // A synchronous failure batch or skipped broken-engine admissions
+            // can leave more queued work without a completion to wake us.
+            if opts.drain && pending {
+                continue;
+            }
         }
-        tokio::time::sleep(opts.poll).await;
+        tokio::select! {
+            result = workers.join_next(), if !workers.is_empty() => {
+                complete(result.expect("nonempty worker set"), &mut running, &mut background)?;
+                last_busy = Instant::now();
+            }
+            _ = tokio::time::sleep_until(next_tick) => {},
+        }
     }
 }
 

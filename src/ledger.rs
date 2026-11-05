@@ -3,8 +3,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 
-const SELECT: &str =
-    "SELECT id,title,steps,cursor,state,approved_step,finished_ms,goal,schedule_id FROM tasks";
+const SELECT: &str = "SELECT id,title,steps,cursor,state,approved_step,finished_ms,goal,schedule_id,accepted_ms,human_started_ms FROM tasks";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Handoff {
@@ -33,6 +32,8 @@ pub struct Task {
     pub title: String,
     pub goal: Option<String>,
     pub schedule_id: Option<i64>,
+    pub accepted_ms: Option<u64>,
+    pub human_started_ms: Option<u64>,
     pub steps: Vec<Action>,
     pub cursor: usize,
     pub state: State,
@@ -99,6 +100,7 @@ impl Ledger {
             ("goal", "TEXT"),
             ("schedule_id", "INTEGER"),
             ("accepted_ms", "INTEGER"),
+            ("human_started_ms", "INTEGER"),
         ] {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name=?1)",
@@ -358,6 +360,8 @@ impl Ledger {
             title: row.get(1)?,
             goal: row.get(7)?,
             schedule_id: row.get(8)?,
+            accepted_ms: row.get(9)?,
+            human_started_ms: row.get(10)?,
             steps: serde_json::from_str(&row.get::<_, String>(2)?)?,
             cursor: row.get(3)?,
             state: serde_json::from_str(&row.get::<_, String>(4)?)?,
@@ -383,6 +387,31 @@ impl Ledger {
             anyhow::bail!("task {id} not found");
         }
         Ok(())
+    }
+    pub fn queued(&self, limit: usize) -> anyhow::Result<Vec<Task>> {
+        self.queue(limit, false)
+    }
+    pub fn queued_humans(&self, limit: usize) -> anyhow::Result<Vec<Task>> {
+        self.queue(limit, true)
+    }
+    fn queue(&self, limit: usize, human_only: bool) -> anyhow::Result<Vec<Task>> {
+        let filter = if human_only {
+            " AND (schedule_id IS NULL OR accepted_ms IS NOT NULL OR human_started_ms IS NOT NULL OR approved_step IS NOT NULL)"
+        } else {
+            ""
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "{SELECT} WHERE state=?1{filter} ORDER BY id LIMIT ?2"
+        ))?;
+        let mut rows = stmt.query(rusqlite::params![
+            serde_json::to_string(&State::Queued)?,
+            i64::try_from(limit).unwrap_or(i64::MAX)
+        ])?;
+        let mut tasks = Vec::new();
+        while let Some(row) = rows.next()? {
+            tasks.push(Self::task(row)?);
+        }
+        Ok(tasks)
     }
     pub fn next_queued(&self) -> anyhow::Result<Option<Task>> {
         let mut stmt = self
@@ -424,8 +453,8 @@ impl Ledger {
             })
             .transpose()?;
         if self.conn.execute(
-            "UPDATE tasks SET state=?2, finished_ms=CASE WHEN ?3 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) END, steps=COALESCE(?5, steps), accepted_ms=CASE WHEN ?6 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) ELSE accepted_ms END WHERE id=?1 AND state=?4",
-            rusqlite::params![id, serde_json::to_string(&to)?, terminal, serde_json::to_string(&from)?, redacted, from == State::Suggested && to == State::Queued],
+            "UPDATE tasks SET state=?2, finished_ms=CASE WHEN ?3 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) END, steps=COALESCE(?5, steps), accepted_ms=CASE WHEN ?6 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) ELSE accepted_ms END, human_started_ms=CASE WHEN ?7 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) ELSE human_started_ms END WHERE id=?1 AND state=?4",
+            rusqlite::params![id, serde_json::to_string(&to)?, terminal, serde_json::to_string(&from)?, redacted, from == State::Suggested && to == State::Queued, to == State::Queued && matches!(&from, State::Suggested | State::AwaitingHandoff(_))],
         )? == 0 {
             anyhow::bail!("illegal transition from {:?} to {to:?}", self.get(id)?.state);
         }
@@ -445,7 +474,7 @@ impl Ledger {
             anyhow::bail!("illegal transition from {:?} to Queued", task.state);
         }
         if self.conn.execute(
-            "UPDATE tasks SET state=?2, approved_step=cursor, finished_ms=NULL WHERE id=?1 AND state=?3",
+            "UPDATE tasks SET state=?2, approved_step=cursor, finished_ms=NULL, human_started_ms=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE id=?1 AND state=?3",
             rusqlite::params![id, serde_json::to_string(&State::Queued)?, serde_json::to_string(&State::AwaitingHandoff(Handoff::Approval))?],
         )? == 0 {
             anyhow::bail!("illegal transition from {:?} to Queued", self.get(id)?.state);
@@ -675,6 +704,8 @@ mod tests {
                 approved_step: None,
                 finished_ms: None,
                 schedule_id: None,
+                accepted_ms: None,
+                human_started_ms: None,
             }
         );
         assert_eq!(
@@ -1452,5 +1483,72 @@ mod tests {
         assert_eq!(removed, vec![expired]);
         assert_eq!(ids.len(), 1);
         assert_eq!(ledger.get(ids[0]).unwrap().schedule_id, Some(valid));
+    }
+    #[test]
+    fn queued_is_bounded_and_oldest_first() {
+        let dir = temp_dir("bounded-queue");
+        let ledger = Ledger::open(dir.0.join("ledger.db")).unwrap();
+        let first = ledger.add("first", &[]).unwrap();
+        let running = ledger.add("running", &[]).unwrap();
+        let third = ledger.add_goal("third", "third").unwrap();
+        ledger.transition(running, State::Executing).unwrap();
+        ledger.suggest("not queued").unwrap();
+        assert!(ledger.queued(0).unwrap().is_empty());
+        assert_eq!(
+            ledger
+                .queued(1)
+                .unwrap()
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![first]
+        );
+        assert_eq!(
+            ledger
+                .queued(usize::MAX)
+                .unwrap()
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![first, third]
+        );
+    }
+    #[test]
+    fn human_starts_do_not_inflate_trial_acceptance() {
+        let dir = temp_dir("human-starts");
+        let path = dir.0.join("ledger.db");
+        let ledger = Ledger::open(&path).unwrap();
+        ledger.add_schedule("every 5m", "approve", true, 0).unwrap();
+        ledger.add_schedule("every 5m", "resume", true, 0).unwrap();
+        let ids = ledger.fire_due(0, |_, n| n + 1).unwrap();
+        for &id in &ids {
+            let task = ledger.get(id).unwrap();
+            assert_eq!(task.accepted_ms, None);
+            assert_eq!(task.human_started_ms, None);
+            ledger.transition(id, State::Executing).unwrap();
+        }
+        ledger
+            .transition(ids[0], State::AwaitingHandoff(Handoff::Approval))
+            .unwrap();
+        ledger.approve(ids[0]).unwrap();
+        ledger
+            .transition(
+                ids[1],
+                State::AwaitingHandoff(Handoff::Challenge(ChallengeKind::Turnstile)),
+            )
+            .unwrap();
+        ledger.resume(ids[1]).unwrap();
+        let trial = ledger.suggest("trial").unwrap().unwrap();
+        ledger.accept(trial).unwrap();
+        assert!(ledger.get(trial).unwrap().accepted_ms.is_some());
+        assert!(ledger.get(trial).unwrap().human_started_ms.is_some());
+        drop(ledger);
+        let ledger = Ledger::open(path).unwrap();
+        for id in ids {
+            let task = ledger.get(id).unwrap();
+            assert!(task.human_started_ms.is_some());
+            assert_eq!(task.accepted_ms, None);
+        }
+        assert!(ledger.schedules().unwrap().iter().all(|s| s.accepted == 0));
     }
 }

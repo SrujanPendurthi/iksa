@@ -51,6 +51,12 @@ pub struct Config {
     pub providers: Vec<SearchProvider>,
     pub auto_max: Risk,
     pub retention_days: u32,
+    #[serde(default = "default_max_agents")]
+    pub max_agents: u32,
+}
+
+fn default_max_agents() -> u32 {
+    3
 }
 
 impl Default for Config {
@@ -71,6 +77,7 @@ impl Default for Config {
             ],
             auto_max: Risk::Read,
             retention_days: 30,
+            max_agents: default_max_agents(),
         }
     }
 }
@@ -106,6 +113,10 @@ impl Config {
                 config.search
             );
         }
+        anyhow::ensure!(
+            (1..=8).contains(&config.max_agents),
+            "max_agents must be between 1 and 8"
+        );
         if config.retention_days == 0 {
             anyhow::bail!("retention_days must be greater than zero");
         }
@@ -274,6 +285,29 @@ mod tests {
             write(&home.0, &json.to_string());
             let err = Config::load(&home.0).unwrap_err().to_string();
             assert!(err.contains(expected), "{err}");
+        }
+    }
+    #[test]
+    fn max_agents_range() {
+        let home = temp_dir("max-agents");
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value.as_object_mut().unwrap().remove("max_agents");
+        write(&home.0, &value.to_string());
+        assert_eq!(Config::load(&home.0).unwrap().max_agents, 3);
+        for n in [0, 9] {
+            value["max_agents"] = n.into();
+            write(&home.0, &value.to_string());
+            assert!(
+                Config::load(&home.0)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("max_agents")
+            );
+        }
+        for n in [1, 8] {
+            value["max_agents"] = n.into();
+            write(&home.0, &value.to_string());
+            assert_eq!(Config::load(&home.0).unwrap().max_agents, n);
         }
     }
 }

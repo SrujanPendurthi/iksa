@@ -12,7 +12,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::Path,
@@ -146,18 +146,20 @@ fn scrub_model(text: &str, secrets: &[String]) -> String {
         vec![secret.to_owned(), quoted[1..quoted.len() - 1].to_owned()]
     })
 }
-/// Sequential execution on the caller's future; the ledger is deliberately not Sync.
+/// Shared browser transport; each run owns its context and caller-owned ledger.
 pub struct Engine {
     browser: RefCell<Option<Browser>>,
+    broken: Cell<bool>,
 }
 impl Engine {
     pub fn new(browser: Browser) -> Self {
         Self {
             browser: RefCell::new(Some(browser)),
+            broken: Cell::new(false),
         }
     }
     pub fn is_available(&self) -> bool {
-        self.browser.borrow().is_some()
+        !self.broken.get() && self.browser.borrow().is_some()
     }
     pub fn launch(chromium: &Path, profile: &Path, mock_keychain: bool) -> anyhow::Result<Self> {
         std::fs::DirBuilder::new()
@@ -405,6 +407,10 @@ impl Engine {
         id: i64,
         timeout: Duration,
     ) -> anyhow::Result<State> {
+        anyhow::ensure!(
+            !self.broken.get(),
+            "browser unavailable after cleanup timeout"
+        );
         let browser = self.browser.borrow();
         let b = browser
             .as_ref()
@@ -708,7 +714,7 @@ impl Engine {
         };
         drop(browser);
         if cleanup_failed {
-            drop(self.browser.borrow_mut().take());
+            self.broken.set(true);
         }
         match result {
             Ok(state) => Ok(state),

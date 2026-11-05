@@ -201,7 +201,7 @@ PRD §3.6's research context system (local ColBERT/ONNX vectorization plus graph
 **Interfaces:**
 - Produces: `Config.extensions: Vec<String>`. Each must be an absolute path to a directory containing `manifest.json` with `"manifest_version": 3`, else config error naming the path. `--load-extension=<iksa>,<user1>,…`.
 - [ ] **Step 1: Failing tests:**
-  - Unit `extensions_validated`: a relative path, a missing dir, or an MV2 manifest → `Err` naming it.
+  - Unit `extensions_validated`: a relative path, a missing dir, an MV2 manifest, or a manifest whose `key` derives `extension::EXTENSION_ID` → `Err` naming it. (iksa's public key is in this public repo; an unpacked extension declaring it would get iksa's ID and pass the native host's `allowed_origins`.)
   - `#[ignore]` `user_extension_blocks_in_human_tab`: the fixture extension's declarativeNetRequest rule blocks `/ad.js` on the fixture host. A human tab (`browse`) loading `/page` has `window.adLoaded === undefined`, and the fixture server logged no request for `/ad.js`.
   - `#[ignore]` `agent_contexts_have_no_user_extensions`: the same page in an agent task → `/ad.js` **is** requested (the extension doesn't run in agent contexts). This pins the documented behaviour.
 - [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** pass, plus the memory pillar with the fixture extension loaded.

@@ -89,7 +89,7 @@ Reviewed and approved by the user. Codex must not change these without a new dec
 
 ## Running this plan with Codex (gpt-6.1-sol)
 
-Same rules as M2b. Browser tests are `#[ignore]` and use `--use-mock-keychain` with a temp profile; they never touch the real `~/.iksa` or the user's Chromium/Chrome data. Task 8's H2 step is **manual by the user**: Codex prepares it and stops.
+Same rules as M2b. **Order:** after Task 1 commits, run `docs/superpowers/plans/2026-11-05-m2b-review-fixes.md` (all 3 tasks), then continue at Task 2. From that plan on, `Engine::launch` takes `extension: Option<&Path>` (no `launch_with_extension`), `extension::manifest` returns `anyhow::Result<Value>`, and a failed `extension::install` makes the daemon launch without the extension. Browser tests are `#[ignore]` and use `--use-mock-keychain` with a temp profile; they never touch the real `~/.iksa` or the user's Chromium/Chrome data. Task 8's H2 step is **manual by the user**: Codex prepares it and stops.
 
 ---
 
@@ -104,7 +104,7 @@ Same rules as M2b. Browser tests are `#[ignore]` and use `--use-mock-keychain` w
   - `pub fn manifest(cfg: &Config) -> serde_json::Value`.
   - `launch_args(profile, mock_keychain, extension: Option<&Path>)`: with `Some`, adds `--load-extension=<path>`.
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
   - Unit `manifest_follows_search_config`: Kagi active → `search_provider.search_url == "https://kagi.com/search?q={searchTerms}"`, `is_default == true`, `name == "Kagi"`. Permissions `== ["nativeMessaging","sidePanel"]`, and there is no `host_permissions` and no `externally_connectable`.
   - Unit `extension_id_matches_key`.
   - Unit `manifests_restrict_origins`: the host manifest's `allowed_origins == ["chrome-extension://<EXTENSION_ID>/"]`, `type == "stdio"`, `path` absolute.
@@ -112,8 +112,8 @@ Same rules as M2b. Browser tests are `#[ignore]` and use `--use-mock-keychain` w
   - `#[ignore]` `m3::extension_loads_and_owns_search`: install into a temp home, then launch.
     - `Target.getTargets` contains a `service_worker` whose URL starts with `chrome-extension://<EXTENSION_ID>/`.
     - The S4 method reads `chrome://settings/searchEngines` (bounded 15 s shadow-DOM read) and contains the active provider name with `(Default)`.
-- [ ] **Step 2:** FAIL. **Step 3:** implement. Embed `extension/*` with `include_str!`. Commit the public key only.
-- [ ] **Step 4:** full ignored suite passes, including M1 pillars launched **with** the extension (pillar tests pass `Some(dir)`). **Step 5:** Commit `feat: bundled extension and native host manifest`.
+- [x] **Step 2:** FAIL. **Step 3:** implement. Embed `extension/*` with `include_str!`. Commit the public key only.
+- [x] **Step 4:** full ignored suite passes, including M1 pillars launched **with** the extension (pillar tests pass `Some(dir)`). **Step 5:** Commit `feat: bundled extension and native host manifest`.
 
 ### Task 1: Control socket and native host relay
 
@@ -277,6 +277,7 @@ Same rules as M2b. Browser tests are `#[ignore]` and use `--use-mock-keychain` w
   - idle ≤ 300 MB with one human `about:blank` window;
   - 5 tabs + 3 agents ≤ 1.2 GB (median of 3);
   - egress: zero non-loopback hosts after 60 s idle with the extension and an open side panel;
+  - egress, search favicon: the manifest's `favicon_url` points at the provider's origin. Run the egress check once with Kagi active and once after opening `chrome://settings/searchEngines`; record any request to the provider host. A request at idle (no settings page) → BLOCKED with the host; a request only while the settings page is open is recorded, not a failure;
   - daemon with browser: zero TCP/UDP listeners.
 
   Record all numbers in `docs/perf.md` `## M3`. Over budget → BLOCKED with numbers; stop.
@@ -287,9 +288,9 @@ Same rules as M2b. Browser tests are `#[ignore]` and use `--use-mock-keychain` w
   4. Open the side panel from the toolbar icon; the task list renders.
 
   The user reports results; Claude records them as H2 in `docs/perf.md`.
-- [ ] **Step 3: CLAUDE.md.**
+- [ ] **Step 3: CLAUDE.md and README.md.** (User docs live only in README.md since the M2b review fixes.)
   - Module map: `extension` (generated MV3 bundle + host manifest), `control` (owner-only Unix socket ops), `native_host` (stdio↔socket relay).
-  - README: `browse`, `share_cookies` (what it shares and why it defaults empty), visit triggers, the side panel, Agent View, the lock, and the expected first-run Keychain prompt.
+  - README.md (not CLAUDE.md): `browse`, `share_cookies` (what it shares and why it defaults empty), visit triggers, the side panel, Agent View, the lock, and the expected first-run Keychain prompt.
 - [ ] **Step 4:** Commit `docs: M3 pillars and README`.
 
 ---

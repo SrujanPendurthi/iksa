@@ -347,3 +347,38 @@ This result resolves the raw-CDP screencast/input subcheck on this pin. It does 
 | V4 Egress with extension | `NON_LOOPBACK=0`, host list `[]`, 120 s idle | PASS |
 | V5 Hidden screencast | Viewport 60 frames/6 s; focus retry unnecessary; visible 47/6 s | PASS |
 | V6 Hidden input forwarding | `forwarded_out=forwarded` after real mouse press/release | PASS |
+
+## M3 Task 0 — pinned extension loading (2026-11-05)
+
+The required first capability check passed on pinned Chromium 156.0.8078.47-1.1:
+`--load-extension=<temporary extension directory>` exposes the iksa background
+service worker. The CDP `Extensions.loadUnpacked` fallback and
+`--enable-unsafe-extension-debugging` were unnecessary. The production daemon
+installs the embedded files when it lazily launches Chromium, then passes the
+extension directory through `launch_args(..., Some(dir))`. The legacy `None`
+launch arguments remain unchanged.
+
+The committed public key derives extension ID
+`fedajodcbhcmcgboakaacifkdogfdhil`; its SHA-256 derivation is independently checked
+in the unit tests. No private key file was retained. The native host manifest is
+written only under the selected data directory's
+`profile/NativeMessagingHosts/dev.iksa.host.json`, with one allowed origin and
+an absolute executable path.
+
+A fresh-profile browser check with Kagi selected reads rendered elements through
+the `chrome://settings/searchEngines` shadow roots within 15 seconds and finds
+**Kagi (Default)** plus the iksa control banner. Chromium rejected the initial
+manifest with `Missing or invalid value for
+'chrome_settings_overrides.search_provider.favicon_url'`. Its
+[settings-overrides parser](https://chromium.googlesource.com/chromium/src/+/2d18bf1fec6017d20ced5b6110fdbfc8a342ebb5/chrome/common/extensions/manifest_handlers/settings_overrides_handler.cc)
+requires an HTTP(S) favicon for a custom provider; the generated URL uses the
+selected provider's origin and `/favicon.ico`. The extension's background script
+makes no network requests. Original idle-egress and memory assertions are kept
+for extension-loaded browser tests.
+
+Evidence: `target/codex/m3-task0-loading-probe.log`,
+`m3-task0-search-diagnostic.log`, `m3-task0-settings-diagnostic.log`,
+`m3-task0-verified-unit.log`, and `m3-task0-integration.log`. All profiles and
+native manifests were temporary and used the mock Keychain. These checks do not
+establish address-bar H2 behavior or a first-load confirmation-bubble result;
+that remains the user's manual M3 Task 8 check.

@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "iksa",
+  "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApFeSyPXKDsthxvy6Ioz9IZ30LTWxvU/n6zdeZRWvjxndkj4EGPi91n3I569x3vaM+fPgbZxdsPnPV2KvY3LEHbgkXwitCaLfFXwGsbelXZpElMXCcyR/J1Ncl84J4NNDN6MNIvzNY4j7nx0tXrzjnDySXMUegQZqifJbQ+tIfL+YjFrc3gXh1RfRaBXLU7jNARGcejE9pK96E0y1vDel2TPb/BAz4z+/BbX6cYhD1zt8NT9n3zYo/j0WFGlLm5q4Hj3JOHSDh+p1kTfLIvNBm9L+Ewl/NcgSEgQ38Jh7cNW485W/Rcj3yOq4YKfLCHSJNW0Wg2x05GlqrcMkrs+mZQIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "sidePanel"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

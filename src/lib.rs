@@ -6,6 +6,7 @@ pub mod challenge;
 pub mod config;
 pub mod daemon;
 pub mod engine;
+pub mod extension;
 pub mod gate;
 pub mod keychain;
 pub mod ledger;

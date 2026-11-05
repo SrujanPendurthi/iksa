@@ -224,8 +224,11 @@ pub struct Chrome {
 }
 impl Chrome {
     pub fn new(extra_args: &[String]) -> Self {
+        Self::with_extension(extra_args, None)
+    }
+    pub fn with_extension(extra_args: &[String], extension: Option<&Path>) -> Self {
         let profile = temp_dir("profile");
-        let mut args = iksa::engine::launch_args(&profile.0, true);
+        let mut args = iksa::engine::launch_args(&profile.0, true, extension);
         args.extend_from_slice(extra_args);
         let b = iksa::cdp::launch(&chromium(), &args).unwrap();
         Self {

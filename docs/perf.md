@@ -165,3 +165,38 @@ The focused two-pillar measurement and concurrency benchmark also passed.
 Evidence: `target/codex/m2b-task8-{acceptance,full,ignored}.log`,
 `m2b-task8-final-daemon-pillars.log`, and `m2b-task8-concurrency.log`.
 The LaunchAgent example passed `plutil -lint`; it was not installed or loaded.
+
+## M3 Task 0 — extension-loaded baseline
+
+2026-11-05. The M1 browser pillars now install the bundled extension and pass its
+directory to `launch_args(..., Some(dir))`. Each fresh pillar browser verifies
+the iksa service-worker target before measuring; existing memory, page-count,
+DOM, and egress assertions are unchanged.
+
+| Check | Actual result |
+| --- | --- |
+| Loaded memory, five visible pages + three isolated agent targets + extension | Two focused runs and the final successful full-suite run: **1,158,036 / 1,149,412 / 1,197,956 KiB**; median **1,158,036 KiB < 1,228,800 KiB**. Every individual sample passed. |
+| Additional loaded sample in the first full-suite attempt | **1,213,043 KiB**, also below the same limit; 15,757 KiB headroom. |
+| Idle browser with extension, three fresh processes | **240,184 / 243,768 / 245,976 KiB**; median **243,768 KiB < 307,200 KiB**. |
+| Idle browser egress with extension | Fresh Example Domain positive control passed; separate 60-second idle capture had **zero non-loopback hosts**. |
+| Release binary | **7,344,672 bytes < 60,000,000 bytes**. |
+| Validation | **190 regular tests**, including **22 unchanged M2b acceptance checks**; **79 non-live ignored tests** passed. |
+
+The first full ignored run failed before its idle capture: the Example Domain
+positive-control navigation returned `net::ERR_INTERNET_DISCONNECTED`. The same
+binary's subsequent independent positive control succeeded. The complete suite
+then passed on an unchanged rerun; no code, test, filter, or threshold was
+changed between attempts. Both logs are retained, rather than treating the
+failed attempt as a pass.
+
+Evidence: `target/codex/m3-task0-loaded1.log`, `m3-task0-loaded2.log`,
+`m3-task0-ignored.log` (initial failed full attempt),
+`m3-task0-ignored-rerun.log` (complete successful run),
+`m3-task0-full.log`, and `m3-task0-acceptance.log`. The full ignored command
+used `--nocapture` to retain measured values while keeping `--ignored`,
+`--test-threads=1`, and `--skip live_` unchanged. Counts use each test binary's
+final result, excluding duplicate result lines printed by isolated child tests.
+
+This baseline does not measure a completed side panel or Agent View, and does
+not establish manual H2 behavior. Later M3 work must retain the same budgets.
+No live model test or real Keychain interaction was run.

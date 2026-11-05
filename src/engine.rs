@@ -20,7 +20,7 @@ use std::{
 };
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 pub const CAPTCHA_WAIT: Duration = Duration::from_secs(10);
-pub fn launch_args(profile: &Path, mock_keychain: bool) -> Vec<String> {
+pub fn launch_args(profile: &Path, mock_keychain: bool, extension: Option<&Path>) -> Vec<String> {
     let mut a = vec![format!("--user-data-dir={}", profile.display())];
     a.extend(
         [
@@ -41,6 +41,9 @@ pub fn launch_args(profile: &Path, mock_keychain: bool) -> Vec<String> {
     );
     if mock_keychain {
         a.push("--use-mock-keychain".into());
+    }
+    if let Some(extension) = extension {
+        a.push(format!("--load-extension={}", extension.display()));
     }
     a
 }
@@ -169,6 +172,14 @@ impl Engine {
         !self.broken.get() && self.browser.borrow().is_some()
     }
     pub fn launch(chromium: &Path, profile: &Path, mock_keychain: bool) -> anyhow::Result<Self> {
+        Self::launch_with_extension(chromium, profile, mock_keychain, None)
+    }
+    pub fn launch_with_extension(
+        chromium: &Path,
+        profile: &Path,
+        mock_keychain: bool,
+        extension: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -176,7 +187,7 @@ impl Engine {
         std::fs::set_permissions(profile, std::fs::Permissions::from_mode(0o700))?;
         Ok(Self::new(cdp::launch(
             chromium,
-            &launch_args(profile, mock_keychain),
+            &launch_args(profile, mock_keychain, extension),
         )?))
     }
     pub async fn observe(
@@ -834,8 +845,18 @@ mod tests {
     #[test]
     fn launch_args_exact() {
         assert_eq!(
-            launch_args(Path::new("/private/profile"), false),
+            launch_args(Path::new("/private/profile"), false, None),
             crate::engine::tests::expected()
+        );
+        let mut with_extension = expected();
+        with_extension.push("--load-extension=/private/extension".into());
+        assert_eq!(
+            launch_args(
+                Path::new("/private/profile"),
+                false,
+                Some(Path::new("/private/extension"))
+            ),
+            with_extension
         );
     }
     fn expected() -> Vec<String> {
@@ -864,9 +885,9 @@ mod tests {
         let p = Path::new("/private/profile");
         let mut e = expected();
         e.push("--use-mock-keychain".into());
-        assert_eq!(launch_args(p, true), e);
+        assert_eq!(launch_args(p, true, None), e);
         assert!(
-            !launch_args(p, false)
+            !launch_args(p, false, None)
                 .iter()
                 .any(|s| s.contains("mock-keychain"))
         );

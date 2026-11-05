@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::{path::PathBuf, time::Duration};
 struct PillarBrowser {
     chrome: common::Chrome,
+    _extension_home: common::TempDir,
 }
 impl PillarBrowser {
     async fn new(netlog: Option<&std::path::Path>) -> Self {
@@ -11,10 +12,29 @@ impl PillarBrowser {
             .into_iter()
             .map(|n| format!("--log-net-log={}", n.display()))
             .collect();
+        let home = common::temp_dir("pillar-extension");
+        let extension = iksa::extension::install(
+            &home.0,
+            &iksa::config::Config::default(),
+            std::path::Path::new(env!("CARGO_BIN_EXE_iksa")),
+        )
+        .unwrap();
         let f = Self {
-            chrome: common::Chrome::new(&args),
+            chrome: common::Chrome::with_extension(&args, Some(&extension)),
+            _extension_home: home,
         };
         f.normalize().await;
+        let prefix = format!("chrome-extension://{}/", iksa::extension::EXTENSION_ID);
+        assert!(
+            f.targets()
+                .await
+                .iter()
+                .any(|t| t["type"] == "service_worker"
+                    && t["url"]
+                        .as_str()
+                        .is_some_and(|url| url.starts_with(&prefix))),
+            "M1 pillar browser did not load the bundled extension"
+        );
         f
     }
     fn b(&self) -> &cdp::Browser {

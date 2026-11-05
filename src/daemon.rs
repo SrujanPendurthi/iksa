@@ -3,6 +3,7 @@ use crate::{
     cas::Cas,
     config::Config,
     engine::Engine,
+    extension,
     ledger::{Handoff, Ledger, State, Task},
     schedule, setup,
 };
@@ -99,10 +100,12 @@ fn launch(home: &Path, opts: &Opts) -> anyhow::Result<Engine> {
         .clone()
         .or_else(|| setup::chromium_path(home))
         .context("Chromium is not installed; run iksa setup")?;
-    Engine::launch(
+    let directory = extension::install(home, &Config::load(home)?, &std::env::current_exe()?)?;
+    Engine::launch_with_extension(
         &path,
         &home.join("profile"),
         std::env::var("IKSA_MOCK_KEYCHAIN").as_deref() == Ok("1"),
+        Some(&directory),
     )
     .map(|engine| engine.with_policy_home(home))
     .with_context(|| format!("launching Chromium {}", path.display()))

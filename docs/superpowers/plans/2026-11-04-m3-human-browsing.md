@@ -78,6 +78,7 @@ Reviewed and approved by the user. Codex must not change these without a new dec
 - **Extension:** MV3; permissions exactly `nativeMessaging`, `sidePanel`; no host permissions; no remote code; default CSP; no `fetch`/XHR/WebSocket anywhere in its JS. A grep check enforces this in Task 2.
 - **Native host:** answers only its own origin (Chromium enforces `allowed_origins`); relays only to `IKSA_HOME/daemon.sock`; exits when stdin closes.
 - **Memory watch:** C14 was already at 98–99.5% of 1.2 GB. Task 8 re-measures with the extension loaded and one human window. If it exceeds the budget, record it as BLOCKED with numbers. Do not raise the target.
+- **C14 is a median of 3, as the constraint above says.** `tests/pillars.rs` `five_tabs_three_agents_under_1200mb` today asserts a single sample, which is stricter than the spec; live Wikipedia samples range 1,117,778–1,253,906 KiB on the same code (perf.md, `m2b-task3-ignored-memory-failure.log`, `m3-task0-*`, `m3-task1-ignored.log`). Change it to run 3 fresh launches, print every sample, and assert the **median** `< 1228800`. The limit stays 1,228,800 KiB. Record all three samples in `docs/perf.md`. If the median fails → BLOCKED with numbers. (Decided 2026-11-05 after M3 Task 1's single sample hit 1,244,644 KiB.)
 
 ## Review Focus
 

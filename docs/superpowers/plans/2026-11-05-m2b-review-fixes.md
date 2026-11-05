@@ -82,8 +82,7 @@ Each bullet is behaviour-preserving; existing tests are the check.
 
 - [ ] **Step 1: ledger.**
   - One private `fn tasks(&self, sql: &str, params: impl rusqlite::Params) -> anyhow::Result<Vec<Task>>` using `query_map(...).collect()`; `list`, `queue` and `get` use it (`get` = first or "task {id} not found").
-  - Delete `fire_due`; rename `fire_due_with_expiry` to `fire_due` (returns `(Vec<i64>, Vec<i64>)`). Update callers and tests.
-  - Delete `next_queued`; tests use `queued(1)?.into_iter().next()`.
+  - Keep `fire_due`, `fire_due_with_expiry` and `next_queued` with their current signatures: the acceptance checks call them (`a0_suggestions_never_run_until_accepted`, `a2_missed_runs_collapse_and_open_task_blocks_fire`, `a2_suggest_mode_and_trial_counts`). `next_queued` becomes `Ok(self.queue(1, false)?.into_iter().next())`. (Corrected 2026-11-05 after Codex's BLOCKED report.)
   - Delete the `queued`/`queued_humans` wrappers; make `queue(limit, human_only)` `pub`. Update `daemon.rs`.
 - [ ] **Step 2: engine.**
   - `Engine::launch(chromium, profile, mock_keychain, extension: Option<&Path>)`; delete `launch_with_extension`. Update every caller (`daemon.rs`, `tests/*`).
@@ -107,6 +106,6 @@ Each bullet is behaviour-preserving; existing tests are the check.
 | R1 | 0 | full ignored suite `--skip live_` | Approve after pause runs; stale model step dropped; bad provider still runs tasks; grant CLI checks |
 | R2 | 1 | `wc -l CLAUDE.md` | ≤ 25 lines; README.md holds the user docs |
 | R3 | all | `cargo test --test acceptance_m2b` | Passes, files untouched: `git diff dd6882f -- tests/acceptance/` is empty and `tests/acceptance_m2b.rs` differs only by the two removed `cfg` lines |
-| R4 | 1–2 | `git diff --stat` per commit | Net deletions; target ≈ −300 lines across Tasks 1–2 |
+| R4 | 1–2 | `git diff --stat` per commit | Net deletions; target ≈ −280 lines across Tasks 1–2 |
 
 After R4: resume M3 at Task 2.

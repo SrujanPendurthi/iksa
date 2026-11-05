@@ -82,7 +82,23 @@ impl Default for Config {
     }
 }
 
+/// Match a domain and its subdomains on label boundaries.
+pub fn domain_matches(host: &str, suffix: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let suffix = suffix
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    !suffix.is_empty() && (host == suffix || host.ends_with(&format!(".{suffix}")))
+}
+
 impl Config {
+    pub fn policy_fingerprint(&self) -> String {
+        let policy = serde_json::to_string(&(&self.auto_max, &self.never_send))
+            .expect("risk and domain strings serialize");
+        blake3::hash(policy.as_bytes()).to_hex().to_string()
+    }
+
     /// Reads `home/config.json`, writing the default first if it is missing.
     pub fn load(home: &Path) -> anyhow::Result<Config> {
         let path = home.join("config.json");
@@ -309,5 +325,31 @@ mod tests {
             write(&home.0, &value.to_string());
             assert_eq!(Config::load(&home.0).unwrap().max_agents, n);
         }
+    }
+    #[test]
+    fn domain_matching_and_policy_fingerprint() {
+        for host in ["shop.example", "a.shop.example", "SHOP.EXAMPLE."] {
+            assert!(domain_matches(host, ".Shop.Example."));
+        }
+        for (host, suffix) in [
+            ("evilshop.example", "shop.example"),
+            ("shop.example.evil", "shop.example"),
+            ("x", ""),
+            ("x", "."),
+        ] {
+            assert!(!domain_matches(host, suffix));
+        }
+        let cfg = Config::default();
+        let expected = blake3::hash(
+            serde_json::to_string(&(&cfg.auto_max, &cfg.never_send))
+                .unwrap()
+                .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+        assert_eq!(cfg.policy_fingerprint(), expected);
+        let mut unrelated = cfg.clone();
+        unrelated.retention_days += 1;
+        assert_eq!(unrelated.policy_fingerprint(), expected);
     }
 }

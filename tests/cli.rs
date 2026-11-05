@@ -704,3 +704,48 @@ fn daemon_stops_between_launch_failures() {
         "daemon kept starting tasks after SIGTERM"
     );
 }
+
+#[test]
+fn grant_add_list_rm() {
+    let h = TempDir::new();
+    let before = iksa::audit::now_ms();
+    let out = ok(run(&h, &["grant", "shop.example", "--days", "3"]));
+    assert!(out.starts_with("1\texpires "), "{out}");
+    let listed = ok(run(&h, &["grant", "list"]));
+    assert!(
+        listed.contains("shop.example") && listed.contains("expires "),
+        "{listed}"
+    );
+    let l = Ledger::open(h.0.join("ledger.db")).unwrap();
+    let grants = l.grants().unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].schedule_id, None);
+    assert!(grants[0].expires_ms >= before + 3 * 86_400_000);
+    assert!(grants[0].expires_ms <= iksa::audit::now_ms() + 3 * 86_400_000);
+    assert_eq!(
+        grants[0].policy,
+        Config::load(&h.0).unwrap().policy_fingerprint()
+    );
+    for args in [
+        vec!["grant", "x", "--days", "31"],
+        vec!["grant", "x", "--days", "0"],
+        vec!["grant", "x", "--days", "no"],
+        vec!["grant", "x", "--days"],
+        vec!["grant", "x", "--risk", "financial"],
+        vec!["grant", "x", "--schedule", "bad"],
+        vec!["grant", "x", "--days", "2", "--days", "3"],
+        vec!["grant", "https://shop.example"],
+        vec!["grant", ""],
+        vec!["grant", "rm"],
+        vec!["grant", "list", "extra"],
+    ] {
+        assert_eq!(run(&h, &args).status.code(), Some(2), "{args:?}");
+    }
+    assert_eq!(l.grants().unwrap().len(), 1);
+    ok(run(&h, &["grant", "rm", "1"]));
+    assert!(ok(run(&h, &["grant", "list"])).is_empty());
+    ok(run(&h, &["grant", "shop.example", "--schedule", "3"]));
+    let grants = l.grants().unwrap();
+    assert_eq!(grants[0].schedule_id, Some(3));
+    assert!(grants[0].expires_ms >= before + 7 * 86_400_000);
+}

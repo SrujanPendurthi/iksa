@@ -76,6 +76,14 @@ pub struct Schedule {
     pub accepted: u32,
     pub dismissed: u32,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Grant {
+    pub id: i64,
+    pub domain: String,
+    pub schedule_id: Option<i64>,
+    pub expires_ms: u64,
+    pub policy: String,
+}
 pub struct Ledger {
     conn: rusqlite::Connection,
 }
@@ -92,7 +100,9 @@ impl Ledger {
             );
             CREATE TABLE IF NOT EXISTS steps (seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, step INTEGER NOT NULL, json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, spec TEXT NOT NULL, goal TEXT NOT NULL,
-                auto INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL, last_task INTEGER);",
+                auto INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL, last_task INTEGER);
+            CREATE TABLE IF NOT EXISTS grants (id INTEGER PRIMARY KEY, domain TEXT NOT NULL,
+                schedule_id INTEGER, expires_ms INTEGER NOT NULL, policy TEXT NOT NULL);",
         )?;
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
@@ -118,6 +128,41 @@ impl Ledger {
         tx.commit()?;
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         Ok(Self { conn })
+    }
+    pub fn add_grant(
+        &self,
+        domain: &str,
+        schedule_id: Option<i64>,
+        expires_ms: u64,
+        policy: &str,
+    ) -> anyhow::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO grants (domain,schedule_id,expires_ms,policy) VALUES (?1,?2,?3,?4)",
+            rusqlite::params![domain, schedule_id, expires_ms, policy],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+    pub fn grants(&self) -> anyhow::Result<Vec<Grant>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id,domain,schedule_id,expires_ms,policy FROM grants ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Grant {
+                id: row.get(0)?,
+                domain: row.get(1)?,
+                schedule_id: row.get(2)?,
+                expires_ms: row.get(3)?,
+                policy: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+    pub fn remove_grant(&self, id: i64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.conn.execute("DELETE FROM grants WHERE id=?1", [id])? > 0,
+            "grant {id} not found"
+        );
+        Ok(())
     }
     pub fn record_step(&self, id: i64, record: &crate::audit::StepRecord) -> anyhow::Result<()> {
         let mut record = record.clone();
@@ -1550,5 +1595,50 @@ mod tests {
             assert_eq!(task.accepted_ms, None);
         }
         assert!(ledger.schedules().unwrap().iter().all(|s| s.accepted == 0));
+    }
+    #[test]
+    fn grants_survive_reopen_and_remove() {
+        let dir = temp_dir("grants");
+        let path = dir.0.join("ledger.db");
+        let ledger = Ledger::open(&path).unwrap();
+        assert!(ledger.grants().unwrap().is_empty());
+        let first = ledger
+            .add_grant("shop.example", None, 1234, "policy")
+            .unwrap();
+        let second = ledger
+            .add_grant("other.example", Some(3), 5678, "other")
+            .unwrap();
+        drop(ledger);
+        let ledger = Ledger::open(&path).unwrap();
+        assert_eq!(
+            ledger.grants().unwrap(),
+            [
+                Grant {
+                    id: first,
+                    domain: "shop.example".into(),
+                    schedule_id: None,
+                    expires_ms: 1234,
+                    policy: "policy".into()
+                },
+                Grant {
+                    id: second,
+                    domain: "other.example".into(),
+                    schedule_id: Some(3),
+                    expires_ms: 5678,
+                    policy: "other".into()
+                },
+            ]
+        );
+        ledger.remove_grant(first).unwrap();
+        assert_eq!(ledger.grants().unwrap()[0].id, second);
+        assert!(
+            ledger
+                .remove_grant(first)
+                .unwrap_err()
+                .to_string()
+                .contains("not found")
+        );
+        ledger.remove_grant(second).unwrap();
+        assert!(ledger.grants().unwrap().is_empty());
     }
 }

@@ -617,3 +617,133 @@ async fn daemon_relaunches_after_workers_release_broken_engine() {
             .all(|t| t.state == State::Committed)
     );
 }
+
+#[tokio::test]
+#[ignore]
+async fn active_grants_recheck_current_policy() {
+    use iksa::{action::Action, gate::Risk};
+    if isolated("active_grants_recheck_current_policy") {
+        return;
+    }
+    // Hold the extract between two granted writes until the config edit is complete.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let (release, ready) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let mut requests = 0;
+        while requests < 4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let n = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..n]);
+            let held = request.starts_with("GET /ready ");
+            let page = request.starts_with("GET / ");
+            let body = if held {
+                ready.recv_timeout(Duration::from_secs(10)).unwrap();
+                "ready"
+            } else if page {
+                "<input id=q><button id=go>Go</button><script>fetch('/ready').then(r=>r.text()).then(t=>{let e=document.createElement('div');e.id='ready';e.textContent=t;document.body.append(e)})</script>"
+            } else {
+                ""
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            // Two page/ready pairs, one for each policy change below.
+            if held || page {
+                requests += 1;
+            }
+        }
+    });
+    for never_send in [true, false] {
+        let home = common::temp_dir("grant-policy-refresh");
+        let cfg = Config::default();
+        std::fs::write(
+            home.0.join("config.json"),
+            serde_json::to_vec(&cfg).unwrap(),
+        )
+        .unwrap();
+        let ledger = Ledger::open(home.0.join("ledger.db")).unwrap();
+        ledger
+            .add_grant(
+                "127.0.0.1",
+                None,
+                iksa::audit::now_ms() + 60_000,
+                &cfg.policy_fingerprint(),
+            )
+            .unwrap();
+        let id = ledger
+            .add(
+                "refresh policy",
+                &[
+                    Action::Navigate { url: url.clone() },
+                    Action::Type {
+                        selector: "#q".into(),
+                        text: "hello".into(),
+                        secret: false,
+                        risk: Risk::Write,
+                    },
+                    Action::Extract {
+                        selector: "#ready".into(),
+                    },
+                    Action::Click {
+                        selector: "#go".into(),
+                        risk: Risk::Write,
+                    },
+                ],
+            )
+            .unwrap();
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let path = home.0.clone();
+                let task =
+                    tokio::task::spawn_local(async move { daemon::run(&path, opts(true)).await });
+                until(
+                    || {
+                        ledger
+                            .records(id)
+                            .unwrap()
+                            .iter()
+                            .any(|r| r.decision == "grant:1")
+                    },
+                    10,
+                )
+                .await;
+                let mut changed = cfg.clone();
+                if never_send {
+                    changed.never_send.push("127.0.0.1".into());
+                } else {
+                    changed.auto_max = Risk::Write;
+                }
+                std::fs::write(
+                    home.0.join("config.json"),
+                    serde_json::to_vec(&changed).unwrap(),
+                )
+                .unwrap();
+                release.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(10), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    ledger.get(id).unwrap().state,
+                    State::AwaitingHandoff(iksa::ledger::Handoff::Approval)
+                );
+                assert_eq!(ledger.get(id).unwrap().cursor, 3);
+                assert_eq!(
+                    ledger
+                        .records(id)
+                        .unwrap()
+                        .iter()
+                        .filter(|r| r.decision.starts_with("grant:"))
+                        .count(),
+                    1
+                );
+            })
+            .await;
+    }
+    server.join().unwrap();
+}

@@ -104,6 +104,7 @@ fn launch(home: &Path, opts: &Opts) -> anyhow::Result<Engine> {
         &home.join("profile"),
         std::env::var("IKSA_MOCK_KEYCHAIN").as_deref() == Ok("1"),
     )
+    .map(|engine| engine.with_policy_home(home))
     .with_context(|| format!("launching Chromium {}", path.display()))
 }
 fn report(id: i64, state: &State) {

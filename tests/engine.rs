@@ -897,3 +897,90 @@ async fn placeholder_without_secret_flag_fails() {
     assert_eq!(f.l.get(id).unwrap().cursor, 1);
     assert_no_resolved_secret(&f, id);
 }
+
+#[tokio::test]
+#[ignore]
+async fn grant_runs_write_without_pause() {
+    let f = EngineFixture::new();
+    let cfg = Config::default();
+    assert_eq!(
+        f.l.add_grant(
+            "127.0.0.1",
+            None,
+            audit::now_ms() + 60_000,
+            &cfg.policy_fingerprint()
+        )
+        .unwrap(),
+        1
+    );
+    let click = Action::Click {
+        selector: "#go".into(),
+        risk: Risk::Write,
+    };
+    let (id, state) = f
+        .run(&[f.nav("/form"), typed(), click, extract("#out")], &cfg)
+        .await;
+    assert_eq!(state, State::Committed);
+    let records = f.l.records(id).unwrap();
+    assert_eq!(records[0].decision, "auto");
+    assert_eq!(records[1].decision, "grant:1");
+    assert_eq!(records[2].decision, "grant:1");
+    assert_eq!(records[3].outcome, "hi");
+    let (_, state) = f
+        .run(
+            &[
+                f.nav("/form"),
+                Action::Click {
+                    selector: "#go".into(),
+                    risk: Risk::Financial,
+                },
+            ],
+            &cfg,
+        )
+        .await;
+    assert_eq!(state, State::AwaitingHandoff(Handoff::Approval));
+    // The current page host, rather than a previous navigation, controls scope.
+    let other = Action::Navigate {
+        url: format!("http://localhost:{}/form", f.port),
+    };
+    let (_, state) = f.run(&[f.nav("/form"), other, typed()], &cfg).await;
+    assert_eq!(state, State::AwaitingHandoff(Handoff::Approval));
+    f.l.remove_grant(1).unwrap();
+    let (_, state) = f.run(&[f.nav("/form"), typed()], &cfg).await;
+    assert_eq!(state, State::AwaitingHandoff(Handoff::Approval));
+}
+
+#[tokio::test]
+#[ignore]
+async fn failed_granted_step_names_grant() {
+    let f = EngineFixture::new();
+    let cfg = Config::default();
+    f.l.add_grant(
+        "127.0.0.1",
+        None,
+        audit::now_ms() + 60_000,
+        &cfg.policy_fingerprint(),
+    )
+    .unwrap();
+    let id =
+        f.l.add(
+            "missing target",
+            &[
+                f.nav("/form"),
+                Action::Click {
+                    selector: "#missing".into(),
+                    risk: Risk::Write,
+                },
+            ],
+        )
+        .unwrap();
+    let state =
+        f.e.run_with_timeout(&f.l, &f.c, &cfg, id, Duration::from_secs(2))
+            .await
+            .unwrap();
+    assert!(matches!(state, State::Failed(_)), "{state:?}");
+    let records = f.l.records(id).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records.last().unwrap().step, 1);
+    assert_eq!(records.last().unwrap().decision, "grant:1");
+}

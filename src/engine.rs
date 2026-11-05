@@ -4,7 +4,7 @@ use crate::{
     cas::Cas,
     cdp::{self, Browser},
     challenge::{self, ChallengeKind},
-    config::Config,
+    config::{Config, domain_matches},
     gate::{self, Decision, Risk},
     keychain,
     ledger::{Handoff, Ledger, State},
@@ -15,7 +15,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -150,13 +150,20 @@ fn scrub_model(text: &str, secrets: &[String]) -> String {
 pub struct Engine {
     browser: RefCell<Option<Browser>>,
     broken: Cell<bool>,
+    policy_home: Option<PathBuf>,
 }
 impl Engine {
     pub fn new(browser: Browser) -> Self {
         Self {
             browser: RefCell::new(Some(browser)),
             broken: Cell::new(false),
+            policy_home: None,
         }
+    }
+    /// Reload durable policy at each grant use by a daemon/run worker.
+    pub fn with_policy_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.policy_home = Some(home.into());
+        self
     }
     pub fn is_available(&self) -> bool {
         !self.broken.get() && self.browser.borrow().is_some()
@@ -443,6 +450,7 @@ impl Engine {
         l.transition(id, State::Executing)?;
         let mut context = None;
         let mut model_step = ModelStep::default();
+        let mut step_decision: Option<String> = None;
         let result: anyhow::Result<State> = async {
             anyhow::ensure!(task.cursor <= task.steps.len(), "invalid task cursor");
             // A used placeholder may precede the last navigation, so replay alone cannot
@@ -526,6 +534,7 @@ impl Engine {
             let mut invalid_streak = l.records(id)?.iter().rev()
                 .take_while(|r| r.outcome.starts_with("invalid:")).count();
             loop {
+                step_decision = None;
                 let task = l.get(id)?;
                 if task.steps.get(task.cursor).is_none() {
                     let Some(goal) = task.goal.as_deref() else {
@@ -551,10 +560,7 @@ impl Engine {
                         format!("({{host:location.hostname,fields:Array.from(document.querySelectorAll('input,textarea,[contenteditable]')).filter(e=>e.tagName!=='INPUT'||!['checkbox','radio','button','submit','reset','image'].includes(e.type)).flatMap(e=>[e.value||'',e.defaultValue||'',e.hasAttribute('contenteditable')?e.innerText:'']),observation:{}}})", observe::OBSERVE_JS)))
                         .await??;
                     let host = value["host"].as_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
-                    if cfg.never_send.iter().any(|suffix| {
-                        let suffix = suffix.trim_start_matches('.').trim_end_matches('.').to_ascii_lowercase();
-                        !suffix.is_empty() && (host == suffix || host.ends_with(&format!(".{suffix}")))
-                    }) {
+                    if cfg.never_send.iter().any(|suffix| domain_matches(&host, suffix)) {
                         planner_record(l, id, task.cursor,
                             format!("blocked: {host} is on never_send"), &ModelStep::default(), &secrets)?;
                         let state = State::AwaitingHandoff(Handoff::Approval);
@@ -640,18 +646,32 @@ impl Engine {
                     }
                 }
                 let decision = if gate::decide(cfg.auto_max, a.risk()) == Decision::NeedsApproval {
-                    if task.approved_step != Some(n) {
-                        if model_step.request.is_some() {
-                            let mut record = StepRecord::new(n, a, "needs approval".into(), None, "awaiting approval".into());
-                            model_step.attach(&mut record, &secrets);
-                            l.record_step(id, &record)?;
+                    if task.approved_step == Some(n) {
+                        "approved".to_owned()
+                    } else {
+                        let grants = l.grants()?;
+                        let grant = if a.risk() == Risk::Write && !grants.is_empty() {
+                            let host = tokio::time::timeout(timeout,
+                                self.eval(b, &s, "location.hostname".into())).await??;
+                            let current = self.policy_home.as_ref().map(|home| Config::load(home)).transpose()?;
+                            gate::grant_for(&grants, host.as_str().unwrap_or(""), task.schedule_id,
+                                a.risk(), crate::audit::now_ms(), current.as_ref().unwrap_or(cfg))
+                        } else { None };
+                        if let Some(id) = grant {
+                            format!("grant:{id}")
+                        } else {
+                            if model_step.request.is_some() {
+                                let mut record = StepRecord::new(n, a, "needs approval".into(), None, "awaiting approval".into());
+                                model_step.attach(&mut record, &secrets);
+                                l.record_step(id, &record)?;
+                            }
+                            let state = State::AwaitingHandoff(Handoff::Approval);
+                            l.transition(id, state.clone())?;
+                            return Ok(state);
                         }
-                        let state = State::AwaitingHandoff(Handoff::Approval);
-                        l.transition(id, state.clone())?;
-                        return Ok(state);
                     }
-                    "approved"
-                } else { "auto" };
+                } else { "auto".to_owned() };
+                step_decision = Some(decision.clone());
                 let deadline = Instant::now() + timeout;
                 let execution = async {
                     let before_document = if secret_on_page && url_of(a, cfg).is_some() {
@@ -742,12 +762,14 @@ impl Engine {
                         let mut record = StepRecord::new(
                             task.cursor,
                             a,
-                            if task.approved_step == Some(task.cursor) {
-                                "approved"
-                            } else {
-                                "auto"
-                            }
-                            .into(),
+                            step_decision.clone().unwrap_or_else(|| {
+                                if task.approved_step == Some(task.cursor) {
+                                    "approved"
+                                } else {
+                                    "auto"
+                                }
+                                .into()
+                            }),
                             None,
                             message.clone(),
                         );

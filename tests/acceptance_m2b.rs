@@ -547,7 +547,6 @@ fn a5_suggestions_bounded() {
 
 // Acceptance checks for tasks not built yet. When starting a task, delete its `#[cfg(any())]`
 // line (and nothing else); the task is done only when these pass unchanged.
-#[cfg(any())]
 #[path = "acceptance/m2b_task6.rs"]
 mod task6;
 #[cfg(any())]

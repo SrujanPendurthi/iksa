@@ -21,7 +21,7 @@ struct TaskInput {
     title: String,
     steps: Vec<Action>,
 }
-const USAGE: &str = "usage: iksa setup | add <task.json|-> | ask <goal…> | key set | secret set <name> | schedule add [--auto] <spec> <goal…> | schedule list | schedule set <id> auto|suggest | schedule rm <id> | daemon | run | list | inbox | accept <id> | dismiss <id> | approve <id> | resume <id> | report <id> | gc";
+const USAGE: &str = "usage: iksa setup | add <task.json|-> | ask <goal…> | key set | secret set <name> | schedule add [--auto] <spec> <goal…> | schedule list | schedule set <id> auto|suggest | schedule rm <id> | grant <domain> [--schedule <id>] [--days N] | grant list | grant rm <id> | daemon | run | list | inbox | accept <id> | dismiss <id> | approve <id> | resume <id> | report <id> | gc";
 fn local_time(ms: u64) -> String {
     let c = schedule::local(ms);
     format!(
@@ -29,6 +29,44 @@ fn local_time(ms: u64) -> String {
         c.year, c.month, c.day, c.hour, c.minute
     )
 }
+fn grant_args(words: &[&str]) -> Option<(String, Option<i64>, u32)> {
+    if matches!(*words.first()?, "list" | "rm") {
+        return None;
+    }
+    let domain = words.first()?.trim_end_matches('.').to_ascii_lowercase();
+    let valid_domain = !domain.is_empty()
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        });
+    if !valid_domain {
+        return None;
+    }
+    let mut schedule = None;
+    let mut days = None;
+    let mut flags = words[1..].chunks_exact(2);
+    for flag in &mut flags {
+        match flag {
+            ["--schedule", value] if schedule.is_none() => {
+                schedule = Some(value.parse::<i64>().ok().filter(|id| *id > 0)?);
+            }
+            ["--days", value] if days.is_none() => {
+                days = Some(value.parse::<u32>().ok().filter(|n| (1..=30).contains(n))?);
+            }
+            _ => return None,
+        }
+    }
+    if !flags.remainder().is_empty() {
+        return None;
+    }
+    Some((domain, schedule, days.unwrap_or(7)))
+}
+
 #[tokio::main]
 async fn main() {
     let result = execute().await;
@@ -129,6 +167,33 @@ async fn execute() -> anyhow::Result<i32> {
                 .set_schedule_auto(id(n).unwrap(), mode == "auto")?;
         }
         ["schedule", "rm", n] if id(n).is_some() => open()?.1.remove_schedule(id(n).unwrap())?,
+        ["grant", "list"] => {
+            for grant in open()?.1.grants()? {
+                println!(
+                    "{}\t{}\tschedule {}\texpires {}",
+                    grant.id,
+                    grant.domain,
+                    grant
+                        .schedule_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "any".into()),
+                    local_time(grant.expires_ms)
+                );
+            }
+        }
+        ["grant", "rm", n] if id(n).is_some() => open()?.1.remove_grant(id(n).unwrap())?,
+        ["grant", ref words @ ..] => {
+            let Some((domain, schedule, days)) = grant_args(words) else {
+                eprintln!("{USAGE}");
+                return Ok(2);
+            };
+            let (cfg, ledger, _) = open()?;
+            let expires = audit::now_ms()
+                .checked_add(u64::from(days) * 86_400_000)
+                .context("grant expiry overflows")?;
+            let id = ledger.add_grant(&domain, schedule, expires, &cfg.policy_fingerprint())?;
+            println!("{id}\texpires {}", local_time(expires));
+        }
         ["add", path] => {
             let (_, ledger, _) = open()?;
             let mut json = String::new();

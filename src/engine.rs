@@ -13,7 +13,7 @@ use crate::{
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -447,7 +447,16 @@ impl Engine {
             })
             .collect();
         let mut secret_on_page = false;
-        l.transition(id, State::Executing)?;
+        if let Err(error) = l.transition(id, State::Executing) {
+            // A queued task may be paused after dispatcher admission.
+            if l.get(id)?.state == State::AwaitingHandoff(Handoff::Paused) {
+                return Ok(State::AwaitingHandoff(Handoff::Paused));
+            }
+            return Err(error);
+        }
+        if l.pause_if_requested(id)? {
+            return Ok(State::AwaitingHandoff(Handoff::Paused));
+        }
         let mut context = None;
         let mut model_step = ModelStep::default();
         let mut step_decision: Option<String> = None;
@@ -517,9 +526,11 @@ impl Engine {
                                 nav + 1 + i
                             );
                         }
+                        if l.pause_if_requested(id)? { return Ok(None); }
                         self.navigate(b, &s, &url_of(&task.steps[nav], cfg).unwrap())
                             .await?;
                         for a in replay {
+                            if l.pause_if_requested(id)? { return Ok(None); }
                             if let Action::Type { secret, .. } = a {
                                 self.action(b, &s, a, cfg, Instant::now() + timeout, timeout, &mut secrets).await?;
                                 secret_on_page |= *secret;
@@ -527,14 +538,17 @@ impl Engine {
                         }
                     }
                 }
-                Ok::<_, anyhow::Error>(s)
+                Ok::<_, anyhow::Error>(Some(s))
             })
             .await??;
-            let s = result;
+            let Some(s) = result else { return Ok(State::AwaitingHandoff(Handoff::Paused)); };
+            let mut recent: VecDeque<(String, blake3::Hash)> = VecDeque::with_capacity(3);
             let mut invalid_streak = l.records(id)?.iter().rev()
                 .take_while(|r| r.outcome.starts_with("invalid:")).count();
             loop {
                 step_decision = None;
+                let mut pending_pair = None;
+                if l.pause_if_requested(id)? { return Ok(State::AwaitingHandoff(Handoff::Paused)); }
                 let task = l.get(id)?;
                 if task.steps.get(task.cursor).is_none() {
                     let Some(goal) = task.goal.as_deref() else {
@@ -574,6 +588,7 @@ impl Engine {
                     }
                     let mut redactions = secrets.clone();
                     redactions.extend(private_fields.iter().cloned());
+                    let observation_hash = blake3::hash(&serde_json::to_vec(&value["observation"])?);
                     let observation: observe::Observation = serde_json::from_value(value["observation"].clone())?;
                     let log: Vec<_> = records.iter().enumerate().map(|(n,r)| {
                         let summary = if r.decision == "planner" { "planner".into() } else { action_summary(&r.action) };
@@ -607,6 +622,7 @@ impl Engine {
                     } else { Err("expected exactly one tool call".into()) };
                     match chosen {
                         Err(error) => {
+                            recent.clear();
                             planner_record(l, id, task.cursor, format!("invalid: {error}"), &model_step, &secrets)?;
                             model_step = ModelStep::default();
                             invalid_streak += 1;
@@ -618,6 +634,10 @@ impl Engine {
                             continue;
                         }
                         Ok(None) => {
+                            if l.pause_if_requested(id)? {
+                                planner_record(l, id, task.cursor, "paused before done".into(), &model_step, &secrets)?;
+                                return Ok(State::AwaitingHandoff(Handoff::Paused));
+                            }
                             let answer = reply.tool.as_ref().unwrap().1["answer"].as_str().unwrap();
                             planner_record(l, id, task.cursor, format!("done: {answer}"), &model_step, &secrets)?;
                             l.transition(id, State::Committed)?;
@@ -632,6 +652,7 @@ impl Engine {
                         }
                         Ok(Some(action)) => {
                             invalid_streak = 0;
+                            pending_pair = Some((serde_json::to_string(&action)?, observation_hash));
                             l.push_step(id, &action)?;
                         }
                     }
@@ -644,6 +665,14 @@ impl Engine {
                         r.step == n && r.action == *a && r.model_request.is_some() ) {
                         model_step = ModelStep {request:record.model_request.clone(),thought:record.thought.clone()};
                     }
+                }
+                if l.pause_if_requested(id)? {
+                    if model_step.request.is_some() {
+                        let mut record = StepRecord::new(n, a, "paused".into(), None, "paused before step".into());
+                        model_step.attach(&mut record, &secrets);
+                        l.record_step(id, &record)?;
+                    }
+                    return Ok(State::AwaitingHandoff(Handoff::Paused));
                 }
                 let decision = if gate::decide(cfg.auto_max, a.risk()) == Decision::NeedsApproval {
                     if task.approved_step == Some(n) {
@@ -720,6 +749,17 @@ impl Engine {
                 }
                 l.set_cursor(id, n + 1)?;
                 model_step = ModelStep::default();
+                if let Some(pair) = pending_pair {
+                    if recent.len() == 3 { recent.pop_front(); }
+                    recent.push_back(pair);
+                    if recent.len() == 3 && recent.iter().all(|pair| Some(pair) == recent.front()) {
+                        let action = serde_json::to_value(a)?;
+                        let op = action["op"].as_str().unwrap();
+                        let state = State::Failed(format!("stuck: repeated {op} 3 times"));
+                        l.transition(id, state.clone())?;
+                        return Ok(state);
+                    }
+                } else { recent.clear(); }
             }
         }
         .await;

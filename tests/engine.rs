@@ -984,3 +984,47 @@ async fn failed_granted_step_names_grant() {
     assert_eq!(records.last().unwrap().step, 1);
     assert_eq!(records.last().unwrap().decision, "grant:1");
 }
+
+#[tokio::test]
+#[ignore]
+async fn pause_finishes_in_flight_step() {
+    let f = EngineFixture::new();
+    let port = common::serve(&[("/pause", common::Response {status:200, headers:vec![], hang:false,
+        body:"<input id=q><script>setTimeout(()=>{let d=document.createElement('div');d.id='later';d.textContent='Ready';document.body.append(d)},1000)</script>".into()})]);
+    let id =
+        f.l.add(
+            "pause in flight",
+            &[
+                Action::Navigate {
+                    url: format!("http://127.0.0.1:{port}/pause"),
+                },
+                extract("#later"),
+                typed(),
+            ],
+        )
+        .unwrap();
+    let cfg = Config {
+        auto_max: Risk::Write,
+        ..Config::default()
+    };
+    let (state, ()) = tokio::join!(f.e.run(&f.l, &f.c, &cfg, id), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while f.l.get(id).unwrap().cursor != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        f.l.request_pause(id).unwrap();
+    });
+    assert_eq!(state.unwrap(), State::AwaitingHandoff(Handoff::Paused));
+    assert_eq!(f.l.get(id).unwrap().cursor, 2);
+    let records = f.l.records(id).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].outcome, "Ready");
+    f.l.resume(id).unwrap();
+    assert_eq!(
+        f.e.run(&f.l, &f.c, &cfg, id).await.unwrap(),
+        State::Committed
+    );
+}

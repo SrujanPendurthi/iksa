@@ -7,6 +7,7 @@ const SELECT: &str = "SELECT id,title,steps,cursor,state,approved_step,finished_
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Handoff {
+    Paused,
     Approval,
     Challenge(ChallengeKind),
 }
@@ -42,6 +43,7 @@ pub struct Task {
 }
 pub fn waiting_on(task: &Task) -> Option<String> {
     match &task.state {
+        State::AwaitingHandoff(Handoff::Paused) => Some("paused".into()),
         State::AwaitingHandoff(Handoff::Approval) => Some(match task.steps.get(task.cursor) {
             Some(action) => {
                 let op = match action {
@@ -111,6 +113,7 @@ impl Ledger {
             ("schedule_id", "INTEGER"),
             ("accepted_ms", "INTEGER"),
             ("human_started_ms", "INTEGER"),
+            ("pause_requested", "INTEGER"),
         ] {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name=?1)",
@@ -471,7 +474,10 @@ impl Ledger {
         if !matches!(
             (&from, &to),
             (State::Suggested, State::Queued | State::Dismissed)
-                | (State::Queued, State::Executing)
+                | (
+                    State::Queued,
+                    State::Executing | State::AwaitingHandoff(Handoff::Paused)
+                )
                 | (
                     State::Executing,
                     State::AwaitingHandoff(_) | State::Committed | State::Failed(_) | State::Queued
@@ -498,8 +504,8 @@ impl Ledger {
             })
             .transpose()?;
         if self.conn.execute(
-            "UPDATE tasks SET state=?2, finished_ms=CASE WHEN ?3 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) END, steps=COALESCE(?5, steps), accepted_ms=CASE WHEN ?6 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) ELSE accepted_ms END, human_started_ms=CASE WHEN ?7 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) ELSE human_started_ms END WHERE id=?1 AND state=?4",
-            rusqlite::params![id, serde_json::to_string(&to)?, terminal, serde_json::to_string(&from)?, redacted, from == State::Suggested && to == State::Queued, to == State::Queued && matches!(&from, State::Suggested | State::AwaitingHandoff(_))],
+            "UPDATE tasks SET state=?2, finished_ms=CASE WHEN ?3 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) END, steps=COALESCE(?5, steps), accepted_ms=CASE WHEN ?6 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) ELSE accepted_ms END, human_started_ms=CASE WHEN ?7 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) ELSE human_started_ms END, pause_requested=CASE WHEN ?8 THEN NULL ELSE pause_requested END WHERE id=?1 AND state=?4",
+            rusqlite::params![id, serde_json::to_string(&to)?, terminal, serde_json::to_string(&from)?, redacted, from == State::Suggested && to == State::Queued, to == State::Queued && matches!(&from, State::Suggested | State::AwaitingHandoff(_)), terminal || to == State::AwaitingHandoff(Handoff::Paused)],
         )? == 0 {
             anyhow::bail!("illegal transition from {:?} to {to:?}", self.get(id)?.state);
         }
@@ -526,9 +532,36 @@ impl Ledger {
         }
         Ok(())
     }
+    pub fn request_pause(&self, id: i64) -> anyhow::Result<()> {
+        let queued = serde_json::to_string(&State::Queued)?;
+        let executing = serde_json::to_string(&State::Executing)?;
+        let paused = serde_json::to_string(&State::AwaitingHandoff(Handoff::Paused))?;
+        let changed = self.conn.execute(
+            "UPDATE tasks SET state=CASE WHEN state=?2 THEN ?4 ELSE state END,
+                pause_requested=CASE WHEN state=?3 THEN CAST(unixepoch('subsec')*1000 AS INTEGER) END
+                WHERE id=?1 AND state IN (?2,?3)",
+            rusqlite::params![id, queued, executing, paused],
+        )?;
+        anyhow::ensure!(
+            changed > 0,
+            "illegal transition from {:?} to AwaitingHandoff(Paused)",
+            self.get(id)?.state
+        );
+        Ok(())
+    }
+    /// Atomically consume a request at an execution boundary.
+    pub(crate) fn pause_if_requested(&self, id: i64) -> anyhow::Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE tasks SET state=?2, pause_requested=NULL WHERE id=?1 AND state=?3 AND pause_requested IS NOT NULL",
+            rusqlite::params![id, serde_json::to_string(&State::AwaitingHandoff(Handoff::Paused))?, serde_json::to_string(&State::Executing)?],
+        )? > 0)
+    }
     pub fn resume(&self, id: i64) -> anyhow::Result<()> {
         let task = self.get(id)?;
-        if !matches!(task.state, State::AwaitingHandoff(Handoff::Challenge(_))) {
+        if !matches!(
+            task.state,
+            State::AwaitingHandoff(Handoff::Challenge(_) | Handoff::Paused)
+        ) {
             anyhow::bail!("illegal transition from {:?} to Queued", task.state);
         }
         self.transition_from(id, task.state, State::Queued, None)
@@ -1640,5 +1673,74 @@ mod tests {
         );
         ledger.remove_grant(second).unwrap();
         assert!(ledger.grants().unwrap().is_empty());
+    }
+    #[test]
+    fn pause_queued_and_resume() {
+        let dir = temp_dir("pause-queued");
+        let ledger = Ledger::open(dir.0.join("ledger.db")).unwrap();
+        let id = ledger.add("pause", &[]).unwrap();
+        ledger.request_pause(id).unwrap();
+        assert_eq!(
+            ledger.get(id).unwrap().state,
+            State::AwaitingHandoff(Handoff::Paused)
+        );
+        assert_eq!(
+            waiting_on(&ledger.get(id).unwrap()).as_deref(),
+            Some("paused")
+        );
+        assert!(
+            ledger
+                .request_pause(id)
+                .unwrap_err()
+                .to_string()
+                .contains("illegal transition")
+        );
+        assert!(ledger.approve(id).is_err());
+        ledger.resume(id).unwrap();
+        assert_eq!(ledger.get(id).unwrap().state, State::Queued);
+        ledger.transition(id, State::Executing).unwrap();
+        ledger.transition(id, State::Committed).unwrap();
+        assert!(
+            ledger
+                .request_pause(id)
+                .unwrap_err()
+                .to_string()
+                .contains("illegal transition")
+        );
+        let suggestion = ledger.suggest("maybe later").unwrap().unwrap();
+        assert!(ledger.request_pause(suggestion).is_err());
+    }
+
+    #[test]
+    fn executing_pause_is_consumed_once_and_survives_recovery() {
+        let dir = temp_dir("pause-executing");
+        let path = dir.0.join("ledger.db");
+        let ledger = Ledger::open(&path).unwrap();
+        let id = ledger.add("pause", &[]).unwrap();
+        ledger.transition(id, State::Executing).unwrap();
+        ledger.request_pause(id).unwrap();
+        ledger.request_pause(id).unwrap();
+        assert_eq!(ledger.get(id).unwrap().state, State::Executing);
+        drop(ledger);
+        let ledger = Ledger::open(&path).unwrap();
+        ledger.recover().unwrap();
+        assert!(!ledger.pause_if_requested(id).unwrap());
+        ledger.transition(id, State::Executing).unwrap();
+        assert!(ledger.pause_if_requested(id).unwrap());
+        assert!(!ledger.pause_if_requested(id).unwrap());
+        assert_eq!(
+            ledger.get(id).unwrap().state,
+            State::AwaitingHandoff(Handoff::Paused)
+        );
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let flag: Option<u64> = conn
+            .query_row("SELECT pause_requested FROM tasks WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(flag, None);
+        ledger.resume(id).unwrap();
+        ledger.transition(id, State::Executing).unwrap();
+        assert!(!ledger.pause_if_requested(id).unwrap());
     }
 }

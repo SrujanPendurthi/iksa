@@ -549,7 +549,6 @@ fn a5_suggestions_bounded() {
 // line (and nothing else); the task is done only when these pass unchanged.
 #[path = "acceptance/m2b_task6.rs"]
 mod task6;
-#[cfg(any())]
 #[path = "acceptance/m2b_task7.rs"]
 mod task7;
 #[path = "acceptance/m2b_task8.rs"]

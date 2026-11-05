@@ -21,7 +21,7 @@ struct TaskInput {
     title: String,
     steps: Vec<Action>,
 }
-const USAGE: &str = "usage: iksa setup | add <task.json|-> | ask <goal…> | key set | secret set <name> | schedule add [--auto] <spec> <goal…> | schedule list | schedule set <id> auto|suggest | schedule rm <id> | grant <domain> [--schedule <id>] [--days N] | grant list | grant rm <id> | daemon | run | list | inbox | accept <id> | dismiss <id> | approve <id> | resume <id> | report <id> | gc";
+const USAGE: &str = "usage: iksa setup | add <task.json|-> | ask <goal…> | key set | secret set <name> | schedule add [--auto] <spec> <goal…> | schedule list | schedule set <id> auto|suggest | schedule rm <id> | grant <domain> [--schedule <id>] [--days N] | grant list | grant rm <id> | daemon | run | list | inbox | accept <id> | dismiss <id> | approve <id> | pause <id> | resume <id> | report <id> | gc";
 fn local_time(ms: u64) -> String {
     let c = schedule::local(ms);
     format!(
@@ -268,6 +268,7 @@ async fn execute() -> anyhow::Result<i32> {
         }
         ["dismiss", n] if id(n).is_some() => open()?.1.dismiss(id(n).unwrap())?,
         ["approve", n] if id(n).is_some() => open()?.1.approve(id(n).unwrap())?,
+        ["pause", n] if id(n).is_some() => open()?.1.request_pause(id(n).unwrap())?,
         ["resume", n] if id(n).is_some() => open()?.1.resume(id(n).unwrap())?,
         ["report", n] if id(n).is_some() => {
             let (_, ledger, cas) = open()?;

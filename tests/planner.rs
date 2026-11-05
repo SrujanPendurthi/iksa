@@ -62,6 +62,9 @@ struct Mock {
 }
 impl Mock {
     fn new(turns: Vec<Turn>) -> Self {
+        Self::with_delay(turns, Duration::ZERO)
+    }
+    fn with_delay(turns: Vec<Turn>, delay: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -142,6 +145,7 @@ impl Mock {
                 let response=json!({"content":content,"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5}}).to_string();
                 seen.push(request);
                 drop(seen);
+                thread::sleep(delay);
                 write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
             }
         });
@@ -179,6 +183,7 @@ impl Fixture {
         let port=common::serve(&[("/form",common::Response{status:200,headers:vec![],hang:false,body:r#"<title>Form</title><h1>Form</h1><label for=q>Query</label><input id=q oninput="document.querySelector('#live').textContent=this.value"><button id=go onclick="document.querySelector('#out').textContent=document.querySelector('#q').value;document.querySelector('#count').textContent=String(Number(document.querySelector('#count').textContent)+1)">Go</button><h2 id=out></h2><div id=live></div><h3 id=count>0</h3>"#.into() }),
             ("/receipt",common::Response {status:200,headers:vec![],hang:false,body:"<h1>S3cr3t-xyz</h1><button id=go>Go</button>".into()}),
             ("/notes",common::Response {status:200,headers:vec![],hang:false,body:"<h1>Notes page</h1><input value=private-notes><h2 aria-label=Notes>private-notes</h2>".into()}),
+            ("/static", common::Response { status:200, headers:vec![], hang:false, body:"<h1>Static</h1><label for=q>Query</label><input id=q><button id=go>Go</button><button id=left>Left</button><button id=right>Right</button>".into() }),
         ]);
         Self {
             e: Engine::new(chrome.b.take().unwrap()),
@@ -785,4 +790,160 @@ async fn redaction_cannot_expand_suggestions_past_limit() {
     assert_eq!(suggested.len(), 1);
     assert_eq!(suggested[0].goal.as_deref(), Some("check calendar"));
     assert!(suggested.iter().all(|t| t.title.chars().count() <= 300));
+}
+
+#[tokio::test]
+#[ignore]
+async fn pause_stops_running_goal() {
+    if isolated("pause_stops_running_goal") {
+        return;
+    }
+    let f = Fixture::new();
+    let mock = Mock::with_delay(
+        vec![click("write"), click("write"), Turn::Done("ok")],
+        Duration::from_secs(1),
+    );
+    let cfg = f.cfg(&mock);
+    let id = f.task("Click Go twice, then finish");
+    let (state, ()) = tokio::join!(f.run(id, &cfg), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while mock.count() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        f.l.request_pause(id).unwrap();
+    });
+    assert_eq!(state, State::AwaitingHandoff(Handoff::Paused));
+    assert!(f.l.get(id).unwrap().steps.len() < 3);
+    assert_eq!(mock.count(), 1);
+    assert!(
+        f.l.records(id)
+            .unwrap()
+            .iter()
+            .all(|r| r.outcome != "clicked")
+    );
+    f.l.resume(id).unwrap();
+    assert_eq!(f.run(id, &cfg).await, State::Committed);
+    let records = f.l.records(id).unwrap();
+    assert_eq!(records.iter().filter(|r| r.outcome == "clicked").count(), 2);
+    assert!(
+        records
+            .iter()
+            .all(|r| r.thought.is_some() && r.model_request.is_some())
+    );
+    assert_eq!(mock.count(), 3);
+}
+
+#[tokio::test]
+#[ignore]
+async fn stuck_model_fails() {
+    if isolated("stuck_model_fails") {
+        return;
+    }
+    let mut f = Fixture::new();
+    f.url = f.url.replace("/form", "/static");
+    let mock = Mock::new(vec![click("write")]);
+    let id = f.task("Click Go");
+    assert_eq!(
+        f.run(id, &f.cfg(&mock)).await,
+        State::Failed("stuck: repeated click 3 times".into())
+    );
+    assert_eq!(
+        f.l.records(id)
+            .unwrap()
+            .iter()
+            .filter(|r| r.outcome == "clicked")
+            .count(),
+        3
+    );
+    assert_eq!(mock.count(), 3);
+}
+
+#[tokio::test]
+#[ignore]
+async fn changing_observation_is_not_stuck() {
+    if isolated("changing_observation_is_not_stuck") {
+        return;
+    }
+    let f = Fixture::new();
+    let mock = Mock::new(vec![click("write")]);
+    let mut cfg = f.cfg(&mock);
+    cfg.model.as_mut().unwrap().max_steps = 4;
+    let id = f.task("Keep clicking Go");
+    assert_eq!(
+        f.run(id, &cfg).await,
+        State::Failed("step budget exhausted".into())
+    );
+    assert_eq!(
+        f.l.records(id)
+            .unwrap()
+            .iter()
+            .filter(|r| r.outcome == "clicked")
+            .count(),
+        4
+    );
+    assert_eq!(mock.count(), 4);
+}
+
+#[tokio::test]
+#[ignore]
+async fn distinct_selectors_and_text_are_not_stuck() {
+    if isolated("distinct_selectors_and_text_are_not_stuck") {
+        return;
+    }
+    let mut f = Fixture::new();
+    f.url = f.url.replace("/form", "/static");
+    let mock = Mock::new(vec![
+        Turn::Pick("click", "Left", json!({"risk":"write"})),
+        Turn::Pick("click", "Right", json!({"risk":"write"})),
+        Turn::Pick("click", "Left", json!({"risk":"write"})),
+        Turn::Pick("click", "Right", json!({"risk":"write"})),
+        Turn::Done("ok"),
+    ]);
+    let id = f.task("Alternate Left and Right");
+    assert_eq!(f.run(id, &f.cfg(&mock)).await, State::Committed);
+    let mut turns: Vec<_> = ["one", "two", "three", "four"]
+        .into_iter()
+        .map(|text| {
+            Turn::Pick(
+                "type",
+                "Query",
+                json!({"text":text,"secret":false,"risk":"write"}),
+            )
+        })
+        .collect();
+    turns.push(Turn::Done("ok"));
+    let mock = Mock::new(turns);
+    let id = f.task("Type four different words in Query");
+    assert_eq!(f.run(id, &f.cfg(&mock)).await, State::Committed);
+    assert_eq!(mock.count(), 5);
+}
+
+#[tokio::test]
+#[ignore]
+async fn pause_before_done_defers_commit() {
+    if isolated("pause_before_done_defers_commit") {
+        return;
+    }
+    let f = Fixture::new();
+    let mock = Mock::with_delay(vec![Turn::Done("ok")], Duration::from_secs(1));
+    let cfg = f.cfg(&mock);
+    let id = f.task("Read Form");
+    let (state, ()) = tokio::join!(f.run(id, &cfg), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while mock.count() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        f.l.request_pause(id).unwrap();
+    });
+    assert_eq!(state, State::AwaitingHandoff(Handoff::Paused));
+    assert_eq!(mock.count(), 1);
+    f.l.resume(id).unwrap();
+    assert_eq!(f.run(id, &cfg).await, State::Committed);
+    assert_eq!(mock.count(), 2);
 }

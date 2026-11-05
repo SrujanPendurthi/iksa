@@ -749,3 +749,22 @@ fn grant_add_list_rm() {
     assert_eq!(grants[0].schedule_id, Some(3));
     assert!(grants[0].expires_ms >= before + 7 * 86_400_000);
 }
+
+#[test]
+fn pause_command() {
+    let h = TempDir::new();
+    let id = add(&h);
+    ok(run(&h, &["pause", &id.to_string()]));
+    assert!(ok(run(&h, &["list"])).contains("paused"));
+    ok(run(&h, &["resume", &id.to_string()]));
+    let l = Ledger::open(h.0.join("ledger.db")).unwrap();
+    assert_eq!(l.get(id).unwrap().state, State::Queued);
+    l.transition(id, State::Executing).unwrap();
+    ok(run(&h, &["pause", &id.to_string()]));
+    assert_eq!(l.get(id).unwrap().state, State::Executing);
+    l.transition(id, State::Committed).unwrap();
+    let out = run(&h, &["pause", &id.to_string()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("illegal transition"));
+    assert_eq!(run(&h, &["pause", "abc"]).status.code(), Some(2));
+}

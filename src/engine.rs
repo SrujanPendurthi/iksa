@@ -615,6 +615,13 @@ impl Engine {
                             let answer = reply.tool.as_ref().unwrap().1["answer"].as_str().unwrap();
                             planner_record(l, id, task.cursor, format!("done: {answer}"), &model_step, &secrets)?;
                             l.transition(id, State::Committed)?;
+                            for goal in planner::suggestions(&reply.tool.as_ref().unwrap().1) {
+                                let goal = scrub_model(&goal, &redactions);
+                                // Redaction can expand a short secret beyond the goal limit.
+                                if goal.chars().count() <= 300 {
+                                    l.suggest(&goal)?;
+                                }
+                            }
                             return Ok(State::Committed);
                         }
                         Ok(Some(action)) => {

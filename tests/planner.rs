@@ -642,3 +642,147 @@ async fn repeated_request_hashes_still_count_toward_budget() {
     );
     assert_eq!(mock.count(), 0);
 }
+
+fn fake_demo(value: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::path::PathBuf::from(std::env::var_os("IKSA_KEYCHAIN_FAKE").unwrap())
+        .join("iksa-secret/demo");
+    std::fs::write(&path, value).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn done_suggestions_land_in_inbox() {
+    if isolated("done_suggestions_land_in_inbox") {
+        return;
+    }
+    fake_demo("S3CRET-VALUE");
+    let f = Fixture::new();
+    let mock = Mock::new(vec![
+        Turn::Pick(
+            "type",
+            "Query",
+            json!({"text":"{{secret:demo}}","secret":true,"risk":"write"}),
+        ),
+        Turn::Call(
+            "done",
+            json!({"answer":"ok","suggestions":["check prices weekly","{{secret:demo}} value is S3CRET-VALUE"]}),
+        ),
+    ]);
+    let id = f.task("Use {{secret:demo}} in Query, then finish");
+    assert_eq!(f.run(id, &f.cfg(&mock)).await, State::Committed);
+    let tasks = f.l.list().unwrap();
+    let suggested: Vec<_> = tasks
+        .iter()
+        .filter(|t| t.state == State::Suggested)
+        .collect();
+    assert_eq!(suggested.len(), 2);
+    assert!(
+        suggested
+            .iter()
+            .any(|t| t.goal.as_deref() == Some("check prices weekly"))
+    );
+    assert!(
+        suggested
+            .iter()
+            .any(|t| t.goal.as_deref() == Some("{{secret:demo}} value is ••••"))
+    );
+    for task in &tasks {
+        assert!(!task.title.contains("S3CRET-VALUE"));
+        assert!(!task.goal.as_deref().unwrap_or("").contains("S3CRET-VALUE"));
+    }
+    for task in suggested {
+        assert_eq!(Some(task.title.as_str()), task.goal.as_deref());
+    }
+    assert!(f.l.next_queued().unwrap().is_none());
+    assert!(
+        !serde_json::to_string(&*mock.requests.lock().unwrap())
+            .unwrap()
+            .contains("S3CRET-VALUE")
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn failed_task_suggests_nothing() {
+    if isolated("failed_task_suggests_nothing") {
+        return;
+    }
+    let f = Fixture::new();
+    let mock = Mock::new(vec![Turn::Call(
+        "click",
+        json!({"ref":7,"risk":"write","suggestions":["must not persist"]}),
+    )]);
+    let mut cfg = f.cfg(&mock);
+    cfg.model.as_mut().unwrap().max_steps = 1;
+    let id = f.task("Click Go");
+    assert_eq!(
+        f.run(id, &cfg).await,
+        State::Failed("step budget exhausted".into())
+    );
+    assert_eq!(mock.count(), 1);
+    assert!(f.l.records(id).unwrap()[0].outcome.starts_with("invalid:"));
+    assert_eq!(f.l.list().unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[ignore]
+async fn suggestions_scrub_form_values_and_dedupe() {
+    if isolated("suggestions_scrub_form_values_and_dedupe") {
+        return;
+    }
+    let mut f = Fixture::new();
+    f.url = f.url.replace("/form", "/notes");
+    f.l.suggest("read notes").unwrap();
+    let mock = Mock::new(vec![Turn::Call(
+        "done",
+        json!({"answer":"ok","suggestions":[" follow private-notes ","follow ••••","follow private-notes","read notes"]}),
+    )]);
+    let id = f.task("Read Notes");
+    assert_eq!(f.run(id, &f.cfg(&mock)).await, State::Committed);
+    let tasks = f.l.list().unwrap();
+    assert_eq!(tasks.len(), 3);
+    assert_eq!(
+        tasks.iter().filter(|t| t.state == State::Suggested).count(),
+        2
+    );
+    assert!(
+        tasks
+            .iter()
+            .any(|t| t.goal.as_deref() == Some("follow ••••"))
+    );
+    assert!(tasks.iter().all(|t| !t.title.contains("private-notes")));
+    assert!(f.l.next_queued().unwrap().is_none());
+}
+
+#[tokio::test]
+#[ignore]
+async fn redaction_cannot_expand_suggestions_past_limit() {
+    if isolated("redaction_cannot_expand_suggestions_past_limit") {
+        return;
+    }
+    fake_demo("z");
+    let f = Fixture::new();
+    let mock = Mock::new(vec![
+        Turn::Pick(
+            "type",
+            "Query",
+            json!({"text":"{{secret:demo}}","secret":true,"risk":"write"}),
+        ),
+        Turn::Call(
+            "done",
+            json!({"answer":"ok","suggestions":["z".repeat(100),"check calendar"]}),
+        ),
+    ]);
+    let id = f.task("Use {{secret:demo}} in Query, then finish");
+    assert_eq!(f.run(id, &f.cfg(&mock)).await, State::Committed);
+    let tasks = f.l.list().unwrap();
+    let suggested: Vec<_> = tasks
+        .iter()
+        .filter(|t| t.state == State::Suggested)
+        .collect();
+    assert_eq!(suggested.len(), 1);
+    assert_eq!(suggested[0].goal.as_deref(), Some("check calendar"));
+    assert!(suggested.iter().all(|t| t.title.chars().count() <= 300));
+}
